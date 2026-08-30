@@ -33,6 +33,10 @@ path = "src/main.rs"
 name = "amg"
 path = "src/main.rs"
 
+[[bin]]
+name = "mock-worker"
+path = "src/bin/mock-worker.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env", "string", "unstable-v5"] }
 axum = { version = "0.8.6", features = ["macros", "ws", "tracing"] }

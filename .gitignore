@@ -1,0 +1,6 @@
+# cargo build
+target
+Cargo.lock
+
+# vscode
+.vscode

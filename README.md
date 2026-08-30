@@ -391,6 +391,38 @@ python3 -m sglang_router.launch_router \
 ```
 MiniLB forwards PD requests using simple random routing and is intended for local debugging only.
 
+### Standalone Mock Worker (Debug)
+The repository includes a model-free HTTP worker for testing gateway registration, health checks,
+request forwarding, and Regular/PD routing. It returns deterministic mock responses and does not
+require a GPU or a model download.
+
+Start one Regular worker:
+```bash
+make mock-worker-regular
+```
+
+Start a paired PD worker (one process, two HTTP endpoints):
+```bash
+make mock-worker-pd
+```
+
+For two independent processes, use `--role` with `--mode pd`:
+```bash
+make mock-worker-pd-prefill
+make mock-worker-pd-decode
+```
+
+The defaults can be overridden, for example:
+```bash
+make mock-worker-pd MOCK_WORKER_MODEL_ID=my-model MOCK_WORKER_PREFILL_PORT=18102 \
+  MOCK_WORKER_DECODE_PORT=18103 MOCK_WORKER_BOOTSTRAP_PORT=19102
+```
+
+Useful fault-injection options are `--health unhealthy`, `--health flapping`, `--fail-rate 0.5`,
+`--delay-ms 200`, and `--response-text "mock response"`. The worker exposes `/health`,
+`/server_info`, `/model_info`, `/v1/models`, `/generate`, `/v1/chat/completions`,
+`/v1/completions`, and `/flush_cache`.
+
 ### Running Worker Servers
 Use upstream SGLang binaries to start dedicated worker processes.
 - **Prefill worker server (gRPC mode)**:

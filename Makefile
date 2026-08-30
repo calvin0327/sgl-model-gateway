@@ -20,7 +20,31 @@ endif
 
 .PHONY: help build test clean docs check fmt dev-setup pre-commit setup-sccache sccache-stats sccache-clean sccache-stop \
         python-dev python-build python-build-release python-install python-clean python-test python-check \
+        mock-worker-regular mock-worker-pd \
         show-version bump-version release-notes
+
+# Standalone model-free HTTP worker settings. Override on the command line, for example:
+# make mock-worker-pd MOCK_WORKER_MODEL_ID=my-model MOCK_WORKER_FAIL_RATE=0.5
+MOCK_WORKER_MODEL_ID ?= deepseek-v4-flash
+MOCK_WORKER_HOST ?= 127.0.0.1
+MOCK_WORKER_REGULAR_PORT ?= 18001
+MOCK_WORKER_PREFILL_PORT ?= 18002
+MOCK_WORKER_DECODE_PORT ?= 18003
+MOCK_WORKER_BOOTSTRAP_PORT ?= 19002
+MOCK_WORKER_HEALTH ?= healthy
+MOCK_WORKER_FAIL_RATE ?= 0.0
+MOCK_WORKER_DELAY_MS ?= 0
+MOCK_WORKER_RESPONSE_TEXT ?=
+
+MOCK_WORKER_COMMON_ARGS = --model-id $(MOCK_WORKER_MODEL_ID) \
+	--host $(MOCK_WORKER_HOST) \
+	--health $(MOCK_WORKER_HEALTH) \
+	--fail-rate $(MOCK_WORKER_FAIL_RATE) \
+	--delay-ms $(MOCK_WORKER_DELAY_MS)
+
+ifneq ($(strip $(MOCK_WORKER_RESPONSE_TEXT)),)
+MOCK_WORKER_COMMON_ARGS += --response-text "$(MOCK_WORKER_RESPONSE_TEXT)"
+endif
 
 help: ## Show this help message
 	@echo "Model Gateway Development Commands"
@@ -128,6 +152,19 @@ python-check: ## Check Python package with twine
 	@pip install twine 2>/dev/null || true
 	@twine check $(PYTHON_DIR)/dist/*
 	@echo "Python package check passed!"
+
+# Standalone model-free HTTP workers
+mock-worker-regular: ## Start a standalone Regular mock worker
+	@echo "Starting Regular mock worker on $(MOCK_WORKER_HOST):$(MOCK_WORKER_REGULAR_PORT) for model $(MOCK_WORKER_MODEL_ID)..."
+	@cargo run --bin mock-worker -- --mode regular --port $(MOCK_WORKER_REGULAR_PORT) $(MOCK_WORKER_COMMON_ARGS)
+
+mock-worker-pd: ## Start paired Prefill/Decode mock workers in one process
+	@echo "Starting PD mock workers: prefill=$(MOCK_WORKER_HOST):$(MOCK_WORKER_PREFILL_PORT), decode=$(MOCK_WORKER_HOST):$(MOCK_WORKER_DECODE_PORT)..."
+	@cargo run --bin mock-worker -- --mode pd \
+		--prefill-port $(MOCK_WORKER_PREFILL_PORT) \
+		--decode-port $(MOCK_WORKER_DECODE_PORT) \
+		--bootstrap-port $(MOCK_WORKER_BOOTSTRAP_PORT) \
+		$(MOCK_WORKER_COMMON_ARGS)
 
 # Combined shortcuts
 dev: python-dev ## Quick development setup (build Python bindings in dev mode)
