@@ -1,8 +1,8 @@
 use super::{
     gateway::{
-        CircuitBreakerConfig, DiscoveryConfig, GatewayConfig, HistoryBackend, HttpServerConfig,
-        MeshConfig, ObservabilityConfig, OracleConfig, PolicyConfig, RetryConfig, RoutingConfig,
-        RoutingMode, SecurityConfig, StorageConfig, TokenizerCacheConfig, WorkerConfig,
+        CircuitBreakerConfig, DiscoveryConfig, GatewayConfig, HistoryBackend, MeshConfig,
+        ObservabilityConfig, OracleConfig, PolicyConfig, RetryConfig, RoutingConfig, RoutingMode,
+        ServerConfig, StorageConfig, TokenizerCacheConfig, UpstreamConfig,
     },
     ConfigError, ConfigResult,
 };
@@ -13,13 +13,12 @@ pub(crate) struct ConfigValidator;
 impl ConfigValidator {
     /// Validates each configuration section and their compatibility rules.
     pub(crate) fn validate_gateway(config: &GatewayConfig) -> ConfigResult<()> {
-        Self::validate_http_server(&config.server)?;
+        Self::validate_server(&config.server)?;
         Self::validate_routing(&config.routing)?;
-        Self::validate_worker_pool(&config.workers)?;
+        Self::validate_worker_pool(&config.upstream)?;
         Self::validate_tokenizer_cache(&config.model.tokenizer_cache)?;
         Self::validate_storage(&config.storage)?;
         Self::validate_observability(&config.observability)?;
-        Self::validate_security(&config.security)?;
 
         if let Some(discovery) = &config.discovery {
             Self::validate_gateway_discovery(discovery, &config.routing)?;
@@ -77,7 +76,7 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_http_server(server: &HttpServerConfig) -> ConfigResult<()> {
+    fn validate_server(server: &ServerConfig) -> ConfigResult<()> {
         if server.port == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "server.port".to_string(),
@@ -92,20 +91,15 @@ impl ConfigValidator {
                 reason: "Must be > 0".to_string(),
             });
         }
-        Ok(())
-    }
 
-    fn validate_routing(routing: &RoutingConfig) -> ConfigResult<()> {
-        Self::validate_mode(&routing.mode)?;
-        Self::validate_policy(&routing.policy)?;
-        if routing.queue_size > 0 && routing.queue_timeout_secs == 0 {
+        if server.queue_size > 0 && server.queue_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "routing.queue_timeout_secs".to_string(),
-                value: routing.queue_timeout_secs.to_string(),
+                value: server.queue_timeout_secs.to_string(),
                 reason: "Must be > 0 when queue_size > 0".to_string(),
             });
         }
-        if let Some(tokens_per_second) = routing.rate_limit_tokens_per_second {
+        if let Some(tokens_per_second) = server.rate_limit_tokens_per_second {
             if tokens_per_second < 0 {
                 return Err(ConfigError::InvalidValue {
                     field: "routing.rate_limit_tokens_per_second".to_string(),
@@ -114,10 +108,35 @@ impl ConfigValidator {
                 });
             }
         }
+
+        if server.client_identity.as_ref().is_some_and(Vec::is_empty) {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Client identity cannot be empty".to_string(),
+            });
+        }
+        if server.ca_certificates.iter().any(Vec::is_empty) {
+            return Err(ConfigError::ValidationFailed {
+                reason: "CA certificates cannot be empty".to_string(),
+            });
+        }
+        if let Some(tls) = &server.server_tls {
+            if tls.certificate.is_empty() || tls.private_key.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "Server TLS certificate and private key cannot be empty".to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
-    fn validate_worker_pool(workers: &WorkerConfig) -> ConfigResult<()> {
+    fn validate_routing(routing: &RoutingConfig) -> ConfigResult<()> {
+        Self::validate_mode(&routing.mode)?;
+        Self::validate_policy(&routing.policy)?;
+
+        Ok(())
+    }
+
+    fn validate_worker_pool(workers: &UpstreamConfig) -> ConfigResult<()> {
         for (field, value) in [
             ("workers.request_timeout_secs", workers.request_timeout_secs),
             ("workers.startup_timeout_secs", workers.startup_timeout_secs),
@@ -222,27 +241,6 @@ impl ConfigValidator {
             &observability.otlp_traces_endpoint,
             "observability.otlp_traces_endpoint",
         )
-    }
-
-    fn validate_security(security: &SecurityConfig) -> ConfigResult<()> {
-        if security.client_identity.as_ref().is_some_and(Vec::is_empty) {
-            return Err(ConfigError::ValidationFailed {
-                reason: "Client identity cannot be empty".to_string(),
-            });
-        }
-        if security.ca_certificates.iter().any(Vec::is_empty) {
-            return Err(ConfigError::ValidationFailed {
-                reason: "CA certificates cannot be empty".to_string(),
-            });
-        }
-        if let Some(tls) = &security.server_tls {
-            if tls.certificate.is_empty() || tls.private_key.is_empty() {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "Server TLS certificate and private key cannot be empty".to_string(),
-                });
-            }
-        }
-        Ok(())
     }
 
     fn validate_gateway_discovery(

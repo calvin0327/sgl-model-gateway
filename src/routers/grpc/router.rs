@@ -134,7 +134,7 @@ impl GrpcRouter {
             shared_components,
             responses_context,
             harmony_responses_context,
-            retry_config: ctx.gateway_config.workers.effective_retry_config(),
+            retry_config: ctx.config.upstream.effective_retry_config(),
         })
     }
 

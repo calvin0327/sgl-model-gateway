@@ -9,10 +9,10 @@ use crate::{
     config::{
         gateway::{
             CircuitBreakerConfig, DiscoveryConfig, ExtensionConfig, GatewayConfig,
-            HealthCheckConfig, HistoryBackend, HttpServerConfig, ManualAssignmentMode, MeshConfig,
-            ModelConfig, ObservabilityConfig, OracleConfig, PolicyConfig, PostgresConfig,
-            RedisConfig, RetryConfig, RoutingConfig, RoutingMode, SecurityConfig, ServerTlsConfig,
-            StorageConfig, TokenizerCacheConfig, WorkerConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
+            HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MeshConfig, ModelConfig,
+            ObservabilityConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
+            RetryConfig, RoutingConfig, RoutingMode, ServerConfig, ServerTlsConfig, StorageConfig,
+            TokenizerCacheConfig, UpstreamConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
             DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST,
             DEFAULT_TCP_KEEPALIVE_SECS,
         },
@@ -968,7 +968,7 @@ impl CliArgs {
             .then_some(control_plane_auth);
 
         let config = GatewayConfig {
-            server: HttpServerConfig {
+            server: ServerConfig {
                 host: self.host.clone(),
                 port: self.port,
                 max_payload_size: self.max_payload_size,
@@ -976,18 +976,23 @@ impl CliArgs {
                 request_id_headers: (!self.request_id_headers.is_empty())
                     .then(|| self.request_id_headers.clone()),
                 shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+                max_concurrent_requests: self.max_concurrent_requests,
+                queue_size: self.queue_size,
+                queue_timeout_secs: self.queue_timeout_secs,
+                rate_limit_tokens_per_second: self.rate_limit_tokens_per_second,
+
+                api_key: self.api_key.clone(),
+                control_plane_auth,
+                server_tls: self.load_server_tls_config()?,
+                ..Default::default()
             },
             routing: RoutingConfig {
                 mode,
                 policy: self.build_policy_config(self.policy),
                 dp_aware: self.dp_aware,
                 enable_igw,
-                max_concurrent_requests: self.max_concurrent_requests,
-                queue_size: self.queue_size,
-                queue_timeout_secs: self.queue_timeout_secs,
-                rate_limit_tokens_per_second: self.rate_limit_tokens_per_second,
             },
-            workers: WorkerConfig {
+            upstream: UpstreamConfig {
                 connection_mode,
                 request_timeout_secs: self.request_timeout_secs,
                 startup_timeout_secs: self.worker_startup_timeout_secs,
@@ -1053,12 +1058,6 @@ impl CliArgs {
                     .then(|| self.prometheus_duration_buckets.clone()),
                 enable_trace: self.enable_trace,
                 otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
-            },
-            security: SecurityConfig {
-                api_key: self.api_key.clone(),
-                control_plane_auth,
-                server_tls: self.load_server_tls_config()?,
-                ..Default::default()
             },
             discovery,
             mesh: self.build_mesh_config()?,

@@ -78,7 +78,7 @@ impl WorkflowEngines {
         // Create local worker engine
         let local_worker = WorkflowEngine::new();
         local_worker
-            .register_workflow(create_local_worker_workflow(&gateway_config.workers))
+            .register_workflow(create_local_worker_workflow(&gateway_config.upstream))
             .expect("local_worker_registration workflow should be valid");
 
         // Create external worker engine

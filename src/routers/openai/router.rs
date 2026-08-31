@@ -176,7 +176,7 @@ impl OpenAIRouter {
             healthy: AtomicBool::new(true),
             shared_components,
             responses_components,
-            retry_config: ctx.gateway_config.workers.effective_retry_config(),
+            retry_config: ctx.config.upstream.effective_retry_config(),
         })
     }
 

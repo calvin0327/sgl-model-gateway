@@ -464,10 +464,10 @@ impl Router {
 
     pub fn to_gateway_config(&self) -> config::ConfigResult<config::GatewayConfig> {
         use config::{
-            CircuitBreakerConfig, DiscoveryConfig, ExtensionConfig, HealthCheckConfig,
-            HttpServerConfig, ModelConfig, ObservabilityConfig, PolicyConfig as ConfigPolicyConfig,
-            RetryConfig, RoutingConfig, RoutingMode, SecurityConfig, ServerTlsConfig,
-            StorageConfig, TokenizerCacheConfig, WorkerConfig,
+            CircuitBreakerConfig, DiscoveryConfig, ExtensionConfig, HealthCheckConfig, ModelConfig,
+            ObservabilityConfig, PolicyConfig as ConfigPolicyConfig, RetryConfig, RoutingConfig,
+            RoutingMode, ServerConfig, ServerTlsConfig, StorageConfig, TokenizerCacheConfig,
+            UpstreamConfig,
         };
 
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
@@ -659,25 +659,33 @@ impl Router {
             .transpose()?;
 
         Ok(config::GatewayConfig {
-            server: HttpServerConfig {
+            server: ServerConfig {
                 host: self.host.clone(),
                 port: self.port,
                 max_payload_size: self.max_payload_size,
                 cors_allowed_origins: self.cors_allowed_origins.clone(),
                 request_id_headers: self.request_id_headers.clone(),
                 shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+                max_concurrent_requests: self.max_concurrent_requests,
+                queue_size: self.queue_size,
+                queue_timeout_secs: self.queue_timeout_secs,
+                rate_limit_tokens_per_second: self.rate_limit_tokens_per_second,
+                api_key: self.api_key.clone(),
+                control_plane_auth: self
+                    .control_plane_auth
+                    .as_ref()
+                    .map(|config| config.to_auth_control_plane_config()),
+                server_tls,
+                client_identity,
+                ca_certificates,
             },
             routing: RoutingConfig {
                 mode,
                 policy,
                 dp_aware: self.dp_aware,
                 enable_igw: self.enable_igw,
-                max_concurrent_requests: self.max_concurrent_requests,
-                queue_size: self.queue_size,
-                queue_timeout_secs: self.queue_timeout_secs,
-                rate_limit_tokens_per_second: self.rate_limit_tokens_per_second,
             },
-            workers: WorkerConfig {
+            upstream: UpstreamConfig {
                 connection_mode: self.connection_mode.clone(),
                 request_timeout_secs: self.request_timeout_secs,
                 startup_timeout_secs: self.worker_startup_timeout_secs,
@@ -745,16 +753,6 @@ impl Router {
                 prometheus_duration_buckets: self.prometheus_duration_buckets.clone(),
                 enable_trace: self.enable_trace,
                 otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
-            },
-            security: SecurityConfig {
-                api_key: self.api_key.clone(),
-                control_plane_auth: self
-                    .control_plane_auth
-                    .as_ref()
-                    .map(|config| config.to_auth_control_plane_config()),
-                server_tls,
-                client_identity,
-                ca_certificates,
             },
             discovery,
             mesh: None,

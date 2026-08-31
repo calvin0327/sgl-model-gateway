@@ -51,7 +51,7 @@ impl StepExecutor<McpWorkflowData> for ConnectMcpServerStep {
 
         // Get proxy config from gateway configuration if available, otherwise fall back to env.
         let proxy_config = app_context
-            .gateway_config
+            .config
             .extensions
             .mcp_config
             .as_ref()

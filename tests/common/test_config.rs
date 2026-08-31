@@ -34,11 +34,11 @@ impl TestGatewayConfig {
             worker_urls: Vec::new(),
         };
         config.routing.policy = policy;
-        config.routing.max_concurrent_requests = defaults::MAX_CONCURRENT_REQUESTS;
-        config.routing.queue_timeout_secs = defaults::QUEUE_TIMEOUT_SECS;
-        config.workers.request_timeout_secs = defaults::REQUEST_TIMEOUT_SECS;
-        config.workers.startup_timeout_secs = defaults::WORKER_STARTUP_TIMEOUT_SECS;
-        config.workers.startup_check_interval_secs = defaults::WORKER_STARTUP_CHECK_INTERVAL_SECS;
+        config.server.max_concurrent_requests = defaults::MAX_CONCURRENT_REQUESTS;
+        config.server.queue_timeout_secs = defaults::QUEUE_TIMEOUT_SECS;
+        config.upstream.request_timeout_secs = defaults::REQUEST_TIMEOUT_SECS;
+        config.upstream.startup_timeout_secs = defaults::WORKER_STARTUP_TIMEOUT_SECS;
+        config.upstream.startup_check_interval_secs = defaults::WORKER_STARTUP_CHECK_INTERVAL_SECS;
         config
     }
 
@@ -101,7 +101,7 @@ impl TestGatewayConfig {
     /// Create a config with custom concurrent request limit (for rate limiting tests)
     pub fn with_concurrency(port: u16, max_concurrent: i32) -> GatewayConfig {
         let mut config = Self::round_robin(port);
-        config.routing.max_concurrent_requests = max_concurrent;
+        config.server.max_concurrent_requests = max_concurrent;
         config
     }
 
@@ -115,17 +115,17 @@ impl TestGatewayConfig {
     /// Create a config with short timeouts (for timeout/retry tests)
     pub fn with_short_timeouts(port: u16) -> GatewayConfig {
         let mut config = Self::round_robin(port);
-        config.workers.request_timeout_secs = 5;
-        config.workers.startup_timeout_secs = 2;
-        config.workers.startup_check_interval_secs = 1;
-        config.routing.queue_timeout_secs = 5;
+        config.upstream.request_timeout_secs = 5;
+        config.upstream.startup_timeout_secs = 2;
+        config.upstream.startup_check_interval_secs = 1;
+        config.server.queue_timeout_secs = 5;
         config
     }
 
     /// Create a round-robin config with retry settings
     pub fn round_robin_with_retry(port: u16, retry_config: RetryConfig) -> GatewayConfig {
         let mut config = Self::round_robin(port);
-        config.workers.retry = retry_config;
+        config.upstream.retry = retry_config;
         config
     }
 
@@ -135,7 +135,7 @@ impl TestGatewayConfig {
         circuit_breaker: CircuitBreakerConfig,
     ) -> GatewayConfig {
         let mut config = Self::round_robin(port);
-        config.workers.circuit_breaker = circuit_breaker;
+        config.upstream.circuit_breaker = circuit_breaker;
         config
     }
 
@@ -146,8 +146,8 @@ impl TestGatewayConfig {
         circuit_breaker: CircuitBreakerConfig,
     ) -> GatewayConfig {
         let mut config = Self::round_robin(port);
-        config.workers.retry = retry_config;
-        config.workers.circuit_breaker = circuit_breaker;
+        config.upstream.retry = retry_config;
+        config.upstream.circuit_breaker = circuit_breaker;
         config
     }
 }
@@ -231,57 +231,57 @@ impl TestGatewayConfigBuilder {
     }
 
     pub fn request_timeout_secs(mut self, request_timeout_secs: u64) -> Self {
-        self.config.workers.request_timeout_secs = request_timeout_secs;
+        self.config.upstream.request_timeout_secs = request_timeout_secs;
         self
     }
 
     pub fn worker_startup_timeout_secs(mut self, startup_timeout_secs: u64) -> Self {
-        self.config.workers.startup_timeout_secs = startup_timeout_secs;
+        self.config.upstream.startup_timeout_secs = startup_timeout_secs;
         self
     }
 
     pub fn worker_startup_check_interval_secs(mut self, check_interval_secs: u64) -> Self {
-        self.config.workers.startup_check_interval_secs = check_interval_secs;
+        self.config.upstream.startup_check_interval_secs = check_interval_secs;
         self
     }
 
     pub fn max_concurrent_requests(mut self, max_concurrent_requests: i32) -> Self {
-        self.config.routing.max_concurrent_requests = max_concurrent_requests;
+        self.config.server.max_concurrent_requests = max_concurrent_requests;
         self
     }
 
     pub fn queue_size(mut self, queue_size: usize) -> Self {
-        self.config.routing.queue_size = queue_size;
+        self.config.server.queue_size = queue_size;
         self
     }
 
     pub fn queue_timeout_secs(mut self, queue_timeout_secs: u64) -> Self {
-        self.config.routing.queue_timeout_secs = queue_timeout_secs;
+        self.config.server.queue_timeout_secs = queue_timeout_secs;
         self
     }
 
     pub fn rate_limit_tokens_per_second(mut self, tokens_per_second: i32) -> Self {
-        self.config.routing.rate_limit_tokens_per_second = Some(tokens_per_second);
+        self.config.server.rate_limit_tokens_per_second = Some(tokens_per_second);
         self
     }
 
     pub fn retry_config(mut self, retry: RetryConfig) -> Self {
-        self.config.workers.retry = retry;
+        self.config.upstream.retry = retry;
         self
     }
 
     pub fn circuit_breaker_config(mut self, circuit_breaker: CircuitBreakerConfig) -> Self {
-        self.config.workers.circuit_breaker = circuit_breaker;
+        self.config.upstream.circuit_breaker = circuit_breaker;
         self
     }
 
     pub fn disable_retries(mut self) -> Self {
-        self.config.workers.disable_retries = true;
+        self.config.upstream.disable_retries = true;
         self
     }
 
     pub fn disable_circuit_breaker(mut self) -> Self {
-        self.config.workers.disable_circuit_breaker = true;
+        self.config.upstream.disable_circuit_breaker = true;
         self
     }
 

@@ -24,14 +24,14 @@ use smg_mcp::{McpConfig, McpManager};
 pub fn create_test_app(
     router: Arc<dyn RouterTrait>,
     client: Client,
-    gateway_config: &GatewayConfig,
+    config: &GatewayConfig,
 ) -> Router {
     // Initialize rate limiter
-    let rate_limiter = match gateway_config.routing.max_concurrent_requests {
+    let rate_limiter = match config.server.max_concurrent_requests {
         n if n <= 0 => None,
         n => {
-            let rate_limit_tokens = gateway_config
-                .routing
+            let rate_limit_tokens = config
+                .server
                 .rate_limit_tokens_per_second
                 .filter(|&t| t > 0)
                 .unwrap_or(n);
@@ -44,7 +44,7 @@ pub fn create_test_app(
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(gateway_config.routing.policy.clone()));
+    let policy_registry = Arc::new(PolicyRegistry::new(config.routing.policy.clone()));
 
     // Initialize storage backends
     let response_storage = Arc::new(MemoryResponseStorage::new());
@@ -56,7 +56,7 @@ pub fn create_test_app(
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        gateway_config.workers.startup_check_interval_secs,
+        config.upstream.startup_check_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue and workflow engines
@@ -66,7 +66,7 @@ pub fn create_test_app(
     // Create AppContext using builder pattern
     let app_context = Arc::new(
         AppContext::builder()
-            .gateway_config(gateway_config.clone())
+            .gateway_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
@@ -95,7 +95,7 @@ pub fn create_test_app(
     });
 
     // Configure request ID headers (use defaults if not specified)
-    let request_id_headers = gateway_config
+    let request_id_headers = config
         .server
         .request_id_headers
         .clone()
@@ -110,7 +110,7 @@ pub fn create_test_app(
 
     // Create auth config from router config
     let auth_config = AuthConfig {
-        api_key: gateway_config.security.api_key.clone(),
+        api_key: config.server.api_key.clone(),
     };
 
     // Use the actual server's build_app function
@@ -118,9 +118,9 @@ pub fn create_test_app(
         app_state,
         auth_config,
         None, // No control plane auth for tests
-        gateway_config.server.max_payload_size,
+        config.server.max_payload_size,
         request_id_headers,
-        gateway_config.server.cors_allowed_origins.clone(),
+        config.server.cors_allowed_origins.clone(),
     )
 }
 
@@ -141,10 +141,10 @@ pub fn create_test_app_with_context(
     });
 
     // Get config from the context
-    let gateway_config = &app_context.gateway_config;
+    let config = &app_context.config;
 
     // Configure request ID headers (use defaults if not specified)
-    let request_id_headers = gateway_config
+    let request_id_headers = config
         .server
         .request_id_headers
         .clone()
@@ -159,7 +159,7 @@ pub fn create_test_app_with_context(
 
     // Create auth config from router config
     let auth_config = AuthConfig {
-        api_key: gateway_config.security.api_key.clone(),
+        api_key: config.server.api_key.clone(),
     };
 
     // Use the actual server's build_app function
@@ -167,9 +167,9 @@ pub fn create_test_app_with_context(
         app_state,
         auth_config,
         None, // No control plane auth for tests
-        gateway_config.server.max_payload_size,
+        config.server.max_payload_size,
         request_id_headers,
-        gateway_config.server.cors_allowed_origins.clone(),
+        config.server.cors_allowed_origins.clone(),
     )
 }
 

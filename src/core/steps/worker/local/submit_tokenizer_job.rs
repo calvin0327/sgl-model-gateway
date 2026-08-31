@@ -56,10 +56,10 @@ impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
             .config
             .chat_template
             .clone()
-            .or_else(|| app_context.gateway_config.model.chat_template.clone());
+            .or_else(|| app_context.config.model.chat_template.clone());
 
         // Get cache config from gateway config
-        let cache_config = app_context.gateway_config.model.tokenizer_cache.to_option();
+        let cache_config = app_context.config.model.tokenizer_cache.to_option();
 
         for worker in workers.iter() {
             let model_id = worker.model_id().to_string();
@@ -75,11 +75,11 @@ impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
             {
                 path.clone()
             } else if let Some(path) = app_context
-                .gateway_config
+                .config
                 .model
                 .tokenizer_path
                 .as_ref()
-                .or(app_context.gateway_config.model.model_path.as_ref())
+                .or(app_context.config.model.model_path.as_ref())
             {
                 debug!(
                     "Using router config tokenizer path '{}' for model {}",

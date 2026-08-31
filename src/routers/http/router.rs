@@ -73,9 +73,9 @@ impl Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
-            dp_aware: ctx.gateway_config.routing.dp_aware,
-            enable_igw: ctx.gateway_config.routing.enable_igw,
-            retry_config: ctx.gateway_config.workers.effective_retry_config(),
+            dp_aware: ctx.config.routing.dp_aware,
+            enable_igw: ctx.config.routing.enable_igw,
+            retry_config: ctx.config.upstream.effective_retry_config(),
         })
     }
 

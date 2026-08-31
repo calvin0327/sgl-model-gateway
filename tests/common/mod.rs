@@ -170,8 +170,8 @@ pub struct AppTestContext {
 impl AppTestContext {
     pub async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         let mut config = TestGatewayConfig::random(3002);
-        config.workers.startup_timeout_secs = 1;
-        config.workers.startup_check_interval_secs = 1;
+        config.upstream.startup_timeout_secs = 1;
+        config.upstream.startup_check_interval_secs = 1;
 
         Self::new_with_config(config, worker_configs).await
     }
@@ -283,11 +283,11 @@ pub async fn create_test_context(config: GatewayConfig) -> Arc<AppContext> {
     let client = reqwest::Client::new();
 
     // Initialize rate limiter
-    let rate_limiter = match config.routing.max_concurrent_requests {
+    let rate_limiter = match config.server.max_concurrent_requests {
         n if n <= 0 => None,
         n => {
             let rate_limit_tokens = config
-                .routing
+                .server
                 .rate_limit_tokens_per_second
                 .filter(|&t| t > 0)
                 .unwrap_or(n);
@@ -312,7 +312,7 @@ pub async fn create_test_context(config: GatewayConfig) -> Arc<AppContext> {
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        config.workers.startup_check_interval_secs,
+        config.upstream.startup_check_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
@@ -403,11 +403,11 @@ pub async fn create_test_context_with_parsers(config: GatewayConfig) -> Arc<AppC
     let client = reqwest::Client::new();
 
     // Initialize rate limiter
-    let rate_limiter = match config.routing.max_concurrent_requests {
+    let rate_limiter = match config.server.max_concurrent_requests {
         n if n <= 0 => None,
         n => {
             let rate_limit_tokens = config
-                .routing
+                .server
                 .rate_limit_tokens_per_second
                 .filter(|&t| t > 0)
                 .unwrap_or(n);
@@ -433,7 +433,7 @@ pub async fn create_test_context_with_parsers(config: GatewayConfig) -> Arc<AppC
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        config.workers.startup_check_interval_secs,
+        config.upstream.startup_check_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
@@ -533,11 +533,11 @@ pub async fn create_test_context_with_mcp_config(
     let client = reqwest::Client::new();
 
     // Initialize rate limiter
-    let rate_limiter = match config.routing.max_concurrent_requests {
+    let rate_limiter = match config.server.max_concurrent_requests {
         n if n <= 0 => None,
         n => {
             let rate_limit_tokens = config
-                .routing
+                .server
                 .rate_limit_tokens_per_second
                 .filter(|&t| t > 0)
                 .unwrap_or(n);
@@ -562,7 +562,7 @@ pub async fn create_test_context_with_mcp_config(
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        config.workers.startup_check_interval_secs,
+        config.upstream.startup_check_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp manager

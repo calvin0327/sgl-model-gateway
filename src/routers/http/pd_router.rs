@@ -182,9 +182,9 @@ impl PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             client: ctx.client.clone(),
-            retry_config: ctx.gateway_config.workers.effective_retry_config(),
-            api_key: ctx.gateway_config.security.api_key.clone(),
-            enable_igw: ctx.gateway_config.routing.enable_igw,
+            retry_config: ctx.config.upstream.effective_retry_config(),
+            api_key: ctx.config.server.api_key.clone(),
+            enable_igw: ctx.config.routing.enable_igw,
         })
     }
 

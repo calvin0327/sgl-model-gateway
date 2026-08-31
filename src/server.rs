@@ -245,7 +245,7 @@ async fn initialize_app_context(config: &GatewayConfig) -> Result<Arc<AppContext
 
     debug!(
         "Workflow engines initialized (health check timeout: {}s)",
-        config.workers.health_check.timeout_secs
+        config.upstream.health_check.timeout_secs
     );
 
     Ok(app_context)
@@ -336,16 +336,16 @@ fn start_health_checker(
     app_context: &Arc<AppContext>,
     config: &GatewayConfig,
 ) -> Option<crate::core::worker::HealthChecker> {
-    if config.workers.health_check.disable_health_check {
+    if config.upstream.health_check.disable_health_check {
         return None;
     }
 
     let health_checker = app_context
         .worker_registry
-        .start_health_checker(config.workers.health_check.check_interval_secs);
+        .start_health_checker(config.upstream.health_check.check_interval_secs);
     debug!(
         "Started health checker for workers with {}s interval",
-        config.workers.health_check.check_interval_secs
+        config.upstream.health_check.check_interval_secs
     );
     Some(health_checker)
 }
@@ -360,8 +360,8 @@ fn start_concurrency_queue(
 ) {
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),
-        config.routing.queue_size,
-        Duration::from_secs(config.routing.queue_timeout_secs),
+        config.server.queue_size,
+        Duration::from_secs(config.server.queue_timeout_secs),
     );
     if app_context.rate_limiter.is_none() {
         info!("Rate limiting is disabled (max_concurrent_requests = -1)");
@@ -372,14 +372,14 @@ fn start_concurrency_queue(
             let processor = spawn(processor.run());
             debug!(
                 "Started request queue (size: {}, timeout: {}s)",
-                config.routing.queue_size, config.routing.queue_timeout_secs
+                config.server.queue_size, config.server.queue_timeout_secs
             );
             (limiter.queue_tx.clone(), Some(processor))
         }
         None => {
             debug!(
                 "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
-                config.routing.max_concurrent_requests
+                config.server.max_concurrent_requests
             );
             (limiter.queue_tx.clone(), None)
         }
@@ -485,10 +485,10 @@ async fn build_http_app(config: &GatewayConfig, app_state: Arc<AppState>) -> Rou
         ]
     });
     let auth_config = AuthConfig {
-        api_key: config.security.api_key.clone(),
+        api_key: config.server.api_key.clone(),
     };
     let control_plane_auth_state =
-        crate::auth::ControlPlaneAuthState::try_init(config.security.control_plane_auth.as_ref())
+        crate::auth::ControlPlaneAuthState::try_init(config.server.control_plane_auth.as_ref())
             .await;
 
     build_app(
@@ -520,7 +520,7 @@ async fn serve_http(app: Router, config: &GatewayConfig) -> Result<()> {
     });
 
     // https server
-    if let Some(tls) = &config.security.server_tls {
+    if let Some(tls) = &config.server.server_tls {
         info!("TLS enabled");
         ring::default_provider()
             .install_default()

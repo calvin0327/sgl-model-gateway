@@ -65,7 +65,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        config.workers.startup_check_interval_secs,
+        config.upstream.startup_check_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp manager

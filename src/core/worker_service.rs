@@ -188,7 +188,7 @@ impl IntoResponse for GetWorkerResponse {
 pub struct WorkerService {
     worker_registry: Arc<WorkerRegistry>,
     job_queue: Arc<std::sync::OnceLock<Arc<JobQueue>>>,
-    gateway_config: GatewayConfig,
+    config: GatewayConfig,
 }
 
 impl WorkerService {
@@ -201,7 +201,7 @@ impl WorkerService {
         Self {
             worker_registry,
             job_queue,
-            gateway_config,
+            config: gateway_config,
         }
     }
 
@@ -226,7 +226,7 @@ impl WorkerService {
         &self,
         mut config: WorkerConfigRequest,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
-        if self.gateway_config.security.api_key.is_some() && config.api_key.is_none() {
+        if self.config.server.api_key.is_some() && config.api_key.is_none() {
             warn!(
                 "Adding worker {} without API key while router has API key configured. \
                 Worker will be accessible without authentication. \
@@ -235,7 +235,7 @@ impl WorkerService {
             );
         }
 
-        config.dp_aware = self.gateway_config.routing.dp_aware;
+        config.dp_aware = self.config.routing.dp_aware;
 
         let worker_url = config.url.clone();
         let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);

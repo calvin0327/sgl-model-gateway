@@ -42,8 +42,8 @@ impl StepExecutor<ExternalWorkerWorkflowData> for CreateExternalWorkersStep {
         // Build configs from router settings
         let circuit_breaker_config = {
             let cfg = app_context
-                .gateway_config
-                .workers
+                .config
+                .upstream
                 .effective_circuit_breaker_config();
             CircuitBreakerConfig {
                 failure_threshold: cfg.failure_threshold,
@@ -54,7 +54,7 @@ impl StepExecutor<ExternalWorkerWorkflowData> for CreateExternalWorkersStep {
         };
 
         let health_config = {
-            let cfg = &app_context.gateway_config.workers.health_check;
+            let cfg = &app_context.config.upstream.health_check;
             HealthConfig {
                 timeout_secs: cfg.timeout_secs,
                 check_interval_secs: cfg.check_interval_secs,

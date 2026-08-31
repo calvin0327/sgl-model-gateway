@@ -164,7 +164,7 @@ impl RouterManager {
 
             let single_router = Arc::from(RouterFactory::create_router(app_context).await?);
             let router_id =
-                Self::determine_router_id(&config.routing.mode, &config.workers.connection_mode);
+                Self::determine_router_id(&config.routing.mode, &config.upstream.connection_mode);
 
             info!("Created single router with ID: {}", router_id.as_str());
             manager.register_router(router_id.clone(), single_router);

@@ -301,7 +301,7 @@ impl JobQueue {
                     .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
                 let timeout_duration =
-                    Duration::from_secs(context.gateway_config.workers.startup_timeout_secs + 30);
+                    Duration::from_secs(context.config.upstream.startup_timeout_secs + 30);
 
                 // Select workflow based on runtime field
                 match config.runtime.as_deref() {
@@ -403,7 +403,7 @@ impl JobQueue {
 
                 let workflow_data = create_worker_removal_workflow_data(
                     url.to_string(),
-                    context.gateway_config.routing.dp_aware,
+                    context.config.routing.dp_aware,
                     Arc::clone(context),
                 );
 
@@ -494,12 +494,14 @@ impl JobQueue {
                     )
                     .await
             }
-            Job::InitializeWorkersFromConfig { gateway_config } => {
-                let api_key = gateway_config.security.api_key.clone();
+            Job::InitializeWorkersFromConfig {
+                gateway_config: config,
+            } => {
+                let api_key = config.server.api_key.clone();
                 let mut worker_count = 0;
 
                 // Create iterator of (url, worker_type, bootstrap_port) tuples based on mode
-                let workers: Vec<(String, &str, Option<u16>)> = match &gateway_config.routing.mode {
+                let workers: Vec<(String, &str, Option<u16>)> = match &config.routing.mode {
                     RoutingMode::Regular { worker_urls } => worker_urls
                         .iter()
                         .map(|url| (url.clone(), "regular", None))
@@ -521,7 +523,7 @@ impl JobQueue {
                     RoutingMode::OpenAI { worker_urls } => {
                         // OpenAI mode: submit AddWorker jobs with runtime: "external"
                         // The external_worker_registration workflow handles model discovery
-                        let api_key = gateway_config.security.api_key.clone();
+                        let api_key = config.server.api_key.clone();
                         let mut submitted_count = 0;
 
                         for url in worker_urls {
@@ -538,30 +540,30 @@ impl JobQueue {
                                 tokenizer_path: None,
                                 reasoning_parser: None,
                                 tool_parser: None,
-                                chat_template: gateway_config.model.chat_template.clone(),
+                                chat_template: config.model.chat_template.clone(),
                                 bootstrap_port: None,
-                                health_check_timeout_secs: gateway_config
-                                    .workers
+                                health_check_timeout_secs: config
+                                    .upstream
                                     .health_check
                                     .timeout_secs,
-                                health_check_interval_secs: gateway_config
-                                    .workers
+                                health_check_interval_secs: config
+                                    .upstream
                                     .health_check
                                     .check_interval_secs,
-                                health_success_threshold: gateway_config
-                                    .workers
+                                health_success_threshold: config
+                                    .upstream
                                     .health_check
                                     .success_threshold,
-                                health_failure_threshold: gateway_config
-                                    .workers
+                                health_failure_threshold: config
+                                    .upstream
                                     .health_check
                                     .failure_threshold,
-                                disable_health_check: gateway_config
-                                    .workers
+                                disable_health_check: config
+                                    .upstream
                                     .health_check
                                     .disable_health_check,
-                                max_connection_attempts: gateway_config
-                                    .workers
+                                max_connection_attempts: config
+                                    .upstream
                                     .health_check
                                     .success_threshold
                                     * 10,
@@ -617,31 +619,19 @@ impl JobQueue {
                         tokenizer_path: None,
                         reasoning_parser: None,
                         tool_parser: None,
-                        chat_template: gateway_config.model.chat_template.clone(),
+                        chat_template: config.model.chat_template.clone(),
                         bootstrap_port,
-                        health_check_timeout_secs: gateway_config.workers.health_check.timeout_secs,
-                        health_check_interval_secs: gateway_config
-                            .workers
+                        health_check_timeout_secs: config.upstream.health_check.timeout_secs,
+                        health_check_interval_secs: config
+                            .upstream
                             .health_check
                             .check_interval_secs,
-                        health_success_threshold: gateway_config
-                            .workers
-                            .health_check
-                            .success_threshold,
-                        health_failure_threshold: gateway_config
-                            .workers
-                            .health_check
-                            .failure_threshold,
-                        disable_health_check: gateway_config
-                            .workers
-                            .health_check
-                            .disable_health_check,
-                        max_connection_attempts: gateway_config
-                            .workers
-                            .health_check
-                            .success_threshold
+                        health_success_threshold: config.upstream.health_check.success_threshold,
+                        health_failure_threshold: config.upstream.health_check.failure_threshold,
+                        disable_health_check: config.upstream.health_check.disable_health_check,
+                        max_connection_attempts: config.upstream.health_check.success_threshold
                             * 10,
-                        dp_aware: gateway_config.routing.dp_aware,
+                        dp_aware: config.routing.dp_aware,
                     };
 
                     let job = Job::AddWorker {

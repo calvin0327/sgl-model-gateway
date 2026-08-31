@@ -243,7 +243,7 @@ mod pd_routing_unit_tests {
                     worker_registry.clone(),
                     policy_registry.clone(),
                     client.clone(),
-                    config.workers.startup_check_interval_secs,
+                    config.upstream.startup_check_interval_secs,
                 )));
 
                 // Create empty OnceLock for worker job queue, workflow engines, and mcp manager

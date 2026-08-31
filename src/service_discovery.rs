@@ -485,39 +485,31 @@ async fn handle_pod_event(
                 reasoning_parser: None,
                 tool_parser: None,
                 chat_template: None,
-                api_key: app_context.gateway_config.security.api_key.clone(),
-                health_check_timeout_secs: app_context
-                    .gateway_config
-                    .workers
-                    .health_check
-                    .timeout_secs,
+                api_key: app_context.config.server.api_key.clone(),
+                health_check_timeout_secs: app_context.config.upstream.health_check.timeout_secs,
                 health_check_interval_secs: app_context
-                    .gateway_config
-                    .workers
+                    .config
+                    .upstream
                     .health_check
                     .check_interval_secs,
                 health_success_threshold: app_context
-                    .gateway_config
-                    .workers
+                    .config
+                    .upstream
                     .health_check
                     .success_threshold,
                 health_failure_threshold: app_context
-                    .gateway_config
-                    .workers
+                    .config
+                    .upstream
                     .health_check
                     .failure_threshold,
                 disable_health_check: app_context
-                    .gateway_config
-                    .workers
+                    .config
+                    .upstream
                     .health_check
                     .disable_health_check,
-                max_connection_attempts: app_context
-                    .gateway_config
-                    .workers
-                    .health_check
-                    .success_threshold
+                max_connection_attempts: app_context.config.upstream.health_check.success_threshold
                     * 20,
-                dp_aware: app_context.gateway_config.routing.dp_aware,
+                dp_aware: app_context.config.routing.dp_aware,
             };
 
             let job = Job::AddWorker {
@@ -866,7 +858,7 @@ mod tests {
         };
 
         let mut gateway_config = GatewayConfig::default();
-        gateway_config.workers.startup_timeout_secs = 1;
+        gateway_config.upstream.startup_timeout_secs = 1;
 
         let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
         let worker_job_queue = Arc::new(std::sync::OnceLock::new());
@@ -875,7 +867,7 @@ mod tests {
         // Jobs submitted during tests will queue but not be processed
         Arc::new(AppContext {
             client: reqwest::Client::new(),
-            gateway_config: gateway_config.clone(),
+            config: gateway_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             worker_registry: worker_registry.clone(),
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(

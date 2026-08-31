@@ -38,7 +38,7 @@ impl std::error::Error for AppContextBuildError {}
 #[derive(Clone)]
 pub struct AppContext {
     pub client: Client,
-    pub gateway_config: GatewayConfig,
+    pub config: GatewayConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -62,7 +62,7 @@ pub struct AppContext {
 impl std::fmt::Debug for AppContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppContext")
-            .field("gateway_config", &self.gateway_config)
+            .field("gateway_config", &self.config)
             .finish_non_exhaustive()
     }
 }
@@ -235,7 +235,7 @@ impl AppContextBuilder {
 
         Ok(AppContext {
             client: self.client.ok_or(AppContextBuildError("client"))?,
-            gateway_config,
+            config: gateway_config,
             rate_limiter: self.rate_limiter,
             tokenizer_registry: self
                 .tokenizer_registry
@@ -310,18 +310,20 @@ impl AppContextBuilder {
         // Use rustls TLS backend when TLS/mTLS is configured (client cert or CA certs provided).
         // This ensures proper PKCS#8 key format support. For plain HTTP workers, use default
         // backend to avoid unnecessary TLS initialization overhead.
-        let has_tls_config = config.security.client_identity.is_some()
-            || !config.security.ca_certificates.is_empty();
+        let has_tls_config = config.server.client_identity.is_some()
+            || !config.server.ca_certificates.is_empty();
 
         let mut client_builder = Client::builder()
             .pool_idle_timeout(Some(Duration::from_secs(
-                config.workers.pool_idle_timeout_secs,
+                config.upstream.pool_idle_timeout_secs,
             )))
-            .pool_max_idle_per_host(config.workers.pool_max_idle_per_host)
-            .timeout(Duration::from_secs(config.workers.request_timeout_secs))
-            .connect_timeout(Duration::from_secs(config.workers.connect_timeout_secs))
+            .pool_max_idle_per_host(config.upstream.pool_max_idle_per_host)
+            .timeout(Duration::from_secs(config.upstream.request_timeout_secs))
+            .connect_timeout(Duration::from_secs(config.upstream.connect_timeout_secs))
             .tcp_nodelay(true)
-            .tcp_keepalive(Some(Duration::from_secs(config.workers.tcp_keepalive_secs)));
+            .tcp_keepalive(Some(Duration::from_secs(
+                config.upstream.tcp_keepalive_secs,
+            )));
 
         // Force rustls backend when TLS is configured
         if has_tls_config {
@@ -330,7 +332,7 @@ impl AppContextBuilder {
         }
 
         // Configure mTLS client identity if provided (certificates already loaded during config creation)
-        if let Some(identity_pem) = &config.security.client_identity {
+        if let Some(identity_pem) = &config.server.client_identity {
             let identity = reqwest::Identity::from_pem(identity_pem)
                 .map_err(|e| format!("Failed to create client identity: {}", e))?;
             client_builder = client_builder.identity(identity);
@@ -338,15 +340,15 @@ impl AppContextBuilder {
         }
 
         // Add CA certificates for verifying worker TLS (certificates already loaded during config creation)
-        for ca_cert in &config.security.ca_certificates {
+        for ca_cert in &config.server.ca_certificates {
             let cert = reqwest::Certificate::from_pem(ca_cert)
                 .map_err(|e| format!("Failed to add CA certificate: {}", e))?;
             client_builder = client_builder.add_root_certificate(cert);
         }
-        if !config.security.ca_certificates.is_empty() {
+        if !config.server.ca_certificates.is_empty() {
             debug!(
                 "Added {} CA certificate(s) for worker verification",
-                config.security.ca_certificates.len()
+                config.server.ca_certificates.len()
             );
         }
 
@@ -360,11 +362,11 @@ impl AppContextBuilder {
 
     /// Create rate limiter based on config
     fn maybe_rate_limiter(mut self, config: &GatewayConfig) -> Self {
-        self.rate_limiter = match config.routing.max_concurrent_requests {
+        self.rate_limiter = match config.server.max_concurrent_requests {
             n if n <= 0 => None,
             n => {
                 let rate_limit_tokens = config
-                    .routing
+                    .server
                     .rate_limit_tokens_per_second
                     .filter(|&t| t > 0)
                     .unwrap_or(n);
@@ -450,7 +452,7 @@ impl AppContextBuilder {
                 .expect("policy_registry must be set")
                 .clone(),
             client.clone(),
-            config.workers.startup_check_interval_secs,
+            config.upstream.startup_check_interval_secs,
         )));
         self
     }

@@ -207,10 +207,10 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
         .filter(|worker| worker.is_healthy())
         .collect();
 
-    let is_ready = if state.context.gateway_config.routing.enable_igw {
+    let is_ready = if state.context.config.routing.enable_igw {
         !healthy_workers.is_empty()
     } else {
-        match &state.context.gateway_config.routing.mode {
+        match &state.context.config.routing.mode {
             RoutingMode::PrefillDecode { .. } => {
                 let has_prefill = healthy_workers
                     .iter()

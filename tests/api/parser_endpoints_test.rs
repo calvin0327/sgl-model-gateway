@@ -84,7 +84,7 @@ impl ParserTestContext {
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(
-                config.workers.request_timeout_secs,
+                config.upstream.request_timeout_secs,
             ))
             .build()
             .unwrap();

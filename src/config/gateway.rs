@@ -5,7 +5,7 @@ pub use data_connector::{HistoryBackend, OracleConfig, PostgresConfig, RedisConf
 use serde::{Deserialize, Serialize};
 
 use super::validation::ConfigValidator;
-use crate::core::ConnectionMode;
+use crate::{auth::ControlPlaneAuthConfig, core::ConnectionMode};
 
 pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 50;
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -18,18 +18,24 @@ pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 /// here so consumers can depend on only the configuration they need.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
-    pub server: HttpServerConfig,
-    pub routing: RoutingConfig,
-    pub workers: WorkerConfig,
-    pub model: ModelConfig,
-    pub storage: StorageConfig,
-    pub extensions: ExtensionConfig,
-    pub observability: ObservabilityConfig,
-    pub security: SecurityConfig,
-    /// Kubernetes discovery settings; absent when discovery is disabled.
-    pub discovery: Option<DiscoveryConfig>,
+    pub server: ServerConfig,
+
     /// Mesh node settings; absent when mesh is disabled.
     pub mesh: Option<MeshConfig>,
+
+    // RoutingConfig is not clear
+    pub routing: RoutingConfig,
+
+    /// Kubernetes discovery settings; absent when discovery is disabled.
+    pub discovery: Option<DiscoveryConfig>,
+    pub upstream: UpstreamConfig,
+
+    pub model: ModelConfig,
+
+    pub storage: StorageConfig,
+    pub extensions: ExtensionConfig,
+
+    pub observability: ObservabilityConfig,
 }
 
 impl GatewayConfig {
@@ -49,14 +55,13 @@ impl GatewayConfig {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            server: HttpServerConfig::default(),
+            server: ServerConfig::default(),
             routing: RoutingConfig::default(),
-            workers: WorkerConfig::default(),
+            upstream: UpstreamConfig::default(),
             model: ModelConfig::default(),
             storage: StorageConfig::default(),
             extensions: ExtensionConfig::default(),
             observability: ObservabilityConfig::default(),
-            security: SecurityConfig::default(),
             discovery: None,
             mesh: None,
         }
@@ -65,16 +70,46 @@ impl Default for GatewayConfig {
 
 /// Configuration for the gateway's public HTTP listener.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpServerConfig {
+pub struct ServerConfig {
+    /// Gateway HTTP listener address.
     pub host: String,
+    /// Gateway HTTP listener port.
     pub port: u16,
+    /// Maximum accepted HTTP request body size in bytes.
     pub max_payload_size: usize,
+    /// Origins allowed by the CORS policy; empty disables CORS headers.
     pub cors_allowed_origins: Vec<String>,
+    /// Request headers checked for an existing request ID.
     pub request_id_headers: Option<Vec<String>>,
+    /// Maximum time to wait for in-flight requests during shutdown.
     pub shutdown_grace_period_secs: u64,
+
+    /// API key required for gateway client requests.
+    pub api_key: Option<String>,
+    /// Authentication policy for control-plane management APIs.
+    pub control_plane_auth: Option<ControlPlaneAuthConfig>,
+
+    /// TLS certificate and private key presented to gateway clients.
+    pub server_tls: Option<ServerTlsConfig>,
+
+    /// Client certificate and private key for mTLS connections to workers.
+    #[serde(skip)]
+    pub client_identity: Option<Vec<u8>>,
+    /// CA certificates trusted when connecting to HTTPS workers.
+    #[serde(default)]
+    pub ca_certificates: Vec<Vec<u8>>,
+
+    /// Maximum in-flight requests; set to -1 to disable the limit.
+    pub max_concurrent_requests: i32,
+    /// Maximum requests allowed to wait for an execution slot.
+    pub queue_size: usize,
+    /// Maximum time a request may wait in the admission queue.
+    pub queue_timeout_secs: u64,
+    /// Token-bucket refill rate; absent disables rate limiting.
+    pub rate_limit_tokens_per_second: Option<i32>,
 }
 
-impl Default for HttpServerConfig {
+impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             host: "0.0.0.0".to_string(),
@@ -83,35 +118,15 @@ impl Default for HttpServerConfig {
             cors_allowed_origins: Vec::new(),
             request_id_headers: None,
             shutdown_grace_period_secs: 180,
-        }
-    }
-}
-
-/// Security settings used by the public server and its outbound clients.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecurityConfig {
-    /// Authentication for inbound gateway requests.
-    pub api_key: Option<String>,
-    pub control_plane_auth: Option<crate::auth::ControlPlaneAuthConfig>,
-
-    /// TLS identity presented by the public HTTP server.
-    pub server_tls: Option<ServerTlsConfig>,
-
-    /// Client certificate material used for outbound connections.
-    #[serde(skip)]
-    pub client_identity: Option<Vec<u8>>,
-    #[serde(default)]
-    pub ca_certificates: Vec<Vec<u8>>,
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
             api_key: None,
             control_plane_auth: None,
             server_tls: None,
             client_identity: None,
             ca_certificates: Vec::new(),
+            max_concurrent_requests: -1,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
         }
     }
 }
@@ -125,18 +140,17 @@ pub struct ServerTlsConfig {
     pub private_key: Vec<u8>,
 }
 
-/// Configuration for request admission and worker selection.
+/// Configuration for request routing and worker selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingConfig {
-    pub mode: RoutingMode,
-    pub policy: PolicyConfig,
-    pub dp_aware: bool,
+    /// Enables multi-model inference gateway mode.
     pub enable_igw: bool,
-    /// Set to -1 to disable concurrent-request limiting.
-    pub max_concurrent_requests: i32,
-    pub queue_size: usize,
-    pub queue_timeout_secs: u64,
-    pub rate_limit_tokens_per_second: Option<i32>,
+    /// Worker topology used by the legacy static startup configuration.
+    pub mode: RoutingMode,
+    /// Default load-balancing policy for worker selection.
+    pub policy: PolicyConfig,
+    /// Enables data-parallelism-aware worker selection.
+    pub dp_aware: bool,
 }
 
 impl RoutingConfig {
@@ -163,10 +177,6 @@ impl Default for RoutingConfig {
             policy: PolicyConfig::Random,
             dp_aware: false,
             enable_igw: false,
-            max_concurrent_requests: -1,
-            queue_size: 100,
-            queue_timeout_secs: 60,
-            rate_limit_tokens_per_second: None,
         }
     }
 }
@@ -352,7 +362,7 @@ impl PolicyConfig {
 
 /// Configuration for connections to and lifecycle management of workers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerConfig {
+pub struct UpstreamConfig {
     /// Protocol used for gateway-to-worker calls.
     pub connection_mode: ConnectionMode,
     /// Deadline for one request sent to a worker.
@@ -381,7 +391,7 @@ pub struct WorkerConfig {
     pub health_check: HealthCheckConfig,
 }
 
-impl Default for WorkerConfig {
+impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
             connection_mode: ConnectionMode::Http,
@@ -401,7 +411,7 @@ impl Default for WorkerConfig {
     }
 }
 
-impl WorkerConfig {
+impl UpstreamConfig {
     pub fn effective_retry_config(&self) -> RetryConfig {
         let mut config = self.retry.clone();
         if self.disable_retries {
@@ -655,14 +665,28 @@ impl Default for ObservabilityConfig {
 /// Kubernetes-based worker and router discovery settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryConfig {
-    pub selector: HashMap<String, String>,
+    /// Kubernetes namespace to watch; absent watches all namespaces.
     pub namespace: Option<String>,
+
+    /// Labels used to discover regular worker Pods.
+    pub selector: HashMap<String, String>,
+
+    /// Worker service port exposed by discovered Pods.
     pub port: u16,
-    pub check_interval_secs: u64,
+
+    /// Labels used to discover Prefill worker Pods.
     pub prefill_selector: HashMap<String, String>,
+    /// Labels used to discover Decode worker Pods.
     pub decode_selector: HashMap<String, String>,
+
+    /// Delay before restarting a completed or failed watcher.
+    pub check_interval_secs: u64,
+
+    /// Pod annotation containing a Prefill Worker bootstrap port.
     pub bootstrap_port_annotation: String,
+    /// Labels used to discover gateway Pods for mesh membership.
     pub router_selector: HashMap<String, String>,
+    /// Pod annotation containing a gateway mesh port.
     pub router_mesh_port_annotation: String,
 }
 
