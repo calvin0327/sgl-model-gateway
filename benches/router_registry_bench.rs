@@ -44,10 +44,10 @@ fn bench_optimizations(c: &mut Criterion) {
 
     //  The NEW method (Fast: O(1) Lookup, Zero Allocation)
     group.bench_function(
-        BenchmarkId::new("New: get_worker_distribution()", size),
+        BenchmarkId::new("New: get_healthy_worker_distribution()", size),
         |b| {
             b.iter(|| {
-                black_box(registry.get_worker_distribution());
+                black_box(registry.get_healthy_worker_distribution());
             });
         },
     );

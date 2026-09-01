@@ -1023,8 +1023,11 @@ mod upstream_cancel_tests {
             cfg_path.to_str().unwrap(),
         )
         .await;
-        let router: Arc<dyn RouterTrait> =
-            Arc::from(RouterFactory::create_router(&ctx).await.expect("router"));
+        let router: Arc<dyn RouterTrait> = Arc::from(
+            RouterFactory::create_regular_router(&ctx)
+                .await
+                .expect("router"),
+        );
         let app = crate::common::test_app::create_test_app_with_context(router, ctx);
 
         let payload = json!({
@@ -1162,8 +1165,11 @@ mod upstream_cancel_tests {
             cfg_path.to_str().unwrap(),
         )
         .await;
-        let router: Arc<dyn RouterTrait> =
-            Arc::from(RouterFactory::create_router(&ctx).await.expect("router"));
+        let router: Arc<dyn RouterTrait> = Arc::from(
+            RouterFactory::create_regular_router(&ctx)
+                .await
+                .expect("router"),
+        );
         let app = crate::common::test_app::create_test_app_with_context(router, ctx);
 
         let payload = json!({
@@ -1275,8 +1281,11 @@ mod upstream_cancel_tests {
         )
         .await;
         let storage = ctx.response_storage.clone();
-        let router: Arc<dyn RouterTrait> =
-            Arc::from(RouterFactory::create_router(&ctx).await.expect("router"));
+        let router: Arc<dyn RouterTrait> = Arc::from(
+            RouterFactory::create_regular_router(&ctx)
+                .await
+                .expect("router"),
+        );
         let pinned_worker = ctx
             .worker_registry
             .get_by_url(&worker_url)

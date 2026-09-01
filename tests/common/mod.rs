@@ -25,7 +25,7 @@ use mock_worker::{MockWorker, MockWorkerConfig};
 use serde_json::json;
 use smg::{
     app_context::AppContext,
-    config::{GatewayConfig, RoutingMode},
+    config::GatewayConfig,
     core::{
         BasicWorkerBuilder, Job, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry,
         WorkerType,
@@ -170,8 +170,8 @@ pub struct AppTestContext {
 impl AppTestContext {
     pub async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         let mut config = TestGatewayConfig::random(3002);
-        config.upstream.startup_timeout_secs = 1;
-        config.upstream.startup_check_interval_secs = 1;
+        config.workers.startup_timeout_secs = 1;
+        config.workers.startup_check_interval_secs = 1;
 
         Self::new_with_config(config, worker_configs).await
     }
@@ -194,22 +194,12 @@ impl AppTestContext {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
 
-        match &mut config.routing.mode {
-            RoutingMode::Regular {
-                worker_urls: ref mut urls,
-            } => {
-                if urls.is_empty() {
-                    *urls = worker_urls.clone();
-                }
-            }
-            RoutingMode::OpenAI {
-                worker_urls: ref mut urls,
-            } => {
-                if urls.is_empty() {
-                    *urls = worker_urls.clone();
-                }
-            }
-            _ => {}
+        if config.workers.prefill_urls.is_empty()
+            && config.workers.decode_urls.is_empty()
+            && config.workers.openai_urls.is_empty()
+            && config.workers.regular_urls.is_empty()
+        {
+            config.workers.regular_urls = worker_urls.clone();
         }
 
         let app_context = create_test_context(config.clone()).await;
@@ -253,7 +243,9 @@ impl AppTestContext {
             }
         }
 
-        let router = RouterFactory::create_router(&app_context).await.unwrap();
+        let router = RouterFactory::create_regular_router(&app_context)
+            .await
+            .unwrap();
         let router = Arc::from(router);
 
         Self {
@@ -312,7 +304,7 @@ pub async fn create_test_context(config: GatewayConfig) -> Arc<AppContext> {
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        config.upstream.startup_check_interval_secs,
+        config.workers.startup_check_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
@@ -358,23 +350,21 @@ pub async fn create_test_context(config: GatewayConfig) -> Arc<AppContext> {
         .expect("WorkflowEngines should only be initialized once");
 
     // Register external workers for OpenAI mode
-    if let RoutingMode::OpenAI { worker_urls, .. } = &config.routing.mode {
-        for url in worker_urls {
-            // Create a worker that supports common test models
-            let models = vec![
-                ModelCard::new("mock-model"),
-                ModelCard::new("gpt-4"),
-                ModelCard::new("gpt-3.5-turbo"),
-            ];
-            let worker: Arc<dyn Worker> = Arc::new(
-                BasicWorkerBuilder::new(url)
-                    .worker_type(WorkerType::Regular)
-                    .runtime_type(RuntimeType::External)
-                    .models(models)
-                    .build(),
-            );
-            app_context.worker_registry.register(worker);
-        }
+    for url in &config.workers.openai_urls {
+        // Create a worker that supports common test models
+        let models = vec![
+            ModelCard::new("mock-model"),
+            ModelCard::new("gpt-4"),
+            ModelCard::new("gpt-3.5-turbo"),
+        ];
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::External)
+                .models(models)
+                .build(),
+        );
+        app_context.worker_registry.register(worker);
     }
 
     // Initialize MCP manager with empty config
@@ -433,7 +423,7 @@ pub async fn create_test_context_with_parsers(config: GatewayConfig) -> Arc<AppC
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        config.upstream.startup_check_interval_secs,
+        config.workers.startup_check_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
@@ -483,23 +473,21 @@ pub async fn create_test_context_with_parsers(config: GatewayConfig) -> Arc<AppC
         .expect("WorkflowEngines should only be initialized once");
 
     // Register external workers for OpenAI mode
-    if let RoutingMode::OpenAI { worker_urls, .. } = &config.routing.mode {
-        for url in worker_urls {
-            // Create a worker that supports common test models
-            let models = vec![
-                ModelCard::new("mock-model"),
-                ModelCard::new("gpt-4"),
-                ModelCard::new("gpt-3.5-turbo"),
-            ];
-            let worker: Arc<dyn Worker> = Arc::new(
-                BasicWorkerBuilder::new(url)
-                    .worker_type(WorkerType::Regular)
-                    .runtime_type(RuntimeType::External)
-                    .models(models)
-                    .build(),
-            );
-            app_context.worker_registry.register(worker);
-        }
+    for url in &config.workers.openai_urls {
+        // Create a worker that supports common test models
+        let models = vec![
+            ModelCard::new("mock-model"),
+            ModelCard::new("gpt-4"),
+            ModelCard::new("gpt-3.5-turbo"),
+        ];
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::External)
+                .models(models)
+                .build(),
+        );
+        app_context.worker_registry.register(worker);
     }
 
     // Initialize MCP manager with empty config
@@ -562,7 +550,7 @@ pub async fn create_test_context_with_mcp_config(
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        config.upstream.startup_check_interval_secs,
+        config.workers.startup_check_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
@@ -608,23 +596,21 @@ pub async fn create_test_context_with_mcp_config(
         .expect("WorkflowEngines should only be initialized once");
 
     // Register external workers for OpenAI mode
-    if let RoutingMode::OpenAI { worker_urls, .. } = &config.routing.mode {
-        for url in worker_urls {
-            // Create a worker that supports common test models
-            let models = vec![
-                ModelCard::new("mock-model"),
-                ModelCard::new("gpt-4"),
-                ModelCard::new("gpt-3.5-turbo"),
-            ];
-            let worker: Arc<dyn Worker> = Arc::new(
-                BasicWorkerBuilder::new(url)
-                    .worker_type(WorkerType::Regular)
-                    .runtime_type(RuntimeType::External)
-                    .models(models)
-                    .build(),
-            );
-            app_context.worker_registry.register(worker);
-        }
+    for url in &config.workers.openai_urls {
+        // Create a worker that supports common test models
+        let models = vec![
+            ModelCard::new("mock-model"),
+            ModelCard::new("gpt-4"),
+            ModelCard::new("gpt-3.5-turbo"),
+        ];
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::External)
+                .models(models)
+                .build(),
+        );
+        app_context.worker_registry.register(worker);
     }
 
     // Initialize MCP manager from config file

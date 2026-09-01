@@ -25,13 +25,13 @@ crate-type = ["rlib"]
 name = "sgl-model-gateway"
 path = "src/main.rs"
 
-[[bin]]
-name = "smg"
-path = "src/main.rs"
+# [[bin]]
+# name = "smg"
+# path = "src/main.rs"
 
-[[bin]]
-name = "amg"
-path = "src/main.rs"
+# [[bin]]
+# name = "amg"
+# path = "src/main.rs"
 
 [[bin]]
 name = "mock-worker"

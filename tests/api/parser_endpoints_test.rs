@@ -9,7 +9,7 @@ use reqwest::Client;
 use serde_json::json;
 use smg::{
     app_context::AppContext,
-    config::{GatewayConfig, RoutingMode},
+    config::GatewayConfig,
     routers::{RouterFactory, RouterTrait},
 };
 use tower::ServiceExt;
@@ -64,27 +64,17 @@ impl ParserTestContext {
         }
 
         // Update config with worker URLs if not already set
-        match &mut config.routing.mode {
-            RoutingMode::Regular {
-                worker_urls: ref mut urls,
-            } => {
-                if urls.is_empty() {
-                    *urls = worker_urls.clone();
-                }
-            }
-            RoutingMode::OpenAI {
-                worker_urls: ref mut urls,
-            } => {
-                if urls.is_empty() {
-                    *urls = worker_urls.clone();
-                }
-            }
-            _ => {} // PrefillDecode mode has its own setup
+        if config.workers.regular_urls.is_empty()
+            && config.workers.prefill_urls.is_empty()
+            && config.workers.decode_urls.is_empty()
+            && config.workers.openai_urls.is_empty()
+        {
+            config.workers.regular_urls = worker_urls.clone();
         }
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(
-                config.upstream.request_timeout_secs,
+                config.workers.request_timeout_secs,
             ))
             .build()
             .unwrap();
@@ -93,7 +83,9 @@ impl ParserTestContext {
         let app_context = crate::common::create_test_context_with_parsers(config.clone()).await;
 
         // Create router
-        let router = RouterFactory::create_router(&app_context).await.unwrap();
+        let router = RouterFactory::create_regular_router(&app_context)
+            .await
+            .unwrap();
         let router = Arc::from(router);
 
         Self {

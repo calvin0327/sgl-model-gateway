@@ -1,8 +1,8 @@
 use super::{
     gateway::{
         CircuitBreakerConfig, DiscoveryConfig, GatewayConfig, HistoryBackend, MeshConfig,
-        ObservabilityConfig, OracleConfig, PolicyConfig, RetryConfig, RoutingConfig, RoutingMode,
-        ServerConfig, StorageConfig, TokenizerCacheConfig, UpstreamConfig,
+        ObservabilityConfig, OracleConfig, PolicyConfig, RetryConfig, RoutingConfig, ServerConfig,
+        StorageConfig, TokenizerCacheConfig, WorkerConfig,
     },
     ConfigError, ConfigResult,
 };
@@ -15,13 +15,13 @@ impl ConfigValidator {
     pub(crate) fn validate_gateway(config: &GatewayConfig) -> ConfigResult<()> {
         Self::validate_server(&config.server)?;
         Self::validate_routing(&config.routing)?;
-        Self::validate_worker_pool(&config.upstream)?;
+        Self::validate_worker(&config.workers)?;
         Self::validate_tokenizer_cache(&config.model.tokenizer_cache)?;
         Self::validate_storage(&config.storage)?;
         Self::validate_observability(&config.observability)?;
 
         if let Some(discovery) = &config.discovery {
-            Self::validate_gateway_discovery(discovery, &config.routing)?;
+            Self::validate_gateway_discovery(discovery)?;
         }
         if let Some(mesh) = &config.mesh {
             Self::validate_mesh(mesh)?;
@@ -130,13 +130,37 @@ impl ConfigValidator {
     }
 
     fn validate_routing(routing: &RoutingConfig) -> ConfigResult<()> {
-        Self::validate_mode(&routing.mode)?;
         Self::validate_policy(&routing.policy)?;
-
+        if let Some(policy) = &routing.prefill_policy {
+            Self::validate_policy(policy)?;
+        }
+        if let Some(policy) = &routing.decode_policy {
+            Self::validate_policy(policy)?;
+        }
         Ok(())
     }
 
-    fn validate_worker_pool(workers: &UpstreamConfig) -> ConfigResult<()> {
+    fn validate_worker(workers: &WorkerConfig) -> ConfigResult<()> {
+        Self::validate_urls(&workers.regular_urls)?;
+        Self::validate_urls(&workers.openai_urls)?;
+        Self::validate_urls(
+            &workers
+                .prefill_urls
+                .iter()
+                .map(|(url, _)| url.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        Self::validate_urls(&workers.decode_urls)?;
+        for (_, bootstrap_port) in &workers.prefill_urls {
+            if *bootstrap_port == Some(0) {
+                return Err(ConfigError::InvalidValue {
+                    field: "workers.prefill_urls.bootstrap_port".to_string(),
+                    value: "0".to_string(),
+                    reason: "Port must be between 1 and 65535".to_string(),
+                });
+            }
+        }
+
         for (field, value) in [
             ("workers.request_timeout_secs", workers.request_timeout_secs),
             ("workers.startup_timeout_secs", workers.startup_timeout_secs),
@@ -243,36 +267,14 @@ impl ConfigValidator {
         )
     }
 
-    fn validate_gateway_discovery(
-        discovery: &DiscoveryConfig,
-        routing: &RoutingConfig,
-    ) -> ConfigResult<()> {
+    fn validate_gateway_discovery(discovery: &DiscoveryConfig) -> ConfigResult<()> {
         if discovery.port == 0 || discovery.check_interval_secs == 0 {
             return Err(ConfigError::ValidationFailed {
                 reason: "Discovery port and check interval must be > 0".to_string(),
             });
         }
-        match &routing.mode {
-            RoutingMode::Regular { .. } if discovery.selector.is_empty() => {
-                Err(ConfigError::ValidationFailed {
-                    reason: "Regular mode with service discovery requires a non-empty selector"
-                        .to_string(),
-                })
-            }
-            RoutingMode::PrefillDecode { .. }
-                if discovery.prefill_selector.is_empty()
-                    && discovery.decode_selector.is_empty() =>
-            {
-                Err(ConfigError::ValidationFailed {
-                    reason: "PD mode with service discovery requires a prefill or decode selector"
-                        .to_string(),
-                })
-            }
-            RoutingMode::OpenAI { .. } => Err(ConfigError::ValidationFailed {
-                reason: "OpenAI mode does not support service discovery".to_string(),
-            }),
-            _ => Ok(()),
-        }
+
+        Ok(())
     }
 
     fn validate_mesh(mesh: &MeshConfig) -> ConfigResult<()> {
@@ -286,46 +288,37 @@ impl ConfigValidator {
 
     /// Checks restrictions that span routing, discovery, and worker settings.
     fn validate_gateway_compatibility(config: &GatewayConfig) -> ConfigResult<()> {
-        if config.routing.enable_igw || config.discovery.is_some() {
-            return Ok(());
-        }
-
         if let PolicyConfig::PowerOfTwo { .. } = &config.routing.policy {
-            if config.routing.mode.worker_count() < 2 {
+            if config.workers.regular_urls.len() < 2 {
                 return Err(ConfigError::IncompatibleConfig {
                     reason: "Power-of-two policy requires at least 2 workers".to_string(),
                 });
             }
         }
 
-        if let RoutingMode::PrefillDecode {
-            prefill_urls,
-            decode_urls,
-            prefill_policy,
-            decode_policy,
-        } = &config.routing.mode
-        {
-            if matches!(prefill_policy, Some(PolicyConfig::PowerOfTwo { .. }))
-                && prefill_urls.len() < 2
-            {
+        if let Some(PolicyConfig::PowerOfTwo { .. }) = &config.routing.prefill_policy {
+            if config.workers.prefill_urls.len() < 2 {
                 return Err(ConfigError::IncompatibleConfig {
                     reason: "Power-of-two policy for prefill requires at least 2 prefill workers"
                         .to_string(),
                 });
             }
-            if matches!(decode_policy, Some(PolicyConfig::PowerOfTwo { .. }))
-                && decode_urls.len() < 2
-            {
+        }
+        if let Some(PolicyConfig::PowerOfTwo { .. }) = &config.routing.decode_policy {
+            if config.workers.decode_urls.len() < 2 {
                 return Err(ConfigError::IncompatibleConfig {
                     reason: "Power-of-two policy for decode requires at least 2 decode workers"
                         .to_string(),
                 });
             }
-            if matches!(decode_policy, Some(PolicyConfig::Bucket { .. })) {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "Decode policy should not be allowed to be bucket".to_string(),
-                });
-            }
+        }
+        if matches!(
+            config.routing.decode_policy,
+            Some(PolicyConfig::Bucket { .. })
+        ) {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Decode policy should not be allowed to be bucket".to_string(),
+            });
         }
 
         Ok(())
@@ -345,61 +338,6 @@ impl ConfigValidator {
                 value: endpoint.to_string(),
                 reason: "host must be non-empty and port must be between 1 and 65535".to_string(),
             });
-        }
-        Ok(())
-    }
-
-    fn validate_mode(mode: &RoutingMode) -> ConfigResult<()> {
-        match mode {
-            RoutingMode::Regular { worker_urls } => {
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
-                }
-                // Allow empty URLs without service discovery to match legacy behavior
-            }
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy,
-                decode_policy,
-            } => {
-                // Allow empty URLs even without service discovery to support dynamic worker addition
-                // URLs will be validated if provided
-                if !prefill_urls.is_empty() {
-                    let prefill_url_strings: Vec<String> =
-                        prefill_urls.iter().map(|(url, _)| url.clone()).collect();
-                    Self::validate_urls(&prefill_url_strings)?;
-                }
-                if !decode_urls.is_empty() {
-                    Self::validate_urls(decode_urls)?;
-                }
-
-                for (_url, port) in prefill_urls {
-                    if let Some(port) = port {
-                        if *port == 0 {
-                            return Err(ConfigError::InvalidValue {
-                                field: "bootstrap_port".to_string(),
-                                value: port.to_string(),
-                                reason: "Port must be between 1 and 65535".to_string(),
-                            });
-                        }
-                    }
-                }
-
-                if let Some(p_policy) = prefill_policy {
-                    Self::validate_policy(p_policy)?;
-                }
-                if let Some(d_policy) = decode_policy {
-                    Self::validate_policy(d_policy)?;
-                }
-            }
-            RoutingMode::OpenAI { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                // URLs will be validated if provided
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
-                }
-            }
         }
         Ok(())
     }

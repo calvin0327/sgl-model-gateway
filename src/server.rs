@@ -11,7 +11,7 @@ use wfaas::LoggingSubscriber;
 use crate::{
     app_context::AppContext,
     app_state::AppState,
-    config::{GatewayConfig, ObservabilityConfig, RoutingMode},
+    config::{GatewayConfig, ObservabilityConfig},
     core::{
         job_queue::{JobQueue, JobQueueConfig},
         steps::{TokenizerConfigRequest, WorkflowEngines},
@@ -24,6 +24,7 @@ use crate::{
         metrics::{self, PrometheusConfig},
         otel_trace,
     },
+    policies::PolicyFactory,
     routers::{app::build_app, router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::TokenizerRegistry,
@@ -31,7 +32,13 @@ use crate::{
 
 /// Starts gateway components, serves HTTP traffic, then stops owned background services.
 pub async fn startup(config: GatewayConfig) -> Result<()> {
-    log_startup(&config);
+    info!(
+        "Starting router on {}:{} | policy: {:?} | max_payload: {}MB",
+        config.server.host,
+        config.server.port,
+        config.routing.policy,
+        config.server.max_payload_size / (1024 * 1024)
+    );
 
     // start prometheus
     metrics::start_prometheus(PrometheusConfig {
@@ -44,7 +51,19 @@ pub async fn startup(config: GatewayConfig) -> Result<()> {
     let (mesh_handler, mesh_sync_manager) = start_mesh(config.mesh.as_ref());
     let mesh_shutdown_handler = mesh_handler.clone();
 
-    let app_context = initialize_app_context(&config).await?;
+    let app_context = initialize_app_context(&config, mesh_sync_manager.as_ref()).await?;
+
+    // Create the empty router manager before worker jobs start. Routers are
+    // created lazily by the worker registration workflow.
+    let router_manager = create_router_manager(&app_context, &config).await?;
+    let worker_job_queue = app_context
+        .worker_job_queue
+        .get()
+        .ok_or_else(|| anyhow!("JobQueue not initialized"))?;
+    worker_job_queue
+        .set_router_manager(Arc::clone(&router_manager))
+        .map_err(Error::msg)?;
+
     submit_startup_jobs(&app_context, &config).await?;
 
     // start mcp manager
@@ -64,9 +83,6 @@ pub async fn startup(config: GatewayConfig) -> Result<()> {
     let (concurrency_queue_tx, concurrency_processor) =
         start_concurrency_queue(&app_context, &config);
 
-    configure_mesh_sync(&app_context, mesh_sync_manager.as_ref());
-
-    let router_manager = create_router_manager(&app_context, &config).await?;
     let app_state = build_app_state(
         app_context.clone(),
         router_manager,
@@ -132,45 +148,6 @@ async fn shutdown_background_services(
     }
 }
 
-/// Logs the effective HTTP, routing policy, and worker configuration.
-fn log_startup(config: &GatewayConfig) {
-    info!(
-        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
-        config.server.host,
-        config.server.port,
-        config.routing.mode,
-        config.routing.policy,
-        config.server.max_payload_size / (1024 * 1024)
-    );
-
-    if config.routing.enable_igw {
-        return;
-    }
-
-    match &config.routing.mode {
-        RoutingMode::Regular { worker_urls } | RoutingMode::OpenAI { worker_urls } => {
-            info!(
-                worker_count = worker_urls.len(),
-                worker_urls = ?worker_urls,
-                "workers configured"
-            );
-        }
-        RoutingMode::PrefillDecode {
-            prefill_urls,
-            decode_urls,
-            ..
-        } => {
-            info!(
-                prefill_worker_count = prefill_urls.len(),
-                decode_worker_count = decode_urls.len(),
-                prefill_worker_urls = ?prefill_urls,
-                decode_worker_urls = ?decode_urls,
-                "PD workers configured"
-            );
-        }
-    }
-}
-
 /// Starts the optional mesh server and returns its request and synchronization handles.
 fn start_mesh(
     mesh_config: Option<&crate::config::MeshConfig>,
@@ -221,13 +198,42 @@ fn start_mesh(
 }
 
 /// Creates shared application state and the job-processing infrastructure.
-async fn initialize_app_context(config: &GatewayConfig) -> Result<Arc<AppContext>> {
+async fn initialize_app_context(
+    config: &GatewayConfig,
+    mesh_sync_manager: Option<&Arc<MeshSyncManager>>,
+) -> Result<Arc<AppContext>> {
     let app_context = Arc::new(
         AppContext::from_config(config.clone())
             .await
             .map_err(Error::msg)
             .context("create app context")?,
     );
+
+    // Configure shared mesh state before creating PD policies and registering workers.
+    configure_mesh_sync(&app_context, mesh_sync_manager);
+
+    // Initialize PD policies before startup worker-registration jobs can run.
+    // The registry uses OnceLock for these policies, so they must be configured
+    // exactly once during gateway startup rather than by individual routers.
+    let prefill_policy = PolicyFactory::create_from_config(
+        config
+            .routing
+            .prefill_policy
+            .as_ref()
+            .unwrap_or(&config.routing.policy),
+    );
+    let decode_policy = PolicyFactory::create_from_config(
+        config
+            .routing
+            .decode_policy
+            .as_ref()
+            .unwrap_or(&config.routing.policy),
+    );
+    app_context
+        .policy_registry
+        .set_prefill_policy(prefill_policy);
+    app_context.policy_registry.set_decode_policy(decode_policy);
+
     app_context.inflight_tracker.start_sampler(20);
 
     let worker_job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -245,7 +251,7 @@ async fn initialize_app_context(config: &GatewayConfig) -> Result<Arc<AppContext
 
     debug!(
         "Workflow engines initialized (health check timeout: {}s)",
-        config.upstream.health_check.timeout_secs
+        config.workers.health_check.timeout_secs
     );
 
     Ok(app_context)
@@ -284,10 +290,6 @@ async fn submit_startup_jobs(app_context: &Arc<AppContext>, config: &GatewayConf
     }
 
     // worker initialization job.
-    info!(
-        "Initializing workers for routing mode: {:?}",
-        config.routing.mode
-    );
     job_queue
         .submit(Job::InitializeWorkersFromConfig {
             gateway_config: Box::new(config.clone()),
@@ -336,16 +338,16 @@ fn start_health_checker(
     app_context: &Arc<AppContext>,
     config: &GatewayConfig,
 ) -> Option<crate::core::worker::HealthChecker> {
-    if config.upstream.health_check.disable_health_check {
+    if config.workers.health_check.disable_health_check {
         return None;
     }
 
     let health_checker = app_context
         .worker_registry
-        .start_health_checker(config.upstream.health_check.check_interval_secs);
+        .start_health_checker(config.workers.health_check.check_interval_secs);
     debug!(
         "Started health checker for workers with {}s interval",
-        config.upstream.health_check.check_interval_secs
+        config.workers.health_check.check_interval_secs
     );
     Some(health_checker)
 }
@@ -432,13 +434,11 @@ async fn start_service_discovery_if_enabled(config: &GatewayConfig, app_state: &
         check_interval: Duration::from_secs(discovery.check_interval_secs),
         port: discovery.port,
         namespace: discovery.namespace,
-        pd_mode: config.routing.is_pd_mode(),
         prefill_selector: discovery.prefill_selector,
         decode_selector: discovery.decode_selector,
         bootstrap_port_annotation: discovery.bootstrap_port_annotation,
         router_selector: discovery.router_selector,
         router_mesh_port_annotation: discovery.router_mesh_port_annotation,
-        igw_mode: config.routing.enable_igw,
     };
     let mesh_cluster_state = app_state
         .mesh_handler
@@ -589,7 +589,7 @@ pub fn init_tracing(config: &ObservabilityConfig) -> Result<LogGuard> {
             if otel_trace::is_otel_enabled() {
                 otel_trace::shutdown_otel();
             }
-            return Err(error).context("initialize logging");
+            Err(error).context("initialize logging")
         }
     }
 }

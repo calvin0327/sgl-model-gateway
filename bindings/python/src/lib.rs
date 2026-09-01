@@ -466,8 +466,7 @@ impl Router {
         use config::{
             CircuitBreakerConfig, DiscoveryConfig, ExtensionConfig, HealthCheckConfig, ModelConfig,
             ObservabilityConfig, PolicyConfig as ConfigPolicyConfig, RetryConfig, RoutingConfig,
-            RoutingMode, ServerConfig, ServerTlsConfig, StorageConfig, TokenizerCacheConfig,
-            UpstreamConfig,
+            ServerConfig, ServerTlsConfig, StorageConfig, TokenizerCacheConfig, WorkerConfig,
         };
 
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
@@ -507,28 +506,17 @@ impl Router {
             }
         };
 
-        let mode = if self.enable_igw {
-            RoutingMode::Regular {
-                worker_urls: vec![],
-            }
-        } else if matches!(self.backend, BackendType::Openai) {
-            RoutingMode::OpenAI {
-                worker_urls: self.worker_urls.clone(),
-            }
-        } else if self.pd_disaggregation {
-            RoutingMode::PrefillDecode {
-                prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
-                decode_urls: self.decode_urls.clone().unwrap_or_default(),
-                prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
-                decode_policy: self.decode_policy.as_ref().map(convert_policy),
-            }
-        } else {
-            RoutingMode::Regular {
-                worker_urls: self.worker_urls.clone(),
-            }
-        };
-
         let policy = convert_policy(&self.policy);
+
+        let prefill_urls = self.prefill_urls.clone().unwrap_or_default();
+        let decode_urls = self.decode_urls.clone().unwrap_or_default();
+        let (regular_urls, openai_urls) = if self.enable_igw || self.pd_disaggregation {
+            (Vec::new(), Vec::new())
+        } else if matches!(self.backend, BackendType::Openai) {
+            (Vec::new(), self.worker_urls.clone())
+        } else {
+            (self.worker_urls.clone(), Vec::new())
+        };
 
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig {
@@ -680,13 +668,17 @@ impl Router {
                 ca_certificates,
             },
             routing: RoutingConfig {
-                mode,
                 policy,
+                prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
+                decode_policy: self.decode_policy.as_ref().map(convert_policy),
                 dp_aware: self.dp_aware,
-                enable_igw: self.enable_igw,
             },
-            upstream: UpstreamConfig {
-                connection_mode: self.connection_mode.clone(),
+            workers: WorkerConfig {
+                regular_urls,
+                prefill_urls,
+                decode_urls,
+                openai_urls,
+                pd_group_id: None,
                 request_timeout_secs: self.request_timeout_secs,
                 startup_timeout_secs: self.worker_startup_timeout_secs,
                 startup_check_interval_secs: self.worker_startup_check_interval,

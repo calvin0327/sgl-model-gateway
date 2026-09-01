@@ -5,7 +5,7 @@
 
 use smg::config::{
     CircuitBreakerConfig, ConfigResult, GatewayConfig, HistoryBackend, ManualAssignmentMode,
-    OracleConfig, PolicyConfig, RetryConfig, RoutingMode,
+    OracleConfig, PolicyConfig, RetryConfig,
 };
 
 use super::mock_worker::{HealthStatus, MockWorkerConfig, WorkerType};
@@ -30,15 +30,12 @@ impl TestGatewayConfig {
         config.server.host = defaults::HOST.to_string();
         config.server.port = port;
         config.server.max_payload_size = defaults::MAX_PAYLOAD_SIZE;
-        config.routing.mode = RoutingMode::Regular {
-            worker_urls: Vec::new(),
-        };
         config.routing.policy = policy;
         config.server.max_concurrent_requests = defaults::MAX_CONCURRENT_REQUESTS;
         config.server.queue_timeout_secs = defaults::QUEUE_TIMEOUT_SECS;
-        config.upstream.request_timeout_secs = defaults::REQUEST_TIMEOUT_SECS;
-        config.upstream.startup_timeout_secs = defaults::WORKER_STARTUP_TIMEOUT_SECS;
-        config.upstream.startup_check_interval_secs = defaults::WORKER_STARTUP_CHECK_INTERVAL_SECS;
+        config.workers.request_timeout_secs = defaults::REQUEST_TIMEOUT_SECS;
+        config.workers.startup_timeout_secs = defaults::WORKER_STARTUP_TIMEOUT_SECS;
+        config.workers.startup_check_interval_secs = defaults::WORKER_STARTUP_CHECK_INTERVAL_SECS;
         config
     }
 
@@ -115,9 +112,9 @@ impl TestGatewayConfig {
     /// Create a config with short timeouts (for timeout/retry tests)
     pub fn with_short_timeouts(port: u16) -> GatewayConfig {
         let mut config = Self::round_robin(port);
-        config.upstream.request_timeout_secs = 5;
-        config.upstream.startup_timeout_secs = 2;
-        config.upstream.startup_check_interval_secs = 1;
+        config.workers.request_timeout_secs = 5;
+        config.workers.startup_timeout_secs = 2;
+        config.workers.startup_check_interval_secs = 1;
         config.server.queue_timeout_secs = 5;
         config
     }
@@ -125,7 +122,7 @@ impl TestGatewayConfig {
     /// Create a round-robin config with retry settings
     pub fn round_robin_with_retry(port: u16, retry_config: RetryConfig) -> GatewayConfig {
         let mut config = Self::round_robin(port);
-        config.upstream.retry = retry_config;
+        config.workers.retry = retry_config;
         config
     }
 
@@ -135,7 +132,7 @@ impl TestGatewayConfig {
         circuit_breaker: CircuitBreakerConfig,
     ) -> GatewayConfig {
         let mut config = Self::round_robin(port);
-        config.upstream.circuit_breaker = circuit_breaker;
+        config.workers.circuit_breaker = circuit_breaker;
         config
     }
 
@@ -146,8 +143,8 @@ impl TestGatewayConfig {
         circuit_breaker: CircuitBreakerConfig,
     ) -> GatewayConfig {
         let mut config = Self::round_robin(port);
-        config.upstream.retry = retry_config;
-        config.upstream.circuit_breaker = circuit_breaker;
+        config.workers.retry = retry_config;
+        config.workers.circuit_breaker = circuit_breaker;
         config
     }
 }
@@ -168,12 +165,12 @@ impl TestGatewayConfigBuilder {
     }
 
     pub fn regular_mode(mut self, worker_urls: Vec<String>) -> Self {
-        self.config.routing.mode = RoutingMode::Regular { worker_urls };
+        self.config.workers.regular_urls = worker_urls;
         self
     }
 
     pub fn openai_mode(mut self, worker_urls: Vec<String>) -> Self {
-        self.config.routing.mode = RoutingMode::OpenAI { worker_urls };
+        self.config.workers.openai_urls = worker_urls;
         self
     }
 
@@ -182,12 +179,8 @@ impl TestGatewayConfigBuilder {
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
     ) -> Self {
-        self.config.routing.mode = RoutingMode::PrefillDecode {
-            prefill_urls,
-            decode_urls,
-            prefill_policy: None,
-            decode_policy: None,
-        };
+        self.config.workers.prefill_urls = prefill_urls;
+        self.config.workers.decode_urls = decode_urls;
         self
     }
 
@@ -231,17 +224,17 @@ impl TestGatewayConfigBuilder {
     }
 
     pub fn request_timeout_secs(mut self, request_timeout_secs: u64) -> Self {
-        self.config.upstream.request_timeout_secs = request_timeout_secs;
+        self.config.workers.request_timeout_secs = request_timeout_secs;
         self
     }
 
     pub fn worker_startup_timeout_secs(mut self, startup_timeout_secs: u64) -> Self {
-        self.config.upstream.startup_timeout_secs = startup_timeout_secs;
+        self.config.workers.startup_timeout_secs = startup_timeout_secs;
         self
     }
 
     pub fn worker_startup_check_interval_secs(mut self, check_interval_secs: u64) -> Self {
-        self.config.upstream.startup_check_interval_secs = check_interval_secs;
+        self.config.workers.startup_check_interval_secs = check_interval_secs;
         self
     }
 
@@ -266,22 +259,22 @@ impl TestGatewayConfigBuilder {
     }
 
     pub fn retry_config(mut self, retry: RetryConfig) -> Self {
-        self.config.upstream.retry = retry;
+        self.config.workers.retry = retry;
         self
     }
 
     pub fn circuit_breaker_config(mut self, circuit_breaker: CircuitBreakerConfig) -> Self {
-        self.config.upstream.circuit_breaker = circuit_breaker;
+        self.config.workers.circuit_breaker = circuit_breaker;
         self
     }
 
     pub fn disable_retries(mut self) -> Self {
-        self.config.upstream.disable_retries = true;
+        self.config.workers.disable_retries = true;
         self
     }
 
     pub fn disable_circuit_breaker(mut self) -> Self {
-        self.config.upstream.disable_circuit_breaker = true;
+        self.config.workers.disable_circuit_breaker = true;
         self
     }
 

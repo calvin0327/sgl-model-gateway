@@ -19,8 +19,8 @@ use super::pd_types::api_path;
 use crate::{
     config::RetryConfig,
     core::{
-        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType, UNKNOWN_MODEL_ID,
+        is_retryable_status, pd_group_id, ConnectionMode, HashRing, RetryExecutor, Worker,
+        WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -53,7 +53,6 @@ pub struct PDRouter {
     pub client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
-    pub enable_igw: bool,
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -91,7 +90,15 @@ impl PDRouter {
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let workers = self.worker_registry.get_prefill_workers();
+        let workers = self.worker_registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Prefill {
+                bootstrap_port: None,
+            }),
+            Some(ConnectionMode::Http),
+            None,
+            true,
+        );
 
         if let Some(worker) = workers.first() {
             self.proxy_to_worker(worker.as_ref(), endpoint, headers)
@@ -182,9 +189,8 @@ impl PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             client: ctx.client.clone(),
-            retry_config: ctx.config.upstream.effective_retry_config(),
+            retry_config: ctx.config.workers.effective_retry_config(),
             api_key: ctx.config.server.api_key.clone(),
-            enable_igw: ctx.config.routing.enable_igw,
         })
     }
 
@@ -975,34 +981,52 @@ impl PDRouter {
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
-        let effective_model_id = if !self.enable_igw { None } else { model_id };
-
-        debug!(
-            "Selecting PD pair: enable_igw={}, model_id={:?}, effective_model_id={:?}",
-            self.enable_igw, model_id, effective_model_id
-        );
-
-        let prefill_workers = if let Some(model) = effective_model_id {
+        let mut prefill_workers: Vec<Arc<dyn Worker>> = if let Some(model) = model_id {
             self.worker_registry
                 .get_by_model(model)
                 .iter()
-                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
+                .filter(|w| {
+                    matches!(w.worker_type(), WorkerType::Prefill { .. })
+                        && matches!(w.connection_mode(), ConnectionMode::Http)
+                        && w.is_available()
+                })
                 .cloned()
                 .collect()
         } else {
-            self.worker_registry.get_prefill_workers()
+            self.worker_registry
+                .get_prefill_workers()
+                .into_iter()
+                .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http) && w.is_available())
+                .collect()
         };
 
-        let decode_workers = if let Some(model) = effective_model_id {
+        let mut decode_workers: Vec<Arc<dyn Worker>> = if let Some(model) = model_id {
             self.worker_registry
                 .get_by_model(model)
                 .iter()
-                .filter(|w| matches!(w.worker_type(), WorkerType::Decode))
+                .filter(|w| {
+                    matches!(w.worker_type(), WorkerType::Decode)
+                        && matches!(w.connection_mode(), ConnectionMode::Http)
+                        && w.is_available()
+                })
                 .cloned()
                 .collect()
         } else {
-            self.worker_registry.get_decode_workers()
+            self.worker_registry
+                .get_decode_workers()
+                .into_iter()
+                .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http) && w.is_available())
+                .collect()
         };
+
+        // A PD pair must belong to the same deployment group. Without this
+        // filter, independently deployed Prefill and Decode workers serving
+        // the same model can be paired accidentally.
+        let Some(group_id) = Self::find_common_pd_group(&prefill_workers, &decode_workers) else {
+            return Err("No PD worker group has both available prefill and decode workers".into());
+        };
+        prefill_workers.retain(|worker| pd_group_id(worker.as_ref()) == group_id);
+        decode_workers.retain(|worker| pd_group_id(worker.as_ref()) == group_id);
 
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
@@ -1010,7 +1034,7 @@ impl PDRouter {
         // Get cached hash ring for consistent hashing
         let hash_ring = self
             .worker_registry
-            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+            .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
         let prefill = Self::pick_worker_by_policy_arc(
             &prefill_workers,
@@ -1048,6 +1072,27 @@ impl PDRouter {
         );
 
         Ok((prefill, decode))
+    }
+
+    /// Find a deterministic PD group with at least one available worker on
+    /// each side. Selecting the group before selecting workers guarantees
+    /// that policy selection cannot cross deployment boundaries.
+    fn find_common_pd_group(
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+    ) -> Option<String> {
+        let mut groups: Vec<String> = prefill_workers
+            .iter()
+            .map(|worker| pd_group_id(worker.as_ref()).to_string())
+            .filter(|group| {
+                decode_workers
+                    .iter()
+                    .any(|worker| pd_group_id(worker.as_ref()) == group)
+            })
+            .collect();
+        groups.sort();
+        groups.dedup();
+        groups.into_iter().next()
     }
 
     async fn pick_worker_by_policy_arc(
@@ -1729,7 +1774,6 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
-            enable_igw: false,
         }
     }
 
@@ -1825,13 +1869,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_select_pd_pair_does_not_cross_deployment_groups() {
+        let router = create_test_pd_router();
+
+        // Group B has only a Prefill worker and must not be paired with the
+        // Decode worker from group A.
+        let prefill_group_b = BasicWorkerBuilder::new("http://prefill-b")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: None,
+            })
+            .label("pd_group_id", "group-b")
+            .build();
+        let prefill_group_a = BasicWorkerBuilder::new("http://prefill-a")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: None,
+            })
+            .label("pd_group_id", "group-a")
+            .build();
+        let decode_group_a = BasicWorkerBuilder::new("http://decode-a")
+            .worker_type(WorkerType::Decode)
+            .label("pd_group_id", "group-a")
+            .build();
+
+        router.worker_registry.register(Arc::new(prefill_group_b));
+        router.worker_registry.register(Arc::new(prefill_group_a));
+        router.worker_registry.register(Arc::new(decode_group_a));
+
+        let (prefill, decode) = router
+            .select_pd_pair(None, None, None)
+            .await
+            .expect("group-a should provide a complete PD pair");
+
+        assert_eq!(pd_group_id(prefill.as_ref()), "group-a");
+        assert_eq!(pd_group_id(decode.as_ref()), "group-a");
+    }
+
+    #[tokio::test]
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
         let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No prefill workers available"));
+        assert!(result
+            .unwrap_err()
+            .contains("No PD worker group has both available prefill and decode workers"));
     }
 
     #[test]

@@ -98,6 +98,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires local redis-server binary"]
     fn test_redis_server_start_stop() {
         let server = RedisTestServer::start().unwrap();
         server.wait_ready();

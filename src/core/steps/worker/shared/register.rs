@@ -5,7 +5,7 @@ use std::{collections::HashSet, sync::Arc};
 use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{
-    StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    StepExecutor, StepId, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
 use crate::{core::steps::workflow_data::WorkerRegistrationData, observability::metrics::Metrics};
@@ -42,6 +42,19 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
                 worker_id
             );
             worker_ids.push(worker_id);
+        }
+
+        // registry router to manager.
+        if let Some(router_manager) = context.data.get_router_manager().cloned() {
+            for worker in workers.iter() {
+                router_manager
+                    .ensure_router_for_worker(&app_context, Arc::clone(worker))
+                    .await
+                    .map_err(|error| WorkflowError::StepFailed {
+                        step_id: StepId::new("ensure_router"),
+                        message: error,
+                    })?;
+            }
         }
 
         // Collect unique worker configurations to avoid redundant metric updates

@@ -9,7 +9,10 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{
     extract::{Json, State},
     http::StatusCode,
-    response::{sse::Event, sse::KeepAlive, IntoResponse, Response, Sse},
+    response::{
+        sse::{Event, KeepAlive},
+        IntoResponse, Response, Sse,
+    },
     routing::{get, post},
     Router,
 };
@@ -117,7 +120,7 @@ impl WorkerState {
         match self.health {
             HealthMode::Healthy => true,
             HealthMode::Unhealthy => false,
-            HealthMode::Flapping => self.port % 2 == 0,
+            HealthMode::Flapping => self.port.is_multiple_of(2),
         }
     }
 }

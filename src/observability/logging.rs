@@ -47,7 +47,7 @@ impl LoggingConfig {
             .unwrap_or(Level::INFO);
 
         Self {
-            level: level,
+            level,
             json_format: config.json_log,
             log_dir: config.log_dir.clone(),
             colorize: true,

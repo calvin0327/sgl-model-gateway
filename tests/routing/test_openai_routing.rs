@@ -19,10 +19,7 @@ use axum::{
 use data_connector::{ResponseId, StoredResponse};
 use serde_json::json;
 use smg::{
-    config::{
-        gateway::{PolicyConfig, RoutingMode},
-        ConfigError, GatewayConfig, HistoryBackend, OracleConfig,
-    },
+    config::{gateway::PolicyConfig, ConfigError, GatewayConfig, HistoryBackend, OracleConfig},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::StringOrArray,
@@ -575,15 +572,12 @@ async fn test_openai_router_responses_streaming_with_mock() {
 /// Test router factory with OpenAI routing mode
 #[tokio::test]
 async fn test_router_factory_openai_mode() {
-    let routing_mode = RoutingMode::OpenAI {
-        worker_urls: vec!["https://api.openai.com".to_string()],
-    };
-
-    let router_config = GatewayConfig::new(routing_mode, PolicyConfig::Random);
+    let mut router_config = GatewayConfig::new(PolicyConfig::Random);
+    router_config.workers.openai_urls = vec!["https://api.openai.com".to_string()];
 
     let app_context = crate::common::create_test_context(router_config).await;
 
-    let router = smg::routers::RouterFactory::create_router(&app_context).await;
+    let router = smg::routers::RouterFactory::create_openai_router(&app_context).await;
     assert!(
         router.is_ok(),
         "Router factory should create OpenAI router successfully"

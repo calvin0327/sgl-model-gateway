@@ -109,6 +109,7 @@ pub fn create_external_worker_workflow() -> WorkflowDefinition<ExternalWorkerWor
 pub fn create_external_worker_workflow_data(
     config: WorkerConfigRequest,
     app_context: Arc<AppContext>,
+    router_manager: Option<Arc<crate::routers::router_manager::RouterManager>>,
 ) -> ExternalWorkerWorkflowData {
     ExternalWorkerWorkflowData {
         config,
@@ -116,6 +117,7 @@ pub fn create_external_worker_workflow_data(
         workers: None,
         labels: std::collections::HashMap::new(),
         app_context: Some(app_context),
+        router_manager,
         actual_workers: None,
     }
 }

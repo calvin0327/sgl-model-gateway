@@ -36,8 +36,7 @@ pub struct ServiceDiscoveryConfig {
     pub check_interval: Duration,
     pub port: u16,
     pub namespace: Option<String>,
-    // PD mode specific configuration
-    pub pd_mode: bool,
+
     pub prefill_selector: HashMap<String, String>,
     pub decode_selector: HashMap<String, String>,
     // Bootstrap port annotation specific to mooncake implementation
@@ -45,8 +44,6 @@ pub struct ServiceDiscoveryConfig {
     // Router node discovery for mesh
     pub router_selector: HashMap<String, String>,
     pub router_mesh_port_annotation: String,
-    // When true (IGW mode), also discover selector pods as Regular workers alongside PD workers
-    pub igw_mode: bool,
 }
 
 impl Default for ServiceDiscoveryConfig {
@@ -57,25 +54,11 @@ impl Default for ServiceDiscoveryConfig {
             check_interval: Duration::from_secs(60),
             port: 8000,
             namespace: None,
-            pd_mode: false,
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
-            igw_mode: false,
-        }
-    }
-}
-
-impl ServiceDiscoveryConfig {
-    pub fn warn_if_misconfigured(&self) {
-        if self.pd_mode && !self.igw_mode && !self.selector.is_empty() {
-            warn!(
-                "--selector is set in PD mode without IGW mode enabled; \
-                regular worker discovery alongside PD workers requires IGW mode, \
-                selector will be ignored"
-            );
         }
     }
 }
@@ -112,28 +95,17 @@ impl PodInfo {
     }
 
     pub fn should_include(pod: &Pod, config: &ServiceDiscoveryConfig) -> bool {
-        if config.pd_mode {
-            if config.prefill_selector.is_empty()
-                && config.decode_selector.is_empty()
-                && (!config.igw_mode || config.selector.is_empty())
-            {
-                warn!("PD mode enabled but both prefill_selector and decode_selector are empty");
-                return false;
-            }
-            let matches_pd = Self::matches_selector(pod, &config.prefill_selector)
-                || Self::matches_selector(pod, &config.decode_selector);
-            // In IGW mode, also discover regular workers via the selector field
-            let matches_regular = config.igw_mode
-                && !config.selector.is_empty()
-                && Self::matches_selector(pod, &config.selector);
-            matches_pd || matches_regular
-        } else {
-            if config.selector.is_empty() {
-                warn!("Regular mode enabled but selector is empty");
-                return false;
-            }
-            Self::matches_selector(pod, &config.selector)
+        if config.selector.is_empty()
+            && config.prefill_selector.is_empty()
+            && config.decode_selector.is_empty()
+        {
+            warn!("Worker discovery enabled but all worker selectors are empty");
+            return false;
         }
+
+        Self::matches_selector(pod, &config.selector)
+            || Self::matches_selector(pod, &config.prefill_selector)
+            || Self::matches_selector(pod, &config.decode_selector)
     }
 
     pub fn from_pod(pod: &Pod, config: Option<&ServiceDiscoveryConfig>) -> Option<Self> {
@@ -151,21 +123,17 @@ impl PodInfo {
 
         let pod_status = status.phase.unwrap_or_else(|| "Unknown".to_string());
 
-        let pod_type = if let Some(config) = config {
-            if config.pd_mode {
-                if Self::matches_selector(pod, &config.prefill_selector) {
-                    Some(PodType::Prefill)
-                } else if Self::matches_selector(pod, &config.decode_selector) {
-                    Some(PodType::Decode)
-                } else {
-                    Some(PodType::Regular)
-                }
-            } else {
+        let pod_type = config.and_then(|config| {
+            if Self::matches_selector(pod, &config.prefill_selector) {
+                Some(PodType::Prefill)
+            } else if Self::matches_selector(pod, &config.decode_selector) {
+                Some(PodType::Decode)
+            } else if Self::matches_selector(pod, &config.selector) {
                 Some(PodType::Regular)
+            } else {
+                None
             }
-        } else {
-            None
-        };
+        });
 
         let bootstrap_port = if matches!(pod_type, Some(PodType::Prefill)) {
             if let Some(config) = config {
@@ -245,39 +213,19 @@ pub async fn start_service_discovery(
 
     let client = Client::try_default().await?;
 
-    // Log the appropriate selectors based on mode
-    if config.pd_mode {
-        let prefill_selector = config
-            .prefill_selector
+    let format_selector = |selector: &HashMap<String, String>| {
+        selector
             .iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect::<Vec<_>>()
-            .join(",");
-
-        let decode_selector = config
-            .decode_selector
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        info!(
-            "Starting K8s service discovery | PD mode | prefill: '{}' | decode: '{}'",
-            prefill_selector, decode_selector
-        );
-    } else {
-        let label_selector = config
-            .selector
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        info!(
-            "Starting K8s service discovery | selector: '{}'",
-            label_selector
-        );
-    }
+            .join(",")
+    };
+    info!(
+        "Starting K8s service discovery | regular: '{}' | prefill: '{}' | decode: '{}'",
+        format_selector(&config.selector),
+        format_selector(&config.prefill_selector),
+        format_selector(&config.decode_selector),
+    );
 
     // Log router discovery if enabled
     if !config.router_selector.is_empty() {
@@ -383,7 +331,6 @@ pub async fn start_service_discovery(
                                     tracked_pods_inner,
                                     app_context_inner,
                                     port,
-                                    config_inner.pd_mode,
                                 )
                                 .await;
                             }
@@ -424,7 +371,6 @@ async fn handle_pod_event(
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
     app_context: Arc<AppContext>,
     port: u16,
-    pd_mode: bool,
 ) {
     let worker_url = pod_info.worker_url(port);
 
@@ -453,23 +399,16 @@ async fn handle_pod_event(
                 pod_info.name, pod_info.pod_type, worker_url
             );
 
-            let worker_type = if pd_mode {
-                match &pod_info.pod_type {
-                    Some(PodType::Prefill) => Some("prefill".to_string()),
-                    Some(PodType::Decode) => Some("decode".to_string()),
-                    Some(PodType::Regular) | None => None,
-                }
-            } else {
-                None
+            let worker_type = match &pod_info.pod_type {
+                Some(PodType::Prefill) => Some("prefill".to_string()),
+                Some(PodType::Decode) => Some("decode".to_string()),
+                Some(PodType::Regular) => Some("regular".to_string()),
+                None => return,
             };
 
-            let bootstrap_port = if pd_mode {
-                match &pod_info.pod_type {
-                    Some(PodType::Prefill) => pod_info.bootstrap_port,
-                    _ => None,
-                }
-            } else {
-                None
+            let bootstrap_port = match &pod_info.pod_type {
+                Some(PodType::Prefill) => pod_info.bootstrap_port,
+                _ => None,
             };
 
             let config = WorkerConfigRequest {
@@ -486,28 +425,16 @@ async fn handle_pod_event(
                 tool_parser: None,
                 chat_template: None,
                 api_key: app_context.config.server.api_key.clone(),
-                health_check_timeout_secs: app_context.config.upstream.health_check.timeout_secs,
+                health_check_timeout_secs: app_context.config.workers.health_check.timeout_secs,
                 health_check_interval_secs: app_context
                     .config
-                    .upstream
+                    .workers
                     .health_check
                     .check_interval_secs,
-                health_success_threshold: app_context
-                    .config
-                    .upstream
-                    .health_check
-                    .success_threshold,
-                health_failure_threshold: app_context
-                    .config
-                    .upstream
-                    .health_check
-                    .failure_threshold,
-                disable_health_check: app_context
-                    .config
-                    .upstream
-                    .health_check
-                    .disable_health_check,
-                max_connection_attempts: app_context.config.upstream.health_check.success_threshold
+                health_success_threshold: app_context.config.workers.health_check.success_threshold,
+                health_failure_threshold: app_context.config.workers.health_check.failure_threshold,
+                disable_health_check: app_context.config.workers.health_check.disable_health_check,
+                max_connection_attempts: app_context.config.workers.health_check.success_threshold
                     * 20,
                 dp_aware: app_context.config.routing.dp_aware,
             };
@@ -858,7 +785,7 @@ mod tests {
         };
 
         let mut gateway_config = GatewayConfig::default();
-        gateway_config.upstream.startup_timeout_secs = 1;
+        gateway_config.workers.startup_timeout_secs = 1;
 
         let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
         let worker_job_queue = Arc::new(std::sync::OnceLock::new());
@@ -912,13 +839,11 @@ mod tests {
             check_interval: Duration::from_secs(60),
             port: 8080,
             namespace: None,
-            pd_mode: true,
             prefill_selector,
             decode_selector,
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
-            igw_mode: false,
         }
     }
 
@@ -967,16 +892,13 @@ mod tests {
         regular_config
             .selector
             .insert("app".to_string(), "sglang".to_string());
-        regular_config.pd_mode = false;
-
         let regular_pod = create_pd_k8s_pod("worker-pod", "10.0.0.4", "worker", None);
         assert!(PodInfo::should_include(&regular_pod, &regular_config));
     }
 
     #[test]
-    fn test_should_include_regular_pod_in_pd_igw_mode() {
+    fn test_should_include_regular_pod_with_mixed_selectors() {
         let mut config = create_pd_config();
-        config.igw_mode = true;
         config
             .selector
             .insert("app".to_string(), "regular-worker".to_string());
@@ -989,15 +911,14 @@ mod tests {
     }
 
     #[test]
-    fn test_should_exclude_regular_pod_in_pd_mode_without_igw() {
+    fn test_should_include_regular_pod_with_mixed_selectors_without_mode_flag() {
         let mut config = create_pd_config();
-        config.igw_mode = false;
         config
             .selector
             .insert("app".to_string(), "regular-worker".to_string());
 
         let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.0.5");
-        assert!(!PodInfo::should_include(&regular_pod, &config));
+        assert!(PodInfo::should_include(&regular_pod, &config));
     }
 
     #[test]
@@ -1008,7 +929,6 @@ mod tests {
         assert_eq!(config.check_interval, Duration::from_secs(60));
         assert_eq!(config.port, 8000);
         assert!(config.namespace.is_none());
-        assert!(!config.pd_mode);
         assert!(config.prefill_selector.is_empty());
         assert!(config.decode_selector.is_empty());
         assert_eq!(config.bootstrap_port_annotation, "sglang.ai/bootstrap-port");
@@ -1075,7 +995,9 @@ mod tests {
     fn test_pod_info_from_pod_with_pd_config_regular_mode() {
         let k8s_pod = create_pd_k8s_pod("regular-pod", "10.0.0.3", "worker", None);
         let mut config = create_pd_config();
-        config.pd_mode = false;
+        config
+            .selector
+            .insert("app".to_string(), "sglang".to_string());
 
         let pod_info = PodInfo::from_pod(&k8s_pod, Some(&config)).unwrap();
         assert_eq!(pod_info.name, "regular-pod");
@@ -1096,7 +1018,7 @@ mod tests {
         assert_eq!(pod_info.ip, "10.0.0.4");
         assert_eq!(pod_info.status, "Running");
         assert!(pod_info.is_ready);
-        assert_eq!(pod_info.pod_type, Some(PodType::Regular));
+        assert_eq!(pod_info.pod_type, None);
         assert!(pod_info.bootstrap_port.is_none());
     }
 
@@ -1265,7 +1187,6 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            false, // pd_mode = false
         )
         .await;
 
@@ -1320,7 +1241,6 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            true, // pd_mode = true for PD pod
         )
         .await;
 
@@ -1353,7 +1273,6 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            true, // pd_mode = true for PD pod
         )
         .await;
 
@@ -1451,12 +1370,11 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            false, // pd_mode = false
         )
         .await;
 
         // With fully async control plane, pod is tracked and job is queued
-        // In regular mode (pd_mode=false), worker_type defaults to Regular
+        // Worker type is derived from the Pod selector classification.
         // Worker registration and validation happen in background job
         assert!(tracked_pods.lock().unwrap().contains(&pod_info));
 
@@ -1485,7 +1403,6 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            true, // pd_mode = true
         )
         .await;
 
@@ -1551,13 +1468,11 @@ mod tests {
             check_interval: Duration::from_secs(60),
             port: 8080,
             namespace: None,
-            pd_mode: true,
             prefill_selector,
             decode_selector,
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
-            igw_mode: true,
         };
 
         let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.1.1");
@@ -1586,16 +1501,14 @@ mod tests {
             check_interval: Duration::from_secs(60),
             port: 8080,
             namespace: None,
-            pd_mode: true,
             prefill_selector,
             decode_selector,
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
-            igw_mode: false,
         };
 
         let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.1.1");
-        assert!(!PodInfo::should_include(&regular_pod, &config));
+        assert!(PodInfo::should_include(&regular_pod, &config));
     }
 }

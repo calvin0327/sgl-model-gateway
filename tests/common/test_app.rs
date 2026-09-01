@@ -56,7 +56,7 @@ pub fn create_test_app(
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        config.upstream.startup_check_interval_secs,
+        config.workers.startup_check_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue and workflow engines
@@ -95,18 +95,14 @@ pub fn create_test_app(
     });
 
     // Configure request ID headers (use defaults if not specified)
-    let request_id_headers = config
-        .server
-        .request_id_headers
-        .clone()
-        .unwrap_or_else(|| {
-            vec![
-                "x-request-id".to_string(),
-                "x-correlation-id".to_string(),
-                "x-trace-id".to_string(),
-                "request-id".to_string(),
-            ]
-        });
+    let request_id_headers = config.server.request_id_headers.clone().unwrap_or_else(|| {
+        vec![
+            "x-request-id".to_string(),
+            "x-correlation-id".to_string(),
+            "x-trace-id".to_string(),
+            "request-id".to_string(),
+        ]
+    });
 
     // Create auth config from router config
     let auth_config = AuthConfig {
@@ -144,18 +140,14 @@ pub fn create_test_app_with_context(
     let config = &app_context.config;
 
     // Configure request ID headers (use defaults if not specified)
-    let request_id_headers = config
-        .server
-        .request_id_headers
-        .clone()
-        .unwrap_or_else(|| {
-            vec![
-                "x-request-id".to_string(),
-                "x-correlation-id".to_string(),
-                "x-trace-id".to_string(),
-                "request-id".to_string(),
-            ]
-        });
+    let request_id_headers = config.server.request_id_headers.clone().unwrap_or_else(|| {
+        vec![
+            "x-request-id".to_string(),
+            "x-correlation-id".to_string(),
+            "x-trace-id".to_string(),
+            "request-id".to_string(),
+        ]
+    });
 
     // Create auth config from router config
     let auth_config = AuthConfig {

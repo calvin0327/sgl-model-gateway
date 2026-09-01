@@ -15,11 +15,9 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    config::RoutingMode,
     core::{
         job_queue::Job,
         steps::{WasmModuleConfigRequest, WasmModuleRemovalRequest},
-        worker::WorkerType,
         worker_manager::WorkerManager,
     },
     middleware::{self, AuthConfig},
@@ -30,7 +28,7 @@ use crate::{
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
-        rerank::V1RerankReqInput,
+        rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
         validated::ValidatedJson,
@@ -109,13 +107,38 @@ async fn v1_completions(
 async fn v1_rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<V1RerankReqInput>,
+    Json(body): Json<RerankRequestInput>,
 ) -> Response {
-    let rerank_body = &body.into();
+    // V1RerankReqInput predates model-aware routing and only contains
+    // `query` and `documents`. Keep that compatibility shape while accepting
+    // an optional model so RouterManager can select the correct model pool.
+    let model = body.model.clone();
+    let mut rerank_body: RerankRequest = V1RerankReqInput {
+        query: body.query,
+        documents: body.documents,
+    }
+    .into();
+
+    if let Some(model) = model {
+        rerank_body.model = model;
+    }
+
     state
         .router
-        .route_rerank(Some(&headers), rerank_body, Some(&rerank_body.model))
+        .route_rerank(Some(&headers), &rerank_body, Some(&rerank_body.model))
         .await
+}
+
+/// Request body for the OpenAI-compatible `/v1/rerank` endpoint.
+///
+/// The upstream protocol's legacy `V1RerankReqInput` does not include a model
+/// field, but model-aware routing requires preserving it at the gateway edge.
+#[derive(Debug, Deserialize)]
+struct RerankRequestInput {
+    query: String,
+    documents: Vec<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 async fn v1_responses(
@@ -202,34 +225,28 @@ async fn liveness() -> Response {
 
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     let workers = state.context.worker_registry.get_all();
-    let healthy_workers: Vec<_> = workers
+    let healthy_workers = workers.iter().filter(|worker| worker.is_healthy()).count();
+    let available_workers: Vec<_> = workers
         .iter()
-        .filter(|worker| worker.is_healthy())
+        .filter(|worker| worker.is_available())
         .collect();
 
-    let is_ready = if state.context.config.routing.enable_igw {
-        !healthy_workers.is_empty()
-    } else {
-        match &state.context.config.routing.mode {
-            RoutingMode::PrefillDecode { .. } => {
-                let has_prefill = healthy_workers
-                    .iter()
-                    .any(|worker| matches!(worker.worker_type(), WorkerType::Prefill { .. }));
-                let has_decode = healthy_workers
-                    .iter()
-                    .any(|worker| matches!(worker.worker_type(), WorkerType::Decode));
-                has_prefill && has_decode
-            }
-            RoutingMode::Regular { .. } | RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
-        }
-    };
+    // Use the same route-level readiness semantics as RouterManager. The
+    // fallback keeps lightweight tests and embedded users working when they
+    // provide a RouterTrait directly instead of a RouterManager.
+    let is_ready = state
+        .router_manager
+        .as_ref()
+        .map(|manager| manager.has_available_route(None))
+        .unwrap_or(!available_workers.is_empty());
 
     if is_ready {
         (
             StatusCode::OK,
             Json(json!({
                 "status": "ready",
-                "healthy_workers": healthy_workers.len(),
+                "healthy_workers": healthy_workers,
+                "available_workers": available_workers.len(),
                 "total_workers": workers.len()
             })),
         )
@@ -239,7 +256,7 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
                 "status": "not ready",
-                "reason": "insufficient healthy workers"
+                "reason": "no complete available route"
             })),
         )
             .into_response()
@@ -260,14 +277,17 @@ async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
+// TODO: multi model
 async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_server_info(req).await
 }
 
+// TODO: multi model
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_models(req).await
 }
 
+// TODO: multi model
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_model_info(req).await
 }

@@ -31,6 +31,7 @@ use crate::{
         WorkerConfigRequest as ProtocolWorkerConfigRequest,
         WorkerUpdateRequest as ProtocolWorkerUpdateRequest,
     },
+    routers::router_manager::RouterManager,
 };
 
 // ============================================================================
@@ -45,6 +46,9 @@ use crate::{
 pub trait WorkerRegistrationData: WorkflowData {
     /// Get the application context (transient, not serialized).
     fn get_app_context(&self) -> Option<&Arc<AppContext>>;
+
+    /// Get the router manager (transient, not serialized).
+    fn get_router_manager(&self) -> Option<&Arc<RouterManager>>;
 
     /// Get the actual worker objects (transient, not serialized).
     fn get_actual_workers(&self) -> Option<&Vec<Arc<dyn Worker>>>;
@@ -123,6 +127,9 @@ pub struct LocalWorkerWorkflowData {
     /// Application context (transient, must be re-initialized after deserialization)
     #[serde(skip, default)]
     pub app_context: Option<Arc<AppContext>>,
+    /// Router manager (transient, must be re-initialized after deserialization)
+    #[serde(skip, default)]
+    pub router_manager: Option<Arc<RouterManager>>,
     /// Actual worker objects (transient, not serialized)
     #[serde(skip, default)]
     pub actual_workers: Option<Vec<Arc<dyn Worker>>>,
@@ -151,6 +158,10 @@ impl WorkerRegistrationData for LocalWorkerWorkflowData {
         self.app_context.as_ref()
     }
 
+    fn get_router_manager(&self) -> Option<&Arc<RouterManager>> {
+        self.router_manager.as_ref()
+    }
+
     fn get_actual_workers(&self) -> Option<&Vec<Arc<dyn Worker>>> {
         self.actual_workers.as_ref()
     }
@@ -172,6 +183,9 @@ pub struct ExternalWorkerWorkflowData {
     /// Application context (transient, must be re-initialized after deserialization)
     #[serde(skip, default)]
     pub app_context: Option<Arc<AppContext>>,
+    /// Router manager (transient, must be re-initialized after deserialization)
+    #[serde(skip, default)]
+    pub router_manager: Option<Arc<RouterManager>>,
     /// Actual worker objects (transient, not serialized)
     #[serde(skip, default)]
     pub actual_workers: Option<Vec<Arc<dyn Worker>>>,
@@ -198,6 +212,10 @@ impl ExternalWorkerWorkflowData {
 impl WorkerRegistrationData for ExternalWorkerWorkflowData {
     fn get_app_context(&self) -> Option<&Arc<AppContext>> {
         self.app_context.as_ref()
+    }
+
+    fn get_router_manager(&self) -> Option<&Arc<RouterManager>> {
+        self.router_manager.as_ref()
     }
 
     fn get_actual_workers(&self) -> Option<&Vec<Arc<dyn Worker>>> {

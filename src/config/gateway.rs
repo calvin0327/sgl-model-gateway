@@ -5,7 +5,7 @@ pub use data_connector::{HistoryBackend, OracleConfig, PostgresConfig, RedisConf
 use serde::{Deserialize, Serialize};
 
 use super::validation::ConfigValidator;
-use crate::{auth::ControlPlaneAuthConfig, core::ConnectionMode};
+use crate::auth::ControlPlaneAuthConfig;
 
 pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 50;
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -16,7 +16,7 @@ pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 ///
 /// Each field maps to a component started by the gateway. The hierarchy stops
 /// here so consumers can depend on only the configuration they need.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     pub server: ServerConfig,
 
@@ -28,7 +28,7 @@ pub struct GatewayConfig {
 
     /// Kubernetes discovery settings; absent when discovery is disabled.
     pub discovery: Option<DiscoveryConfig>,
-    pub upstream: UpstreamConfig,
+    pub workers: WorkerConfig,
 
     pub model: ModelConfig,
 
@@ -40,31 +40,15 @@ pub struct GatewayConfig {
 
 impl GatewayConfig {
     /// Creates a gateway configuration with the legacy router defaults.
-    pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
+    pub fn new(policy: PolicyConfig) -> Self {
         Self {
-            routing: RoutingConfig::new(mode, policy),
+            routing: RoutingConfig::new(policy),
             ..Default::default()
         }
     }
 
     pub fn validate(&self) -> super::ConfigResult<()> {
         ConfigValidator::validate_gateway(self)
-    }
-}
-
-impl Default for GatewayConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            routing: RoutingConfig::default(),
-            upstream: UpstreamConfig::default(),
-            model: ModelConfig::default(),
-            storage: StorageConfig::default(),
-            extensions: ExtensionConfig::default(),
-            observability: ObservabilityConfig::default(),
-            discovery: None,
-            mesh: None,
-        }
     }
 }
 
@@ -143,100 +127,34 @@ pub struct ServerTlsConfig {
 /// Configuration for request routing and worker selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingConfig {
-    /// Enables multi-model inference gateway mode.
-    pub enable_igw: bool,
-    /// Worker topology used by the legacy static startup configuration.
-    pub mode: RoutingMode,
     /// Default load-balancing policy for worker selection.
     pub policy: PolicyConfig,
+
+    pub prefill_policy: Option<PolicyConfig>,
+
+    pub decode_policy: Option<PolicyConfig>,
+
     /// Enables data-parallelism-aware worker selection.
     pub dp_aware: bool,
 }
 
 impl RoutingConfig {
     /// Creates routing configuration with the legacy router defaults.
-    pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
+    pub fn new(policy: PolicyConfig) -> Self {
         Self {
-            mode,
             policy,
             ..Default::default()
         }
-    }
-
-    pub fn is_pd_mode(&self) -> bool {
-        self.mode.is_pd_mode()
     }
 }
 
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            mode: RoutingMode::Regular {
-                worker_urls: Vec::new(),
-            },
+            prefill_policy: Some(PolicyConfig::Random),
+            decode_policy: Some(PolicyConfig::Random),
             policy: PolicyConfig::Random,
             dp_aware: false,
-            enable_igw: false,
-        }
-    }
-}
-
-/// Routing mode configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum RoutingMode {
-    #[serde(rename = "regular")]
-    Regular { worker_urls: Vec<String> },
-    #[serde(rename = "prefill_decode")]
-    PrefillDecode {
-        /// With optional bootstrap ports
-        prefill_urls: Vec<(String, Option<u16>)>,
-        decode_urls: Vec<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        prefill_policy: Option<PolicyConfig>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        decode_policy: Option<PolicyConfig>,
-    },
-    #[serde(rename = "openai")]
-    OpenAI { worker_urls: Vec<String> },
-}
-
-impl RoutingMode {
-    pub fn is_pd_mode(&self) -> bool {
-        matches!(self, RoutingMode::PrefillDecode { .. })
-    }
-
-    pub fn worker_count(&self) -> usize {
-        match self {
-            RoutingMode::Regular { worker_urls } => worker_urls.len(),
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                ..
-            } => prefill_urls.len() + decode_urls.len(),
-            RoutingMode::OpenAI { .. } => 1,
-        }
-    }
-
-    /// Get the effective prefill policy for PD mode
-    /// Falls back to the main policy if no specific prefill policy is set
-    pub fn get_prefill_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
-        match self {
-            RoutingMode::PrefillDecode { prefill_policy, .. } => {
-                prefill_policy.as_ref().unwrap_or(main_policy)
-            }
-            _ => main_policy,
-        }
-    }
-
-    /// Get the effective decode policy for PD mode
-    /// Falls back to the main policy if no specific decode policy is set
-    pub fn get_decode_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
-        match self {
-            RoutingMode::PrefillDecode { decode_policy, .. } => {
-                decode_policy.as_ref().unwrap_or(main_policy)
-            }
-            _ => main_policy,
         }
     }
 }
@@ -362,15 +280,27 @@ impl PolicyConfig {
 
 /// Configuration for connections to and lifecycle management of workers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpstreamConfig {
-    /// Protocol used for gateway-to-worker calls.
-    pub connection_mode: ConnectionMode,
+pub struct WorkerConfig {
+    pub regular_urls: Vec<String>,
+
+    pub prefill_urls: Vec<(String, Option<u16>)>,
+
+    pub decode_urls: Vec<String>,
+
+    /// Shared PD deployment group for workers configured in this gateway.
+    /// Workers in the same group may be paired with each other.
+    #[serde(default)]
+    pub pd_group_id: Option<String>,
+
+    pub openai_urls: Vec<String>,
+
     /// Deadline for one request sent to a worker.
     pub request_timeout_secs: u64,
     /// Total time allowed for configured workers to become available at startup.
     pub startup_timeout_secs: u64,
     /// Polling interval while waiting for worker startup.
     pub startup_check_interval_secs: u64,
+
     /// How long an unused HTTP connection remains in the pool.
     pub pool_idle_timeout_secs: u64,
     /// Deadline for opening a new HTTP connection to a worker.
@@ -379,22 +309,44 @@ pub struct UpstreamConfig {
     pub pool_max_idle_per_host: usize,
     /// Idle time before TCP keepalive probes begin.
     pub tcp_keepalive_secs: u64,
-    /// Retry policy for failed worker requests.
-    pub retry: RetryConfig,
-    /// Policy for temporarily excluding repeatedly failing workers.
-    pub circuit_breaker: CircuitBreakerConfig,
+
     /// Forces each failed request to use only its initial attempt.
     pub disable_retries: bool,
+    /// Retry policy for failed worker requests.
+    pub retry: RetryConfig,
+
     /// Prevents workers from being temporarily excluded after failures.
     pub disable_circuit_breaker: bool,
+    /// Policy for temporarily excluding repeatedly failing workers.
+    pub circuit_breaker: CircuitBreakerConfig,
+
     /// Background probes used to determine worker availability.
     pub health_check: HealthCheckConfig,
 }
 
-impl Default for UpstreamConfig {
+impl WorkerConfig {
+    pub fn has_regular_workers(&self) -> bool {
+        !self.regular_urls.is_empty()
+    }
+
+    pub fn has_prefill_decode_workers(&self) -> bool {
+        !self.prefill_urls.is_empty() && !self.decode_urls.is_empty()
+    }
+
+    pub fn has_openai_workers(&self) -> bool {
+        !self.openai_urls.is_empty()
+    }
+}
+
+impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            connection_mode: ConnectionMode::Http,
+            regular_urls: Vec::new(),
+            prefill_urls: Vec::new(),
+            decode_urls: Vec::new(),
+            pd_group_id: None,
+            openai_urls: Vec::new(),
+
             request_timeout_secs: 1800,
             startup_timeout_secs: 1800,
             startup_check_interval_secs: 30,
@@ -411,7 +363,7 @@ impl Default for UpstreamConfig {
     }
 }
 
-impl UpstreamConfig {
+impl WorkerConfig {
     pub fn effective_retry_config(&self) -> RetryConfig {
         let mut config = self.retry.clone();
         if self.disable_retries {
@@ -519,7 +471,7 @@ impl Default for HealthCheckConfig {
 }
 
 /// Configuration for the model and its request/output adapters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub model_path: Option<String>,
     pub tokenizer_path: Option<String>,
@@ -527,19 +479,6 @@ pub struct ModelConfig {
     pub tokenizer_cache: TokenizerCacheConfig,
     pub reasoning_parser: Option<String>,
     pub tool_call_parser: Option<String>,
-}
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            model_path: None,
-            tokenizer_path: None,
-            chat_template: None,
-            tokenizer_cache: TokenizerCacheConfig::default(),
-            reasoning_parser: None,
-            tool_call_parser: None,
-        }
-    }
 }
 
 /// Tokenizer cache configuration
@@ -617,21 +556,12 @@ impl Default for StorageConfig {
 }
 
 /// Configuration for optional gateway extensions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ExtensionConfig {
     #[serde(skip)]
     pub mcp_config: Option<smg_mcp::McpConfig>,
     #[serde(default)]
     pub enable_wasm: bool,
-}
-
-impl Default for ExtensionConfig {
-    fn default() -> Self {
-        Self {
-            mcp_config: None,
-            enable_wasm: false,
-        }
-    }
 }
 
 /// Logging, metrics, and tracing settings for the gateway process.

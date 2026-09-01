@@ -6,9 +6,9 @@ pub use gateway::{
     CircuitBreakerConfig, DiscoveryConfig, ExtensionConfig, GatewayConfig, HealthCheckConfig,
     HistoryBackend, ManualAssignmentMode, MeshConfig, ModelConfig, ObservabilityConfig,
     OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RoutingConfig,
-    RoutingMode, ServerConfig, ServerTlsConfig, StorageConfig, TokenizerCacheConfig,
-    UpstreamConfig, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS,
-    DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
+    ServerConfig, ServerTlsConfig, StorageConfig, TokenizerCacheConfig, WorkerConfig,
+    DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST,
+    DEFAULT_TCP_KEEPALIVE_SECS,
 };
 
 #[derive(Debug, thiserror::Error)]

@@ -32,6 +32,14 @@ pub const DEFAULT_WORKER_COST: f32 = 1.0;
 /// Default HTTP client timeout for worker requests (in seconds)
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
 
+/// Label used to keep Prefill and Decode workers from different PD
+/// deployments from being paired together.
+pub const PD_GROUP_ID_LABEL: &str = "pd_group_id";
+
+/// Workers without an explicit `pd_group_id` remain compatible with the
+/// original single-PD-deployment behavior.
+pub const DEFAULT_PD_GROUP_ID: &str = "__default_pd_group__";
+
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
@@ -417,6 +425,21 @@ pub trait Worker: Send + Sync + fmt::Debug {
     }
     async fn grpc_health_check(&self) -> WorkerResult<bool>;
     async fn http_health_check(&self) -> WorkerResult<bool>;
+}
+
+/// Return the PD deployment group for a worker.
+///
+/// The group is intentionally represented as a label so it can be supplied
+/// by static worker registration, Kubernetes discovery, or the worker API
+/// without changing the Worker trait or protocol structures.
+pub fn pd_group_id(worker: &dyn Worker) -> &str {
+    worker
+        .metadata()
+        .labels
+        .get(PD_GROUP_ID_LABEL)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_PD_GROUP_ID)
 }
 
 /// Connection mode for worker communication

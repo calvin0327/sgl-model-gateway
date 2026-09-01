@@ -60,7 +60,9 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
             .await;
-    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    let router = RouterFactory::create_regular_router(&ctx)
+        .await
+        .expect("router");
 
     // Build a simple ResponsesRequest that will trigger the tool call
     let req = ResponsesRequest {
@@ -236,7 +238,9 @@ async fn test_conversations_crud_basic() {
         .build_unchecked();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
-    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_regular_router(&ctx)
+        .await
+        .expect("router");
 
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
@@ -550,7 +554,9 @@ async fn test_multi_turn_loop_with_mcp() {
         .build_unchecked();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
-    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    let router = RouterFactory::create_regular_router(&ctx)
+        .await
+        .expect("router");
 
     // Build request with MCP tools
     let req = ResponsesRequest {
@@ -702,7 +708,9 @@ async fn test_max_tool_calls_limit() {
         .build_unchecked();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
-    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    let router = RouterFactory::create_regular_router(&ctx)
+        .await
+        .expect("router");
 
     let req = ResponsesRequest {
         background: Some(false),
@@ -822,7 +830,9 @@ async fn setup_streaming_mcp_test() -> (
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
             .await;
-    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    let router = RouterFactory::create_regular_router(&ctx)
+        .await
+        .expect("router");
 
     (mcp, worker, router, dir)
 }
@@ -1240,7 +1250,9 @@ async fn test_conversation_items_create_and_get() {
         .build_unchecked();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
-    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_regular_router(&ctx)
+        .await
+        .expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1326,7 +1338,9 @@ async fn test_conversation_items_delete() {
         .build_unchecked();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
-    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_regular_router(&ctx)
+        .await
+        .expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1434,7 +1448,9 @@ async fn test_conversation_items_max_limit() {
         .build_unchecked();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
-    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_regular_router(&ctx)
+        .await
+        .expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1491,7 +1507,9 @@ async fn test_conversation_items_unsupported_type() {
         .build_unchecked();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
-    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_regular_router(&ctx)
+        .await
+        .expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1547,7 +1565,9 @@ async fn test_conversation_items_multi_conversation_sharing() {
         .build_unchecked();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
-    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_regular_router(&ctx)
+        .await
+        .expect("router");
 
     // Create two conversations
     let conv_a_resp =

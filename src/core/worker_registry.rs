@@ -624,21 +624,47 @@ impl WorkerRegistry {
 
     /// Get counts of regular and PD workers efficiently (O(1))
     /// This avoids the overhead of get_all() which allocates memory and iterates all workers
-    pub fn get_worker_distribution(&self) -> (usize, usize) {
-        // Use the existing type_workers index for O(1) lookup
-        let regular_count = self
-            .type_workers
-            .get(&WorkerType::Regular)
-            .map(|v| v.len())
-            .unwrap_or(0);
+    pub fn get_worker_distribution_for_model(&self, model_id: &str) -> (usize, usize, usize) {
+        let workers = self.get_by_model(model_id);
 
-        // Get total workers count efficiently from DashMap
-        let total_workers = self.workers.len();
+        let mut regular_count = 0;
+        let mut prefill_count = 0;
+        let mut decode_count = 0;
 
-        // PD workers are any workers that are not Regular
-        let pd_count = total_workers.saturating_sub(regular_count);
+        for worker in workers.iter() {
+            if !worker.is_healthy() {
+                continue;
+            }
 
-        (regular_count, pd_count)
+            match worker.worker_type() {
+                WorkerType::Regular => regular_count += 1,
+                WorkerType::Prefill { .. } => prefill_count += 1,
+                WorkerType::Decode => decode_count += 1,
+            }
+        }
+
+        (regular_count, prefill_count, decode_count)
+    }
+
+    /// Return global healthy worker distribution.
+    pub fn get_healthy_worker_distribution(&self) -> (usize, usize, usize) {
+        let mut regular_count = 0;
+        let mut prefill_count = 0;
+        let mut decode_count = 0;
+
+        for worker in self.get_all() {
+            if !worker.is_healthy() {
+                continue;
+            }
+
+            match worker.worker_type() {
+                WorkerType::Regular => regular_count += 1,
+                WorkerType::Prefill { .. } => prefill_count += 1,
+                WorkerType::Decode => decode_count += 1,
+            }
+        }
+
+        (regular_count, prefill_count, decode_count)
     }
 
     /// Start a health checker for all workers in the registry

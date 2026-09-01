@@ -201,7 +201,7 @@ async fn test_router_with_tracing() {
     println!("Workers initialized");
 
     // 9. create router
-    let router = RouterFactory::create_router(&app_context)
+    let router = RouterFactory::create_regular_router(&app_context)
         .await
         .expect("Failed to create router");
 

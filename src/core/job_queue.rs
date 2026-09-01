@@ -5,7 +5,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{Arc, OnceLock, Weak},
     time::{Duration, SystemTime},
 };
 
@@ -17,16 +17,20 @@ use wfaas::WorkflowId;
 
 use crate::{
     app_context::AppContext,
-    config::{GatewayConfig, RoutingMode},
-    core::steps::{
-        create_external_worker_workflow_data, create_local_worker_workflow_data,
-        create_mcp_workflow_data, create_tokenizer_workflow_data,
-        create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
-        create_worker_removal_workflow_data, create_worker_update_workflow_data,
-        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
-        WasmModuleConfigRequest, WasmModuleRemovalRequest,
+    config::GatewayConfig,
+    core::{
+        steps::{
+            create_external_worker_workflow_data, create_local_worker_workflow_data,
+            create_mcp_workflow_data, create_tokenizer_workflow_data,
+            create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
+            create_worker_removal_workflow_data, create_worker_update_workflow_data,
+            McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
+            WasmModuleConfigRequest, WasmModuleRemovalRequest,
+        },
+        PD_GROUP_ID_LABEL,
     },
     protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
+    routers::router_manager::RouterManager,
 };
 
 /// Job types for control plane operations
@@ -127,6 +131,8 @@ pub struct JobQueue {
     status_map: Arc<DashMap<String, JobStatus>>,
     /// Semaphore to limit concurrent job execution
     concurrency_limit: Arc<Semaphore>,
+    /// Router manager injected after application startup.
+    router_manager: Arc<OnceLock<Arc<RouterManager>>>,
 }
 
 impl std::fmt::Debug for JobQueue {
@@ -158,6 +164,7 @@ impl JobQueue {
             context: context.clone(),
             status_map: status_map.clone(),
             concurrency_limit: concurrency_limit.clone(),
+            router_manager: Arc::new(OnceLock::new()),
         });
 
         // Single dispatcher task
@@ -198,6 +205,16 @@ impl JobQueue {
         let queue_depth = self.tx.max_capacity() - self.tx.capacity();
         let available_permits = self.concurrency_limit.available_permits();
         (queue_depth, available_permits)
+    }
+
+    pub fn set_router_manager(&self, router_manager: Arc<RouterManager>) -> Result<(), String> {
+        self.router_manager
+            .set(router_manager)
+            .map_err(|_| "RouterManager already initialized".to_string())
+    }
+
+    pub fn router_manager(&self) -> Option<Arc<RouterManager>> {
+        self.router_manager.get().cloned()
     }
 
     /// Submit a job with detailed queue status
@@ -293,6 +310,11 @@ impl JobQueue {
 
     /// Execute a specific job
     async fn execute_job(job: &Job, context: &Arc<AppContext>) -> Result<String, String> {
+        let router_manager = context
+            .worker_job_queue
+            .get()
+            .and_then(|queue| queue.router_manager());
+
         match job {
             Job::AddWorker { config } => {
                 let engines = context
@@ -301,7 +323,7 @@ impl JobQueue {
                     .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
                 let timeout_duration =
-                    Duration::from_secs(context.config.upstream.startup_timeout_secs + 30);
+                    Duration::from_secs(context.config.workers.startup_timeout_secs + 30);
 
                 // Select workflow based on runtime field
                 match config.runtime.as_deref() {
@@ -309,6 +331,7 @@ impl JobQueue {
                         let workflow_data = create_external_worker_workflow_data(
                             (**config).clone(),
                             Arc::clone(context),
+                            router_manager.clone(),
                         );
                         let instance_id = engines
                             .external_worker
@@ -338,6 +361,7 @@ impl JobQueue {
                         let workflow_data = create_local_worker_workflow_data(
                             (**config).clone(),
                             Arc::clone(context),
+                            router_manager,
                         );
                         let instance_id = engines
                             .local_worker
@@ -498,160 +522,126 @@ impl JobQueue {
                 gateway_config: config,
             } => {
                 let api_key = config.server.api_key.clone();
-                let mut worker_count = 0;
 
-                // Create iterator of (url, worker_type, bootstrap_port) tuples based on mode
-                let workers: Vec<(String, &str, Option<u16>)> = match &config.routing.mode {
-                    RoutingMode::Regular { worker_urls } => worker_urls
+                let mut worker_specs: Vec<(
+                    String,
+                    &'static str,
+                    Option<u16>,
+                    Option<&'static str>,
+                )> = Vec::new();
+
+                // Regular workers
+                worker_specs.extend(
+                    config
+                        .workers
+                        .regular_urls
                         .iter()
-                        .map(|url| (url.clone(), "regular", None))
-                        .collect(),
-                    RoutingMode::PrefillDecode {
-                        prefill_urls,
-                        decode_urls,
-                        ..
-                    } => {
-                        let prefill_workers = prefill_urls
-                            .iter()
-                            .map(|(url, port)| (url.clone(), "prefill", *port));
+                        .cloned()
+                        .map(|url| (url, "regular", None, None)),
+                );
 
-                        let decode_workers =
-                            decode_urls.iter().map(|url| (url.clone(), "decode", None));
+                // Prefill workers
+                worker_specs.extend(
+                    config
+                        .workers
+                        .prefill_urls
+                        .iter()
+                        .map(|(url, bootstrap_port)| {
+                            (url.clone(), "prefill", *bootstrap_port, None)
+                        }),
+                );
 
-                        prefill_workers.chain(decode_workers).collect()
-                    }
-                    RoutingMode::OpenAI { worker_urls } => {
-                        // OpenAI mode: submit AddWorker jobs with runtime: "external"
-                        // The external_worker_registration workflow handles model discovery
-                        let api_key = config.server.api_key.clone();
-                        let mut submitted_count = 0;
+                // Decode workers
+                worker_specs.extend(
+                    config
+                        .workers
+                        .decode_urls
+                        .iter()
+                        .cloned()
+                        .map(|url| (url, "decode", None, None)),
+                );
 
-                        for url in worker_urls {
-                            let url_for_error = url.clone();
-                            let config = WorkerConfigRequest {
-                                url: url.clone(),
-                                api_key: api_key.clone(),
-                                worker_type: Some("regular".to_string()),
-                                labels: HashMap::new(),
-                                model_id: None,
-                                priority: None,
-                                cost: None,
-                                runtime: Some("external".to_string()),
-                                tokenizer_path: None,
-                                reasoning_parser: None,
-                                tool_parser: None,
-                                chat_template: config.model.chat_template.clone(),
-                                bootstrap_port: None,
-                                health_check_timeout_secs: config
-                                    .upstream
-                                    .health_check
-                                    .timeout_secs,
-                                health_check_interval_secs: config
-                                    .upstream
-                                    .health_check
-                                    .check_interval_secs,
-                                health_success_threshold: config
-                                    .upstream
-                                    .health_check
-                                    .success_threshold,
-                                health_failure_threshold: config
-                                    .upstream
-                                    .health_check
-                                    .failure_threshold,
-                                disable_health_check: config
-                                    .upstream
-                                    .health_check
-                                    .disable_health_check,
-                                max_connection_attempts: config
-                                    .upstream
-                                    .health_check
-                                    .success_threshold
-                                    * 10,
-                                dp_aware: false,
-                            };
-
-                            let job = Job::AddWorker {
-                                config: Box::new(config),
-                            };
-
-                            if let Some(queue) = context.worker_job_queue.get() {
-                                queue.submit(job).await.map_err(|e| {
-                                    format!(
-                                        "Failed to submit AddWorker job for external endpoint {}: {}",
-                                        url_for_error, e
-                                    )
-                                })?;
-                                submitted_count += 1;
-                            } else {
-                                return Err("JobQueue not available".to_string());
-                            }
-                        }
-
-                        if submitted_count == 0 {
-                            info!("OpenAI mode: no worker URLs provided");
-                            return Ok("OpenAI mode: no worker URLs to initialize".to_string());
-                        }
-
-                        return Ok(format!(
-                            "Submitted {} AddWorker jobs for external endpoints",
-                            submitted_count
-                        ));
-                    }
-                };
+                // OpenAI workers
+                worker_specs.extend(
+                    config
+                        .workers
+                        .openai_urls
+                        .iter()
+                        .cloned()
+                        .map(|url| (url, "regular", None, Some("external"))),
+                );
 
                 debug!(
                     "Creating AddWorker jobs for {} workers from config",
-                    workers.len()
+                    worker_specs.len()
                 );
 
-                // Process all workers with unified loop
-                for (url, worker_type, bootstrap_port) in workers {
-                    let url_for_error = url.clone(); // Clone for error message
-                    let config = WorkerConfigRequest {
+                let mut submitted_count = 0;
+
+                for (url, worker_type, bootstrap_port, runtime) in worker_specs {
+                    let url_for_error = url.clone();
+                    let health_check = &config.workers.health_check;
+                    let mut labels = HashMap::new();
+                    if matches!(worker_type, "prefill" | "decode") {
+                        if let Some(group_id) = config.workers.pd_group_id.as_ref() {
+                            labels.insert(PD_GROUP_ID_LABEL.to_string(), group_id.clone());
+                        }
+                    }
+
+                    let worker_config = WorkerConfigRequest {
                         url,
                         api_key: api_key.clone(),
+
                         worker_type: Some(worker_type.to_string()),
-                        labels: HashMap::new(),
+                        runtime: runtime.map(str::to_string),
+
+                        labels,
                         model_id: None,
                         priority: None,
                         cost: None,
-                        runtime: None,
+
                         tokenizer_path: None,
                         reasoning_parser: None,
                         tool_parser: None,
                         chat_template: config.model.chat_template.clone(),
+
                         bootstrap_port,
-                        health_check_timeout_secs: config.upstream.health_check.timeout_secs,
-                        health_check_interval_secs: config
-                            .upstream
-                            .health_check
-                            .check_interval_secs,
-                        health_success_threshold: config.upstream.health_check.success_threshold,
-                        health_failure_threshold: config.upstream.health_check.failure_threshold,
-                        disable_health_check: config.upstream.health_check.disable_health_check,
-                        max_connection_attempts: config.upstream.health_check.success_threshold
-                            * 10,
-                        dp_aware: config.routing.dp_aware,
+
+                        health_check_timeout_secs: health_check.timeout_secs,
+                        health_check_interval_secs: health_check.check_interval_secs,
+                        health_success_threshold: health_check.success_threshold,
+                        health_failure_threshold: health_check.failure_threshold,
+                        disable_health_check: health_check.disable_health_check,
+
+                        max_connection_attempts: health_check.success_threshold.saturating_mul(10),
+
+                        dp_aware: if runtime == Some("external") {
+                            false
+                        } else {
+                            config.routing.dp_aware
+                        },
                     };
 
                     let job = Job::AddWorker {
-                        config: Box::new(config),
+                        config: Box::new(worker_config),
                     };
 
-                    if let Some(queue) = context.worker_job_queue.get() {
-                        queue.submit(job).await.map_err(|e| {
-                            format!(
-                                "Failed to submit AddWorker job for {} worker {}: {}",
-                                worker_type, url_for_error, e
-                            )
-                        })?;
-                        worker_count += 1;
-                    } else {
-                        return Err("JobQueue not available".to_string());
-                    }
+                    let queue = context
+                        .worker_job_queue
+                        .get()
+                        .ok_or_else(|| "JobQueue not available".to_string())?;
+
+                    queue.submit(job).await.map_err(|error| {
+                        format!(
+                            "Failed to submit AddWorker job for {} worker {}: {}",
+                            worker_type, url_for_error, error
+                        )
+                    })?;
+
+                    submitted_count += 1;
                 }
 
-                Ok(format!("Submitted {} AddWorker jobs", worker_count))
+                Ok(format!("Submitted {} AddWorker jobs", submitted_count))
             }
             Job::InitializeMcpServers { mcp_config } => {
                 let mut server_count = 0;

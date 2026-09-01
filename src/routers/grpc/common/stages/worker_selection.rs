@@ -8,7 +8,7 @@ use tracing::{error, warn};
 
 use super::PipelineStage;
 use crate::{
-    core::{ConnectionMode, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
+    core::{pd_group_id, ConnectionMode, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
     observability::metrics::{metrics_labels, Metrics},
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
@@ -206,19 +206,18 @@ impl WorkerSelectionStage {
             false,
         );
 
-        let (available_prefill, available_decode): (Vec<_>, Vec<_>) =
-            all_workers
-                .into_iter()
-                .fold((Vec::new(), Vec::new()), |mut acc, w| {
-                    if w.is_available() {
-                        match w.metadata().worker_type {
-                            WorkerType::Prefill { .. } => acc.0.push(w),
-                            WorkerType::Decode => acc.1.push(w),
-                            _ => {}
-                        }
+        let (mut available_prefill, mut available_decode): (Vec<_>, Vec<_>) = all_workers
+            .into_iter()
+            .fold((Vec::new(), Vec::new()), |mut acc, w| {
+                if w.is_available() {
+                    match w.metadata().worker_type {
+                        WorkerType::Prefill { .. } => acc.0.push(w),
+                        WorkerType::Decode => acc.1.push(w),
+                        _ => {}
                     }
-                    acc
-                });
+                }
+                acc
+            });
 
         if available_prefill.is_empty() {
             warn!("No available prefill workers");
@@ -229,6 +228,28 @@ impl WorkerSelectionStage {
             warn!("No available decode workers");
             return None;
         }
+
+        // Select one deployment group before applying worker policies. This
+        // prevents a request from using Prefill and Decode workers belonging
+        // to different PD deployments of the same model.
+        let mut groups: Vec<String> = available_prefill
+            .iter()
+            .map(|worker| pd_group_id(worker.as_ref()).to_string())
+            .filter(|group| {
+                available_decode
+                    .iter()
+                    .any(|worker| pd_group_id(worker.as_ref()) == group)
+            })
+            .collect();
+        groups.sort();
+        groups.dedup();
+
+        let Some(group_id) = groups.into_iter().next() else {
+            warn!("No gRPC PD worker group has both prefill and decode workers");
+            return None;
+        };
+        available_prefill.retain(|worker| pd_group_id(worker.as_ref()) == group_id);
+        available_decode.retain(|worker| pd_group_id(worker.as_ref()) == group_id);
 
         // Select using policies
         let policy = match model_id {

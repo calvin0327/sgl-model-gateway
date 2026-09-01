@@ -68,7 +68,7 @@ impl GrpcPDRouter {
             worker_registry,
             pipeline,
             shared_components,
-            retry_config: ctx.config.upstream.effective_retry_config(),
+            retry_config: ctx.config.workers.effective_retry_config(),
         })
     }
 

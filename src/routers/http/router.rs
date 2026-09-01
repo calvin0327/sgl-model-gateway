@@ -49,7 +49,6 @@ pub struct Router {
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
     dp_aware: bool,
-    enable_igw: bool,
     retry_config: RetryConfig,
 }
 
@@ -60,7 +59,6 @@ impl std::fmt::Debug for Router {
             .field("policy_registry", &self.policy_registry)
             .field("client", &self.client)
             .field("dp_aware", &self.dp_aware)
-            .field("enable_igw", &self.enable_igw)
             .field("retry_config", &self.retry_config)
             .finish()
     }
@@ -74,13 +72,19 @@ impl Router {
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
             dp_aware: ctx.config.routing.dp_aware,
-            enable_igw: ctx.config.routing.enable_igw,
-            retry_config: ctx.config.upstream.effective_retry_config(),
+            retry_config: ctx.config.workers.effective_retry_config(),
         })
     }
 
     fn select_first_worker(&self) -> Result<String, String> {
-        let workers = self.worker_registry.get_all();
+        let workers = self.worker_registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Regular),
+            Some(ConnectionMode::Http),
+            None,
+            true,
+        );
+
         let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
         if healthy_workers.is_empty() {
             Err("No workers are available".to_string())
@@ -137,11 +141,9 @@ impl Router {
         text: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
-        let effective_model_id = if !self.enable_igw { None } else { model_id };
-
         // Get workers for the specified model O(1), filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
-            effective_model_id,
+            model_id,
             Some(WorkerType::Regular),
             Some(ConnectionMode::Http),
             None,  // any runtime type
@@ -166,7 +168,7 @@ impl Router {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self
             .worker_registry
-            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+            .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
         let idx = policy
             .select_worker(
@@ -878,7 +880,6 @@ mod tests {
             dp_aware: false,
             client: Client::new(),
             retry_config: RetryConfig::default(),
-            enable_igw: false,
         }
     }
 

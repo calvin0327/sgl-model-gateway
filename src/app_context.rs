@@ -310,20 +310,18 @@ impl AppContextBuilder {
         // Use rustls TLS backend when TLS/mTLS is configured (client cert or CA certs provided).
         // This ensures proper PKCS#8 key format support. For plain HTTP workers, use default
         // backend to avoid unnecessary TLS initialization overhead.
-        let has_tls_config = config.server.client_identity.is_some()
-            || !config.server.ca_certificates.is_empty();
+        let has_tls_config =
+            config.server.client_identity.is_some() || !config.server.ca_certificates.is_empty();
 
         let mut client_builder = Client::builder()
             .pool_idle_timeout(Some(Duration::from_secs(
-                config.upstream.pool_idle_timeout_secs,
+                config.workers.pool_idle_timeout_secs,
             )))
-            .pool_max_idle_per_host(config.upstream.pool_max_idle_per_host)
-            .timeout(Duration::from_secs(config.upstream.request_timeout_secs))
-            .connect_timeout(Duration::from_secs(config.upstream.connect_timeout_secs))
+            .pool_max_idle_per_host(config.workers.pool_max_idle_per_host)
+            .timeout(Duration::from_secs(config.workers.request_timeout_secs))
+            .connect_timeout(Duration::from_secs(config.workers.connect_timeout_secs))
             .tcp_nodelay(true)
-            .tcp_keepalive(Some(Duration::from_secs(
-                config.upstream.tcp_keepalive_secs,
-            )));
+            .tcp_keepalive(Some(Duration::from_secs(config.workers.tcp_keepalive_secs)));
 
         // Force rustls backend when TLS is configured
         if has_tls_config {
@@ -452,7 +450,7 @@ impl AppContextBuilder {
                 .expect("policy_registry must be set")
                 .clone(),
             client.clone(),
-            config.upstream.startup_check_interval_secs,
+            config.workers.startup_check_interval_secs,
         )));
         self
     }

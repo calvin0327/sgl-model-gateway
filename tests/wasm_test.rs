@@ -65,7 +65,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        config.upstream.startup_check_interval_secs,
+        config.workers.startup_check_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
@@ -169,7 +169,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
     let app_context = create_test_context_with_wasm().await;
 
     // Create a dummy router (we only need the app for WASM endpoints)
-    let router = RouterFactory::create_router(&app_context)
+    let router = RouterFactory::create_regular_router(&app_context)
         .await
         .expect("Failed to create router");
     let router = Arc::from(router);

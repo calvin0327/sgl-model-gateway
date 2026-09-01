@@ -11,14 +11,13 @@ use crate::{
             CircuitBreakerConfig, DiscoveryConfig, ExtensionConfig, GatewayConfig,
             HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MeshConfig, ModelConfig,
             ObservabilityConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-            RetryConfig, RoutingConfig, RoutingMode, ServerConfig, ServerTlsConfig, StorageConfig,
-            TokenizerCacheConfig, UpstreamConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
+            RetryConfig, RoutingConfig, ServerConfig, ServerTlsConfig, StorageConfig,
+            TokenizerCacheConfig, WorkerConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
             DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST,
             DEFAULT_TCP_KEEPALIVE_SECS,
         },
         ConfigError, ConfigResult,
     },
-    core::ConnectionMode,
     version,
 };
 
@@ -124,6 +123,9 @@ pub struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     worker_urls: Vec<String>,
 
+    #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
+    openai_urls: Vec<String>,
+
     /// API key used to authorize requests to workers
     #[arg(long, help_heading = "Worker Configuration")]
     api_key: Option<String>,
@@ -181,10 +183,6 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
-    /// Enable IGW (Inference Gateway) mode for multi-model support
-    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
-    enable_igw: bool,
-
     // PD Disaggregation
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -228,17 +226,6 @@ pub struct CliArgs {
     /// Token bucket refill rate (tokens per second)
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
-
-    // Backend
-    /// Backend runtime to use
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = Backend::Sglang,
-        alias = "runtime",
-        help_heading = "Backend"
-    )]
-    backend: Backend,
 
     /// Request timeout in seconds
     #[arg(long, default_value_t = 1800, help_heading = "HTTP Client")]
@@ -903,42 +890,6 @@ impl CliArgs {
     /// self-contained and does not retain CLI paths.
     fn resolve_config(&self) -> Result<GatewayConfig> {
         let prefill_urls = self.parse_prefill_args()?;
-        let enable_igw = self.enable_igw || self.service_discovery;
-
-        let mode = if matches!(self.backend, Backend::Openai) {
-            RoutingMode::OpenAI {
-                worker_urls: self.worker_urls.clone(),
-            }
-        } else if self.pd_disaggregation {
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls: self.decode.clone(),
-                prefill_policy: self.prefill_policy.map(|p| self.build_policy_config(p)),
-                decode_policy: self.decode_policy.map(|p| self.build_policy_config(p)),
-            }
-        } else {
-            RoutingMode::Regular {
-                worker_urls: self.worker_urls.clone(),
-            }
-        };
-
-        let mut all_urls = Vec::new();
-        match &mode {
-            RoutingMode::Regular { worker_urls } => all_urls.extend(worker_urls.clone()),
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                ..
-            } => {
-                all_urls.extend(prefill_urls.iter().map(|(url, _)| url.clone()));
-                all_urls.extend(decode_urls.clone());
-            }
-            RoutingMode::OpenAI { .. } => {}
-        }
-        let connection_mode = match &mode {
-            RoutingMode::OpenAI { .. } => ConnectionMode::Http,
-            _ => determine_connection_mode(&all_urls),
-        };
 
         let oracle = (self.history_backend == HistoryBackendKind::Oracle)
             .then(|| self.build_oracle_config())
@@ -987,13 +938,17 @@ impl CliArgs {
                 ..Default::default()
             },
             routing: RoutingConfig {
-                mode,
                 policy: self.build_policy_config(self.policy),
+                prefill_policy: self.prefill_policy.map(|p| self.build_policy_config(p)),
+                decode_policy: self.decode_policy.map(|p| self.build_policy_config(p)),
                 dp_aware: self.dp_aware,
-                enable_igw,
             },
-            upstream: UpstreamConfig {
-                connection_mode,
+            workers: WorkerConfig {
+                regular_urls: self.worker_urls.clone(),
+                openai_urls: self.openai_urls.clone(),
+                prefill_urls: prefill_urls.clone(),
+                decode_urls: self.decode.clone(),
+                pd_group_id: None,
                 request_timeout_secs: self.request_timeout_secs,
                 startup_timeout_secs: self.worker_startup_timeout_secs,
                 startup_check_interval_secs: self.worker_startup_check_interval,
@@ -1065,32 +1020,6 @@ impl CliArgs {
 
         config.validate()?;
         Ok(config)
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum Backend {
-    #[value(name = "sglang")]
-    Sglang,
-    #[value(name = "vllm")]
-    Vllm,
-    #[value(name = "trtllm")]
-    Trtllm,
-    #[value(name = "openai")]
-    Openai,
-    #[value(name = "anthropic")]
-    Anthropic,
-}
-
-impl std::fmt::Display for Backend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Sglang => "sglang",
-            Self::Vllm => "vllm",
-            Self::Trtllm => "trtllm",
-            Self::Openai => "openai",
-            Self::Anthropic => "anthropic",
-        })
     }
 }
 
@@ -1182,15 +1111,6 @@ fn parse_control_plane_api_key(key_str: &str) -> Option<ApiKeyEntry> {
     };
 
     Some(ApiKeyEntry::new(id, name, key, role))
-}
-
-fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
-    for url in worker_urls {
-        if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-            return ConnectionMode::Grpc { port: None };
-        }
-    }
-    ConnectionMode::Http
 }
 
 fn parse_label_selectors(selector_list: &[String]) -> HashMap<String, String> {
