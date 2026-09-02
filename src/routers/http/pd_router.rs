@@ -19,8 +19,10 @@ use super::pd_types::api_path;
 use crate::{
     config::RetryConfig,
     core::{
-        is_retryable_status, pd_group_id, ConnectionMode, HashRing, RetryExecutor, Worker,
-        WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        is_retryable_status, pd_group_id,
+        scheduler::{SchedulerOutput, WorkerSelection as ScheduledWorkerSelection},
+        ConnectionMode, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
+        WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -81,6 +83,15 @@ struct PDRequestContext<'a> {
 struct BreakerOutcomesRecorded;
 
 impl PDRouter {
+    fn selected_pd_pair(selection: &SchedulerOutput) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
+        match &selection.worker_selection {
+            ScheduledWorkerSelection::PrefillDecode {
+                prefill, decode, ..
+            } => Some((prefill.clone(), decode.clone())),
+            _ => None,
+        }
+    }
+
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
         api_path(worker.base_url(), endpoint)
     }
@@ -184,7 +195,7 @@ impl PDRouter {
         }
     }
 
-    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+    pub fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -373,6 +384,7 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         original_request: &T,
         context: PDRequestContext<'_>,
+        selected_pair: Option<(Arc<dyn Worker>, Arc<dyn Worker>)>,
     ) -> Response {
         let start_time = Instant::now();
 
@@ -399,19 +411,21 @@ impl PDRouter {
                     // Clone Arc (cheap reference count increment) instead of cloning the entire request
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
+                    let selected_pair = selected_pair.clone();
                     async move {
-                        let (prefill, decode) = match self
-                            .select_pd_pair(
-                                context.request_text.as_deref(),
-                                context.model_id,
-                                context.headers.as_ref(),
-                            )
-                            .await
-                        {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                return Self::handle_server_selection_error(e);
-                            }
+                        let (prefill, decode) = match selected_pair {
+                            Some(pair) => pair,
+                            None => match self
+                                .select_pd_pair(
+                                    context.request_text.as_deref(),
+                                    context.model_id,
+                                    context.headers.as_ref(),
+                                )
+                                .await
+                            {
+                                Ok(pair) => pair,
+                                Err(e) => return Self::handle_server_selection_error(e),
+                            },
                         };
 
                         debug!(
@@ -523,6 +537,36 @@ impl PDRouter {
         }
 
         response
+    }
+
+    async fn execute_dual_dispatch_selected<T: Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        original_request: &T,
+        route: &'static str,
+        batch_size: Option<usize>,
+        is_stream: bool,
+        return_logprob: bool,
+        request_text: Option<String>,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let Some(selected_pair) = Self::selected_pd_pair(selection) else {
+            return error::bad_request("invalid_worker_selection", "Expected a PD worker pair");
+        };
+
+        let context = PDRequestContext {
+            route,
+            batch_size,
+            is_stream,
+            return_logprob,
+            request_text,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, original_request, context, Some(selected_pair))
+            .await
     }
 
     async fn handle_decode_error_response(
@@ -1631,7 +1675,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, None)
+            .await
     }
 
     async fn route_chat(
@@ -1662,7 +1707,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, None)
+            .await
     }
 
     async fn route_completion(
@@ -1696,7 +1742,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, None)
+            .await
     }
 
     async fn route_rerank(
@@ -1722,7 +1769,113 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, None)
+            .await
+    }
+
+    async fn route_generate_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let request_text = if self.policies_need_request_text() {
+            body.text.clone()
+        } else {
+            None
+        };
+        self.execute_dual_dispatch_selected(
+            headers,
+            body,
+            "/generate",
+            Self::get_generate_batch_size(body),
+            body.stream,
+            body.return_logprob.unwrap_or(false),
+            request_text,
+            model_id,
+            selection,
+        )
+        .await
+    }
+
+    async fn route_chat_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let request_text = if self.policies_need_request_text() {
+            Self::build_chat_request_text(body)
+        } else {
+            None
+        };
+        self.execute_dual_dispatch_selected(
+            headers,
+            body,
+            "/v1/chat/completions",
+            Self::get_chat_batch_size(body),
+            body.stream,
+            body.logprobs,
+            request_text,
+            model_id,
+            selection,
+        )
+        .await
+    }
+
+    async fn route_completion_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let request_text = if self.policies_need_request_text() {
+            match &body.prompt {
+                StringOrArray::String(text) => Some(text.clone()),
+                StringOrArray::Array(texts) => texts.first().map(|text| text.to_string()),
+            }
+        } else {
+            None
+        };
+        self.execute_dual_dispatch_selected(
+            headers,
+            body,
+            "/v1/completions",
+            Self::get_completion_batch_size(body),
+            body.stream,
+            body.logprobs.is_some(),
+            request_text,
+            model_id,
+            selection,
+        )
+        .await
+    }
+
+    async fn route_rerank_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RerankRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let request_text = self
+            .policies_need_request_text()
+            .then(|| body.query.clone());
+        self.execute_dual_dispatch_selected(
+            headers,
+            body,
+            "/v1/rerank",
+            None,
+            false,
+            false,
+            request_text,
+            model_id,
+            selection,
+        )
+        .await
     }
 
     async fn route_embeddings(

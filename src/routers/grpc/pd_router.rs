@@ -9,8 +9,8 @@ use crate::{
     app_context::AppContext,
     config::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, WorkerRegistry, WorkerType,
-        UNKNOWN_MODEL_ID,
+        is_retryable_status, scheduler::SchedulerOutput, ConnectionMode, RetryExecutor,
+        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::metrics::{metrics_labels, Metrics},
     protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
@@ -28,7 +28,7 @@ pub struct GrpcPDRouter {
 
 impl GrpcPDRouter {
     /// Create a new gRPC PD router
-    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
+    pub fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         // Get registries from context
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
@@ -78,6 +78,7 @@ impl GrpcPDRouter {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Response {
         debug!(
             "Processing generate request for model: {} (PD mode)",
@@ -98,9 +99,16 @@ impl GrpcPDRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let scheduled_selection = scheduled_selection.clone();
                 async move {
                     pipeline
-                        .execute_generate(request, headers, model_id, components)
+                        .execute_generate(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            scheduled_selection,
+                        )
                         .await
                 }
             },
@@ -136,6 +144,7 @@ impl GrpcPDRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Response {
         debug!(
             "Processing chat completion request for model: {} (PD mode)",
@@ -156,9 +165,10 @@ impl GrpcPDRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let scheduled_selection = scheduled_selection.clone();
                 async move {
                     pipeline
-                        .execute_chat(request, headers, model_id, components)
+                        .execute_chat(request, headers, model_id, components, scheduled_selection)
                         .await
                 }
             },
@@ -226,7 +236,19 @@ impl RouterTrait for GrpcPDRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_generate_impl(headers, body, model_id).await
+        self.route_generate_impl(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_generate_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        self.route_generate_impl(headers, body, model_id, Some(selection.clone()))
+            .await
     }
 
     async fn route_chat(
@@ -235,7 +257,18 @@ impl RouterTrait for GrpcPDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_chat_impl(headers, body, model_id).await
+        self.route_chat_impl(headers, body, model_id, None).await
+    }
+
+    async fn route_chat_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        self.route_chat_impl(headers, body, model_id, Some(selection.clone()))
+            .await
     }
 
     fn router_type(&self) -> &'static str {

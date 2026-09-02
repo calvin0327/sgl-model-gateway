@@ -19,6 +19,7 @@ pub mod metrics_aggregator;
 pub mod model_card;
 pub mod model_type;
 pub mod retry;
+pub mod scheduler;
 pub mod steps;
 pub mod token_bucket;
 pub mod worker;

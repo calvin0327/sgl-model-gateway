@@ -29,7 +29,7 @@ use super::{
     utils::error_type_from_status,
 };
 use crate::{
-    core::{WorkerRegistry, UNKNOWN_MODEL_ID},
+    core::{scheduler::SchedulerOutput, WorkerRegistry, UNKNOWN_MODEL_ID},
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
     protocols::{
@@ -262,6 +262,7 @@ impl RequestPipeline {
         headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Response {
         let start = Instant::now();
         // Clone Arc for metrics (cheap atomic increment) to avoid borrow issues
@@ -279,6 +280,9 @@ impl RequestPipeline {
         );
 
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+        if let Some(selection) = scheduled_selection.as_ref() {
+            ctx.set_scheduled_selection(selection);
+        }
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -368,6 +372,7 @@ impl RequestPipeline {
         headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
@@ -383,6 +388,9 @@ impl RequestPipeline {
         );
 
         let mut ctx = RequestContext::for_generate(request, headers, model_id.clone(), components);
+        if let Some(selection) = scheduled_selection.as_ref() {
+            ctx.set_scheduled_selection(selection);
+        }
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -471,6 +479,7 @@ impl RequestPipeline {
         headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Response {
         debug!(
             "execute_embeddings: Starting execution for model: {}",
@@ -489,6 +498,9 @@ impl RequestPipeline {
         );
 
         let mut ctx = RequestContext::for_embedding(request, headers, model_id.clone(), components);
+        if let Some(selection) = scheduled_selection.as_ref() {
+            ctx.set_scheduled_selection(selection);
+        }
 
         for stage in self.stages.iter() {
             debug!("execute_embeddings: Executing stage: {}", stage.name());
@@ -571,6 +583,7 @@ impl RequestPipeline {
         headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Response {
         debug!(
             "execute_classify: Starting execution for model: {}",
@@ -589,6 +602,9 @@ impl RequestPipeline {
         );
 
         let mut ctx = RequestContext::for_classify(request, headers, model_id.clone(), components);
+        if let Some(selection) = scheduled_selection.as_ref() {
+            ctx.set_scheduled_selection(selection);
+        }
 
         for stage in self.stages.iter() {
             debug!("execute_classify: Executing stage: {}", stage.name());

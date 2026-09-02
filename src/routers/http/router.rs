@@ -15,8 +15,10 @@ use crate::{
     app_context::AppContext,
     config::RetryConfig,
     core::{
-        is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        is_retryable_status,
+        scheduler::{SchedulerOutput, WorkerSelection as ScheduledWorkerSelection},
+        AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
+        WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -65,8 +67,15 @@ impl std::fmt::Debug for Router {
 }
 
 impl Router {
+    fn selected_regular_worker(selection: &SchedulerOutput) -> Option<Arc<dyn Worker>> {
+        match &selection.worker_selection {
+            ScheduledWorkerSelection::Regular { worker } => Some(worker.clone()),
+            _ => None,
+        }
+    }
+
     /// Create a new router with injected policy and client
-    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
+    pub fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
@@ -200,6 +209,30 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
+        self.route_typed_request_internal(headers, typed_req, route, model_id, None)
+            .await
+    }
+
+    async fn route_typed_request_with_worker<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &'static str,
+        model_id: Option<&str>,
+        worker: Arc<dyn Worker>,
+    ) -> Response {
+        self.route_typed_request_internal(headers, typed_req, route, model_id, Some(worker))
+            .await
+    }
+
+    async fn route_typed_request_internal<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &'static str,
+        model_id: Option<&str>,
+        selected_worker: Option<Arc<dyn Worker>>,
+    ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
@@ -221,7 +254,15 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(
+                        headers,
+                        typed_req,
+                        route,
+                        model_id,
+                        is_stream,
+                        &text,
+                        selected_worker.clone(),
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -280,11 +321,16 @@ impl Router {
         model_id: Option<&str>,
         is_stream: bool,
         text: &str,
+        selected_worker: Option<Arc<dyn Worker>>,
     ) -> Response {
-        let worker = match self
-            .select_worker_for_model(model_id, Some(text), headers)
-            .await
-        {
+        let worker = match selected_worker {
+            Some(worker) => Some(worker),
+            None => {
+                self.select_worker_for_model(model_id, Some(text), headers)
+                    .await
+            }
+        };
+        let worker = match worker {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
@@ -758,6 +804,20 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_generate_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let Some(worker) = Self::selected_regular_worker(selection) else {
+            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        };
+        self.route_typed_request_with_worker(headers, body, "/generate", model_id, worker.clone())
+            .await
+    }
+
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
@@ -766,6 +826,26 @@ impl RouterTrait for Router {
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
             .await
+    }
+
+    async fn route_chat_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let Some(worker) = Self::selected_regular_worker(selection) else {
+            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        };
+        self.route_typed_request_with_worker(
+            headers,
+            body,
+            "/v1/chat/completions",
+            model_id,
+            worker.clone(),
+        )
+        .await
     }
 
     async fn route_completion(
@@ -778,6 +858,26 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_completion_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let Some(worker) = Self::selected_regular_worker(selection) else {
+            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        };
+        self.route_typed_request_with_worker(
+            headers,
+            body,
+            "/v1/completions",
+            model_id,
+            worker.clone(),
+        )
+        .await
+    }
+
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
@@ -786,6 +886,26 @@ impl RouterTrait for Router {
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/responses", model_id)
             .await
+    }
+
+    async fn route_responses_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let Some(worker) = Self::selected_regular_worker(selection) else {
+            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        };
+        self.route_typed_request_with_worker(
+            headers,
+            body,
+            "/v1/responses",
+            model_id,
+            worker.clone(),
+        )
+        .await
     }
 
     async fn get_response(
@@ -813,6 +933,26 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_embeddings_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let Some(worker) = Self::selected_regular_worker(selection) else {
+            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        };
+        self.route_typed_request_with_worker(
+            headers,
+            body,
+            "/v1/embeddings",
+            model_id,
+            worker.clone(),
+        )
+        .await
+    }
+
     async fn route_classify(
         &self,
         headers: Option<&HeaderMap>,
@@ -821,6 +961,26 @@ impl RouterTrait for Router {
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/classify", model_id)
             .await
+    }
+
+    async fn route_classify_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let Some(worker) = Self::selected_regular_worker(selection) else {
+            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        };
+        self.route_typed_request_with_worker(
+            headers,
+            body,
+            "/v1/classify",
+            model_id,
+            worker.clone(),
+        )
+        .await
     }
 
     async fn route_rerank(
@@ -842,6 +1002,32 @@ impl RouterTrait for Router {
                         "Failed to build rerank response",
                     );
                 }
+            }
+        } else {
+            response
+        }
+    }
+
+    async fn route_rerank_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &RerankRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let Some(worker) = Self::selected_regular_worker(selection) else {
+            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        };
+        let response = self
+            .route_typed_request_with_worker(headers, body, "/v1/rerank", model_id, worker.clone())
+            .await;
+        if response.status().is_success() {
+            match Self::build_rerank_response(body, response).await {
+                Ok(response) => response,
+                Err(_) => error::internal_error(
+                    "rerank_response_build_failed",
+                    "Failed to build rerank response",
+                ),
             }
         } else {
             response

@@ -15,34 +15,29 @@ pub struct RouterFactory;
 
 impl RouterFactory {
     /// Create a regular router
-    pub async fn create_regular_router(
-        ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        let router = Router::new(ctx).await?;
+    pub fn create_regular_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        let router = Router::new(ctx)?;
 
         Ok(Box::new(router))
     }
 
     /// Create a PD router using policies initialized in the application context.
-    pub async fn create_pd_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
-        let router = PDRouter::new(ctx).await?;
+    pub fn create_pd_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        let router = PDRouter::new(ctx)?;
 
         Ok(Box::new(router))
     }
 
     /// Create a gRPC router with injected policy
-    pub async fn create_grpc_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
-        let router = GrpcRouter::new(ctx).await?;
+    pub fn create_grpc_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        let router = GrpcRouter::new(ctx)?;
 
         Ok(Box::new(router))
     }
 
     /// Create a gRPC PD router using policies initialized in the application context.
-    pub async fn create_grpc_pd_router(
-        ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        let router = GrpcPDRouter::new(ctx).await?;
-
+    pub fn create_grpc_pd_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        let router = GrpcPDRouter::new(ctx)?;
         Ok(Box::new(router))
     }
 
@@ -51,10 +46,8 @@ impl RouterFactory {
     /// Workers should be registered via the external worker registration workflow
     /// before using this router. The workflow discovers models from the provided
     /// endpoints and creates external workers in the registry.
-    pub async fn create_openai_router(
-        ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        let router = OpenAIRouter::new(ctx).await?;
+    pub fn create_openai_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        let router = OpenAIRouter::new(ctx)?;
         Ok(Box::new(router))
     }
 }

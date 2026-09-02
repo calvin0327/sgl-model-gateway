@@ -13,7 +13,7 @@ use super::{
     proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
 };
 use crate::{
-    core::{Worker, WorkerLoadGuard},
+    core::{scheduler::SchedulerOutput, Worker, WorkerLoadGuard},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         classify::{ClassifyRequest, ClassifyResponse},
@@ -198,6 +198,26 @@ pub(crate) struct ResponseState {
 }
 
 impl RequestContext {
+    /// Install the worker selection made by the gateway Scheduler. The
+    /// WorkerSelectionStage will observe this value after preparation and
+    /// skip its legacy registry/policy selection path.
+    pub fn set_scheduled_selection(&mut self, selection: &SchedulerOutput) {
+        self.state.workers = Some(match &selection.worker_selection {
+            crate::core::scheduler::WorkerSelection::Regular { worker }
+            | crate::core::scheduler::WorkerSelection::External { worker } => {
+                WorkerSelection::Single {
+                    worker: worker.clone(),
+                }
+            }
+            crate::core::scheduler::WorkerSelection::PrefillDecode {
+                prefill, decode, ..
+            } => WorkerSelection::Dual {
+                prefill: prefill.clone(),
+                decode: decode.clone(),
+            },
+        });
+    }
+
     /// Create context for chat completion request
     pub fn for_chat(
         request: Arc<ChatCompletionRequest>,

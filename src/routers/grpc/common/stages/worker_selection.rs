@@ -59,6 +59,14 @@ impl PipelineStage for WorkerSelectionStage {
             )
         })?;
 
+        // RouterManager may have already selected the concrete worker(s) with
+        // Scheduler. Preparation still runs first because it produces the
+        // tokenizer output required by request building, but this stage must
+        // not select a second worker from the registry.
+        if ctx.state.workers.is_some() {
+            return Ok(None);
+        }
+
         // For Harmony, use selection_text produced during Harmony encoding
         // Otherwise, use original_text from regular preparation
         let text = if prep.harmony_mode {

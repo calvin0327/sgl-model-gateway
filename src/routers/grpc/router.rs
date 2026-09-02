@@ -21,7 +21,10 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::RetryConfig,
-    core::{is_retryable_status, RetryExecutor, WorkerRegistry, UNKNOWN_MODEL_ID},
+    core::{
+        is_retryable_status, scheduler::SchedulerOutput, RetryExecutor, WorkerRegistry,
+        UNKNOWN_MODEL_ID,
+    },
     observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
@@ -49,7 +52,7 @@ pub struct GrpcRouter {
 
 impl GrpcRouter {
     /// Create a new gRPC router
-    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
+    pub fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         // Get tokenizer registry (no longer requires pre-loaded tokenizer)
         let tokenizer_registry = ctx.tokenizer_registry.clone();
 
@@ -144,6 +147,7 @@ impl GrpcRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Response {
         // Choose Harmony pipeline if workers indicate Harmony (checks architectures, hf_model_type)
         let is_harmony =
@@ -175,9 +179,10 @@ impl GrpcRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let scheduled_selection = scheduled_selection.clone();
                 async move {
                     pipeline
-                        .execute_chat(request, headers, model_id, components)
+                        .execute_chat(request, headers, model_id, components, scheduled_selection)
                         .await
                 }
             },
@@ -208,6 +213,7 @@ impl GrpcRouter {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Response {
         debug!(
             "Processing generate request for model: {}",
@@ -229,9 +235,16 @@ impl GrpcRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let scheduled_selection = scheduled_selection.clone();
                 async move {
                     pipeline
-                        .execute_generate(request, headers, model_id, components)
+                        .execute_generate(
+                            request,
+                            headers,
+                            model_id,
+                            components,
+                            scheduled_selection,
+                        )
                         .await
                 }
             },
@@ -320,6 +333,7 @@ impl GrpcRouter {
         headers: Option<&HeaderMap>,
         body: &EmbeddingRequest,
         model_id: Option<&str>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Response {
         debug!(
             "Processing embedding request for model: {}",
@@ -332,6 +346,7 @@ impl GrpcRouter {
                 headers.cloned(),
                 model_id.map(|s| s.to_string()),
                 self.shared_components.clone(),
+                scheduled_selection,
             )
             .await
     }
@@ -342,6 +357,7 @@ impl GrpcRouter {
         headers: Option<&HeaderMap>,
         body: &ClassifyRequest,
         model_id: Option<&str>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Response {
         debug!(
             "Processing classify request for model: {}",
@@ -354,6 +370,7 @@ impl GrpcRouter {
                 headers.cloned(),
                 model_id.map(|s| s.to_string()),
                 self.shared_components.clone(),
+                scheduled_selection,
             )
             .await
     }
@@ -380,7 +397,19 @@ impl RouterTrait for GrpcRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_generate_impl(headers, body, model_id).await
+        self.route_generate_impl(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_generate_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        self.route_generate_impl(headers, body, model_id, Some(selection.clone()))
+            .await
     }
 
     async fn route_chat(
@@ -389,7 +418,18 @@ impl RouterTrait for GrpcRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_chat_impl(headers, body, model_id).await
+        self.route_chat_impl(headers, body, model_id, None).await
+    }
+
+    async fn route_chat_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        self.route_chat_impl(headers, body, model_id, Some(selection.clone()))
+            .await
     }
 
     async fn route_responses(
@@ -420,7 +460,19 @@ impl RouterTrait for GrpcRouter {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_embeddings_impl(headers, body, model_id).await
+        self.route_embeddings_impl(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_embeddings_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        self.route_embeddings_impl(headers, body, model_id, Some(selection.clone()))
+            .await
     }
 
     async fn route_classify(
@@ -429,7 +481,19 @@ impl RouterTrait for GrpcRouter {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_classify_impl(headers, body, model_id).await
+        self.route_classify_impl(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_classify_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        self.route_classify_impl(headers, body, model_id, Some(selection.clone()))
+            .await
     }
 
     fn router_type(&self) -> &'static str {

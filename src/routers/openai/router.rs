@@ -29,8 +29,10 @@ use crate::{
     app_context::AppContext,
     config::RetryConfig,
     core::{
-        is_retryable_status, model_type::Endpoint, ModelCard, ProviderType, RetryExecutor,
-        RuntimeType, Worker, WorkerRegistry,
+        is_retryable_status,
+        model_type::Endpoint,
+        scheduler::{SchedulerOutput, WorkerSelection as ScheduledWorkerSelection},
+        ModelCard, ProviderType, RetryExecutor, RuntimeType, Worker, WorkerRegistry,
     },
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     protocols::{
@@ -53,6 +55,14 @@ pub struct OpenAIRouter {
     shared_components: Arc<SharedComponents>,
     responses_components: Arc<ResponsesComponents>,
     retry_config: RetryConfig,
+}
+
+// Request-scoped hint used by the Scheduler-aware trait methods. This avoids
+// storing mutable selection state on the shared router while allowing the
+// existing request implementation (including retry and provider handling) to
+// consume the exact Worker selected by RouterManager.
+tokio::task_local! {
+    static SCHEDULED_EXTERNAL_WORKER: Option<Arc<dyn Worker>>;
 }
 
 impl std::fmt::Debug for OpenAIRouter {
@@ -148,7 +158,7 @@ impl OpenAIRouter {
         Arc::clone(&self.responses_components)
     }
 
-    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
+    pub fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         let worker_registry = ctx.worker_registry.clone();
         let mcp_manager = ctx
             .mcp_manager
@@ -299,6 +309,10 @@ impl OpenAIRouter {
         model_id: &str,
         auth_header: Option<&HeaderValue>,
     ) -> Result<Arc<dyn Worker>, Response> {
+        if let Ok(Some(worker)) = SCHEDULED_EXTERNAL_WORKER.try_with(|worker| worker.clone()) {
+            return Ok(worker);
+        }
+
         // Try to find a worker immediately
         if let Some(worker) = self.find_best_worker_for_model(model_id) {
             return Ok(worker);
@@ -704,6 +718,25 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         response
     }
 
+    async fn route_chat_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let Some(worker) = (match &selection.worker_selection {
+            ScheduledWorkerSelection::External { worker } => Some(worker.clone()),
+            _ => None,
+        }) else {
+            return error_responses::bad_request("Expected an External worker selection");
+        };
+
+        SCHEDULED_EXTERNAL_WORKER
+            .scope(Some(worker), self.route_chat(headers, body, model_id))
+            .await
+    }
+
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
@@ -971,6 +1004,25 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
 
         response
+    }
+
+    async fn route_responses_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        let Some(worker) = (match &selection.worker_selection {
+            ScheduledWorkerSelection::External { worker } => Some(worker.clone()),
+            _ => None,
+        }) else {
+            return error_responses::bad_request("Expected an External worker selection");
+        };
+
+        SCHEDULED_EXTERNAL_WORKER
+            .scope(Some(worker), self.route_responses(headers, body, model_id))
+            .await
     }
 
     async fn get_response(

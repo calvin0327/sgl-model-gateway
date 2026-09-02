@@ -55,7 +55,7 @@ pub async fn startup(config: GatewayConfig) -> Result<()> {
 
     // Create the empty router manager before worker jobs start. Routers are
     // created lazily by the worker registration workflow.
-    let router_manager = create_router_manager(&app_context, &config).await?;
+    let router_manager = create_router_manager(&app_context, &config)?;
     let worker_job_queue = app_context
         .worker_job_queue
         .get()
@@ -316,12 +316,11 @@ async fn submit_startup_jobs(app_context: &Arc<AppContext>, config: &GatewayConf
 }
 
 /// Builds the router implementation for the resolved gateway configuration.
-async fn create_router_manager(
+fn create_router_manager(
     app_context: &Arc<AppContext>,
     config: &GatewayConfig,
 ) -> Result<Arc<RouterManager>> {
     let router_manager = RouterManager::from_config(config, app_context)
-        .await
         .map_err(Error::msg)
         .context("create router manager")?;
 
