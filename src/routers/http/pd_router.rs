@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{borrow::Cow, collections::BTreeSet, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -21,19 +21,18 @@ use crate::{
     core::{
         is_retryable_status, pd_group_id,
         scheduler::{SchedulerOutput, WorkerSelection as ScheduledWorkerSelection},
-        ConnectionMode, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType, UNKNOWN_MODEL_ID,
+        ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
-        common::{GenerationRequest, InputIds, StringOrArray},
+        common::{InputIds, StringOrArray},
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -51,7 +50,6 @@ use crate::{
 #[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
-    pub policy_registry: Arc<PolicyRegistry>,
     pub client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
@@ -68,9 +66,7 @@ struct PDRequestContext<'a> {
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
-    request_text: Option<String>,
     model_id: Option<&'a str>,
-    headers: Option<HeaderMap>,
 }
 
 /// Marker placed on a `Response` by paths inside
@@ -198,19 +194,10 @@ impl PDRouter {
     pub fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
-            policy_registry: Arc::clone(&ctx.policy_registry),
             client: ctx.client.clone(),
             retry_config: ctx.config.workers.effective_retry_config(),
             api_key: ctx.config.server.api_key.clone(),
         })
-    }
-
-    fn handle_server_selection_error(error: String) -> Response {
-        error!("Failed to select PD pair error={}", error);
-        error::service_unavailable(
-            "server_selection_failed",
-            format!("No available servers: {}", error),
-        )
     }
 
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
@@ -384,7 +371,7 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         original_request: &T,
         context: PDRequestContext<'_>,
-        selected_pair: Option<(Arc<dyn Worker>, Arc<dyn Worker>)>,
+        selected_pair: (Arc<dyn Worker>, Arc<dyn Worker>),
     ) -> Response {
         let start_time = Instant::now();
 
@@ -413,20 +400,7 @@ impl PDRouter {
                     let context = context.clone();
                     let selected_pair = selected_pair.clone();
                     async move {
-                        let (prefill, decode) = match selected_pair {
-                            Some(pair) => pair,
-                            None => match self
-                                .select_pd_pair(
-                                    context.request_text.as_deref(),
-                                    context.model_id,
-                                    context.headers.as_ref(),
-                                )
-                                .await
-                            {
-                                Ok(pair) => pair,
-                                Err(e) => return Self::handle_server_selection_error(e),
-                            },
-                        };
+                        let (prefill, decode) = selected_pair;
 
                         debug!(
                             "PD retry attempt {} using prefill={} decode={}",
@@ -543,29 +517,14 @@ impl PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
-        route: &'static str,
-        batch_size: Option<usize>,
-        is_stream: bool,
-        return_logprob: bool,
-        request_text: Option<String>,
-        model_id: Option<&str>,
+        context: PDRequestContext<'_>,
         selection: &SchedulerOutput,
     ) -> Response {
         let Some(selected_pair) = Self::selected_pd_pair(selection) else {
             return error::bad_request("invalid_worker_selection", "Expected a PD worker pair");
         };
 
-        let context = PDRequestContext {
-            route,
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, original_request, context, Some(selected_pair))
+        self.execute_dual_dispatch(headers, original_request, context, selected_pair)
             .await
     }
 
@@ -991,202 +950,43 @@ impl PDRouter {
         }
     }
 
-    fn policies_need_request_text(&self) -> bool {
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-        prefill_policy.needs_request_text() || decode_policy.needs_request_text()
-    }
-
-    /// Builds the text used for cache-aware routing of a chat request.
-    ///
-    /// This must reflect the *full* conversation (system prompt, prior turns,
-    /// the current message and tool context) so that KV-cache prefix matching
-    /// routes to the worker that actually shares the most prefix. Using only the
-    /// first message ignores the conversation history that drives KV reuse in
-    /// multi-turn chats. See https://github.com/sgl-project/sglang/issues/26263.
-    ///
-    /// Returns `None` when the conversation has no text to route on, preserving
-    /// the prior behavior of not feeding an empty key into prefix matching.
-    fn build_chat_request_text(body: &ChatCompletionRequest) -> Option<String> {
-        // `extract_text_for_routing` walks every message (system, prior turns,
-        // current message, tool content) and is the same routing text the regular
-        // (non-PD) router uses, keeping cache-aware routing consistent across both.
-        let text = body.extract_text_for_routing();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    }
-
-    async fn select_pd_pair(
-        &self,
-        request_text: Option<&str>,
-        model_id: Option<&str>,
-        headers: Option<&HeaderMap>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
-        let mut prefill_workers: Vec<Arc<dyn Worker>> = if let Some(model) = model_id {
-            self.worker_registry
-                .get_by_model(model)
-                .iter()
-                .filter(|w| {
-                    matches!(w.worker_type(), WorkerType::Prefill { .. })
-                        && matches!(w.connection_mode(), ConnectionMode::Http)
-                        && w.is_available()
-                })
-                .cloned()
-                .collect()
-        } else {
-            self.worker_registry
-                .get_prefill_workers()
-                .into_iter()
-                .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http) && w.is_available())
-                .collect()
-        };
-
-        let mut decode_workers: Vec<Arc<dyn Worker>> = if let Some(model) = model_id {
-            self.worker_registry
-                .get_by_model(model)
-                .iter()
-                .filter(|w| {
-                    matches!(w.worker_type(), WorkerType::Decode)
-                        && matches!(w.connection_mode(), ConnectionMode::Http)
-                        && w.is_available()
-                })
-                .cloned()
-                .collect()
-        } else {
-            self.worker_registry
-                .get_decode_workers()
-                .into_iter()
-                .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http) && w.is_available())
-                .collect()
-        };
-
-        // A PD pair must belong to the same deployment group. Without this
-        // filter, independently deployed Prefill and Decode workers serving
-        // the same model can be paired accidentally.
-        let Some(group_id) = Self::find_common_pd_group(&prefill_workers, &decode_workers) else {
-            return Err("No PD worker group has both available prefill and decode workers".into());
-        };
-        prefill_workers.retain(|worker| pd_group_id(worker.as_ref()) == group_id);
-        decode_workers.retain(|worker| pd_group_id(worker.as_ref()) == group_id);
-
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-
-        // Get cached hash ring for consistent hashing
-        let hash_ring = self
-            .worker_registry
-            .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID));
-
-        let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
-            request_text,
-            headers,
-            hash_ring.clone(),
-            "prefill",
-        )
-        .await?;
-
-        let decode = Self::pick_worker_by_policy_arc(
-            &decode_workers,
-            &*decode_policy,
-            request_text,
-            headers,
-            hash_ring,
-            "decode",
-        )
-        .await?;
-
-        // Record worker selection metrics (Layer 3)
-        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_PREFILL,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            prefill_policy.name(),
+    fn select_health_pd_pair(&self) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
+        let workers = self.worker_registry.get_workers_filtered(
+            None,
+            None,
+            Some(ConnectionMode::Http),
+            None,
+            false,
         );
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_DECODE,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            decode_policy.name(),
-        );
-
-        Ok((prefill, decode))
-    }
-
-    /// Find a deterministic PD group with at least one available worker on
-    /// each side. Selecting the group before selecting workers guarantees
-    /// that policy selection cannot cross deployment boundaries.
-    fn find_common_pd_group(
-        prefill_workers: &[Arc<dyn Worker>],
-        decode_workers: &[Arc<dyn Worker>],
-    ) -> Option<String> {
-        let mut groups: Vec<String> = prefill_workers
+        let prefill_workers: Vec<_> = workers
             .iter()
-            .map(|worker| pd_group_id(worker.as_ref()).to_string())
+            .filter(|worker| {
+                matches!(worker.worker_type(), WorkerType::Prefill { .. }) && worker.is_available()
+            })
+            .collect();
+        let decode_workers: Vec<_> = workers
+            .iter()
+            .filter(|worker| {
+                matches!(worker.worker_type(), WorkerType::Decode) && worker.is_available()
+            })
+            .collect();
+        let groups: BTreeSet<_> = prefill_workers
+            .iter()
+            .map(|worker| pd_group_id(worker.as_ref()))
             .filter(|group| {
                 decode_workers
                     .iter()
-                    .any(|worker| pd_group_id(worker.as_ref()) == group)
+                    .any(|worker| pd_group_id(worker.as_ref()) == *group)
             })
             .collect();
-        groups.sort();
-        groups.dedup();
-        groups.into_iter().next()
-    }
-
-    async fn pick_worker_by_policy_arc(
-        workers: &[Arc<dyn Worker>],
-        policy: &dyn LoadBalancingPolicy,
-        request_text: Option<&str>,
-        headers: Option<&HeaderMap>,
-        hash_ring: Option<Arc<HashRing>>,
-        worker_type: &str,
-    ) -> Result<Arc<dyn Worker>, String> {
-        if workers.is_empty() {
-            return Err(format!(
-                "No {} workers available. Please check if {} servers are configured and healthy.",
-                worker_type, worker_type
-            ));
-        }
-
-        let available_workers: Vec<Arc<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-
-        if available_workers.is_empty() {
-            return Err(format!(
-                "No available {} workers (all circuits open or unhealthy)",
-                worker_type
-            ));
-        }
-
-        let selected_idx = policy
-            .select_worker(
-                &available_workers,
-                &SelectWorkerInfo {
-                    request_text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                    headers,
-                    hash_ring,
-                },
-            )
-            .await
-            .ok_or_else(|| {
-                format!(
-                    "Policy {} failed to select a {} worker",
-                    policy.name(),
-                    worker_type
-                )
-            })?;
-
-        Ok(available_workers[selected_idx].clone())
+        let group = groups.into_iter().next()?.to_string();
+        let prefill = prefill_workers
+            .into_iter()
+            .find(|worker| pd_group_id(worker.as_ref()) == group.as_str())?;
+        let decode = decode_workers
+            .into_iter()
+            .find(|worker| pd_group_id(worker.as_ref()) == group.as_str())?;
+        Some((prefill.clone(), decode.clone()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1549,13 +1349,15 @@ impl RouterTrait for PDRouter {
     async fn health_generate(&self, _req: Request<Body>) -> Response {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
-        // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
-            Ok(pair) => pair,
-            Err(e) => {
+        // Health is a management probe and has no model_id, so it cannot go
+        // through the request Scheduler. Pick the first available pair in the
+        // same deployment group without invoking a routing policy.
+        let (prefill, decode) = match self.select_health_pd_pair() {
+            Some(pair) => pair,
+            None => {
                 return error::service_unavailable(
                     "no_healthy_worker_pair",
-                    format!("No healthy worker pair available: {}", e),
+                    "No healthy HTTP PD worker pair available",
                 );
             }
         };
@@ -1654,29 +1456,11 @@ impl RouterTrait for PDRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.return_logprob.unwrap_or(false);
-
-        let request_text = if self.policies_need_request_text() {
-            body.text.as_deref().map(|s| s.to_string())
-        } else {
-            None
-        };
-
-        let batch_size = Self::get_generate_batch_size(body);
-
-        let context = PDRequestContext {
-            route: "/generate",
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, context, None)
-            .await
+        let _ = (headers, body, model_id);
+        error::service_unavailable(
+            "scheduler_selection_required",
+            "Request must be scheduled before entering the HTTP PD router",
+        )
     }
 
     async fn route_chat(
@@ -1685,30 +1469,11 @@ impl RouterTrait for PDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs;
-
-        let request_text = if self.policies_need_request_text() {
-            Self::build_chat_request_text(body)
-        } else {
-            None
-        };
-
-        // Calculate batch size
-        let batch_size = Self::get_chat_batch_size(body);
-
-        let context = PDRequestContext {
-            route: "/v1/chat/completions",
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, context, None)
-            .await
+        let _ = (headers, body, model_id);
+        error::service_unavailable(
+            "scheduler_selection_required",
+            "Request must be scheduled before entering the HTTP PD router",
+        )
     }
 
     async fn route_completion(
@@ -1717,33 +1482,11 @@ impl RouterTrait for PDRouter {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs.is_some();
-
-        let request_text = if self.policies_need_request_text() {
-            match &body.prompt {
-                StringOrArray::String(s) => Some(s.clone()),
-                StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
-            }
-        } else {
-            None
-        };
-
-        // Calculate batch size
-        let batch_size = Self::get_completion_batch_size(body);
-
-        let context = PDRequestContext {
-            route: "/v1/completions",
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, context, None)
-            .await
+        let _ = (headers, body, model_id);
+        error::service_unavailable(
+            "scheduler_selection_required",
+            "Request must be scheduled before entering the HTTP PD router",
+        )
     }
 
     async fn route_rerank(
@@ -1752,25 +1495,11 @@ impl RouterTrait for PDRouter {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Extract text for cache-aware routing
-        let req_text = if self.policies_need_request_text() {
-            Some(body.query.clone())
-        } else {
-            None
-        };
-
-        let context = PDRequestContext {
-            route: "/v1/rerank",
-            batch_size: None,
-            is_stream: false,
-            return_logprob: false,
-            request_text: req_text,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, context, None)
-            .await
+        let _ = (headers, body, model_id);
+        error::service_unavailable(
+            "scheduler_selection_required",
+            "Request must be scheduled before entering the HTTP PD router",
+        )
     }
 
     async fn route_generate_with_selection(
@@ -1780,20 +1509,16 @@ impl RouterTrait for PDRouter {
         model_id: Option<&str>,
         selection: &SchedulerOutput,
     ) -> Response {
-        let request_text = if self.policies_need_request_text() {
-            body.text.clone()
-        } else {
-            None
-        };
         self.execute_dual_dispatch_selected(
             headers,
             body,
-            "/generate",
-            Self::get_generate_batch_size(body),
-            body.stream,
-            body.return_logprob.unwrap_or(false),
-            request_text,
-            model_id,
+            PDRequestContext {
+                route: "/generate",
+                batch_size: Self::get_generate_batch_size(body),
+                is_stream: body.stream,
+                return_logprob: body.return_logprob.unwrap_or(false),
+                model_id,
+            },
             selection,
         )
         .await
@@ -1806,20 +1531,16 @@ impl RouterTrait for PDRouter {
         model_id: Option<&str>,
         selection: &SchedulerOutput,
     ) -> Response {
-        let request_text = if self.policies_need_request_text() {
-            Self::build_chat_request_text(body)
-        } else {
-            None
-        };
         self.execute_dual_dispatch_selected(
             headers,
             body,
-            "/v1/chat/completions",
-            Self::get_chat_batch_size(body),
-            body.stream,
-            body.logprobs,
-            request_text,
-            model_id,
+            PDRequestContext {
+                route: "/v1/chat/completions",
+                batch_size: Self::get_chat_batch_size(body),
+                is_stream: body.stream,
+                return_logprob: body.logprobs,
+                model_id,
+            },
             selection,
         )
         .await
@@ -1832,23 +1553,16 @@ impl RouterTrait for PDRouter {
         model_id: Option<&str>,
         selection: &SchedulerOutput,
     ) -> Response {
-        let request_text = if self.policies_need_request_text() {
-            match &body.prompt {
-                StringOrArray::String(text) => Some(text.clone()),
-                StringOrArray::Array(texts) => texts.first().map(|text| text.to_string()),
-            }
-        } else {
-            None
-        };
         self.execute_dual_dispatch_selected(
             headers,
             body,
-            "/v1/completions",
-            Self::get_completion_batch_size(body),
-            body.stream,
-            body.logprobs.is_some(),
-            request_text,
-            model_id,
+            PDRequestContext {
+                route: "/v1/completions",
+                batch_size: Self::get_completion_batch_size(body),
+                is_stream: body.stream,
+                return_logprob: body.logprobs.is_some(),
+                model_id,
+            },
             selection,
         )
         .await
@@ -1861,18 +1575,16 @@ impl RouterTrait for PDRouter {
         model_id: Option<&str>,
         selection: &SchedulerOutput,
     ) -> Response {
-        let request_text = self
-            .policies_need_request_text()
-            .then(|| body.query.clone());
         self.execute_dual_dispatch_selected(
             headers,
             body,
-            "/v1/rerank",
-            None,
-            false,
-            false,
-            request_text,
-            model_id,
+            PDRequestContext {
+                route: "/v1/rerank",
+                batch_size: None,
+                is_stream: false,
+                return_logprob: false,
+                model_id,
+            },
             selection,
         )
         .await
@@ -1918,12 +1630,9 @@ mod tests {
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry =
-            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
         PDRouter {
             worker_registry,
-            policy_registry,
             client: Client::new(),
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
@@ -1936,137 +1645,6 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
-    }
-
-    #[test]
-    fn test_chat_request_text_uses_full_conversation() {
-        // Regression test for https://github.com/sgl-project/sglang/issues/26263
-        // Cache-aware routing must build its text from the full conversation, not
-        // just the first message, so that KV-cache prefix matching reflects what
-        // the worker will actually process in a multi-turn chat.
-        let body: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "test-model",
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "First question about apples."},
-                {"role": "assistant", "content": "Apples are red."},
-                {"role": "user", "content": "Follow up question about oranges."}
-            ]
-        }))
-        .expect("valid chat request");
-
-        let text = PDRouter::build_chat_request_text(&body)
-            .expect("multi-message chat should produce routing text");
-
-        assert!(
-            text.contains("apples"),
-            "routing text must include earlier turns, got: {text:?}"
-        );
-        assert!(
-            text.contains("oranges"),
-            "routing text must include later turns (not only the first message), got: {text:?}"
-        );
-    }
-
-    #[test]
-    fn test_chat_request_text_none_when_no_text() {
-        // When the conversation carries no text content, no routing text should
-        // be produced (None) rather than an empty string, preserving the prior
-        // PD behavior. See https://github.com/sgl-project/sglang/issues/26263.
-        let body: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "test-model",
-            "messages": [
-                {"role": "user", "content": ""}
-            ]
-        }))
-        .expect("valid chat request");
-
-        assert!(
-            PDRouter::build_chat_request_text(&body).is_none(),
-            "empty conversation text should produce None, not Some(\"\")"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_select_healthy_prefill_worker() {
-        let router = create_test_pd_router();
-
-        let healthy_worker = create_test_worker(
-            "http://healthy".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            true,
-        );
-        let unhealthy_worker = create_test_worker(
-            "http://unhealthy".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            false,
-        );
-        let decode_worker =
-            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
-
-        router.worker_registry.register(Arc::from(unhealthy_worker));
-        router.worker_registry.register(Arc::from(healthy_worker));
-        router.worker_registry.register(Arc::from(decode_worker));
-
-        let result = router.select_pd_pair(None, None, None).await;
-
-        assert!(result.is_ok());
-        let (prefill, _decode) = result.unwrap();
-
-        assert_eq!(prefill.url(), "http://healthy");
-        assert!(prefill.is_healthy());
-    }
-
-    #[tokio::test]
-    async fn test_select_pd_pair_does_not_cross_deployment_groups() {
-        let router = create_test_pd_router();
-
-        // Group B has only a Prefill worker and must not be paired with the
-        // Decode worker from group A.
-        let prefill_group_b = BasicWorkerBuilder::new("http://prefill-b")
-            .worker_type(WorkerType::Prefill {
-                bootstrap_port: None,
-            })
-            .label("pd_group_id", "group-b")
-            .build();
-        let prefill_group_a = BasicWorkerBuilder::new("http://prefill-a")
-            .worker_type(WorkerType::Prefill {
-                bootstrap_port: None,
-            })
-            .label("pd_group_id", "group-a")
-            .build();
-        let decode_group_a = BasicWorkerBuilder::new("http://decode-a")
-            .worker_type(WorkerType::Decode)
-            .label("pd_group_id", "group-a")
-            .build();
-
-        router.worker_registry.register(Arc::new(prefill_group_b));
-        router.worker_registry.register(Arc::new(prefill_group_a));
-        router.worker_registry.register(Arc::new(decode_group_a));
-
-        let (prefill, decode) = router
-            .select_pd_pair(None, None, None)
-            .await
-            .expect("group-a should provide a complete PD pair");
-
-        assert_eq!(pd_group_id(prefill.as_ref()), "group-a");
-        assert_eq!(pd_group_id(decode.as_ref()), "group-a");
-    }
-
-    #[tokio::test]
-    async fn test_empty_worker_lists() {
-        let router = create_test_pd_router();
-
-        let result = router.select_pd_pair(None, None, None).await;
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("No PD worker group has both available prefill and decode workers"));
     }
 
     #[test]

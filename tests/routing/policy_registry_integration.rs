@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use data_connector::MemoryResponseStorage;
 use smg::{
     config::PolicyConfig, core::WorkerRegistry, policies::PolicyRegistry,
     protocols::worker_spec::WorkerConfigRequest, routers::router_manager::RouterManager,
@@ -17,7 +18,11 @@ async fn test_policy_registry_with_router_manager() {
     let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
     // Create RouterManager with shared registries
-    let _router_manager = RouterManager::new(worker_registry.clone());
+    let _router_manager = RouterManager::new(
+        worker_registry.clone(),
+        policy_registry.clone(),
+        Arc::new(MemoryResponseStorage::new()),
+    );
 
     // Add first worker for llama-3 with cache_aware policy hint
     let mut labels1 = HashMap::new();

@@ -19,6 +19,7 @@ use crate::{
         job_queue::Job,
         steps::{WasmModuleConfigRequest, WasmModuleRemovalRequest},
         worker_manager::WorkerManager,
+        UNKNOWN_MODEL_ID,
     },
     middleware::{self, AuthConfig},
     protocols::{
@@ -119,9 +120,7 @@ async fn v1_rerank(
     }
     .into();
 
-    if let Some(model) = model {
-        rerank_body.model = model;
-    }
+    rerank_body.model = model.unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
 
     state
         .router
@@ -231,6 +230,7 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
         .filter(|worker| worker.is_available())
         .collect();
 
+    // TODO:
     // Use the same route-level readiness semantics as RouterManager. The
     // fallback keeps lightweight tests and embedded users working when they
     // provide a RouterTrait directly instead of a RouterManager.

@@ -21,7 +21,6 @@ use serial_test::serial;
 use smg::{
     core::Job,
     observability::{logging, otel_trace},
-    routers::RouterFactory,
 };
 use tokio::sync::oneshot;
 use tonic::metadata::MetadataMap;
@@ -201,15 +200,12 @@ async fn test_router_with_tracing() {
     println!("Workers initialized");
 
     // 9. create router
-    let router = RouterFactory::create_regular_router(&app_context)
-        .await
-        .expect("Failed to create router");
+    let router = common::create_router_manager(&app_context);
 
     println!("Router created");
 
     // 10. create app (middleware::create_logging_layer() will use the already initialized OTEL layer)
-    let app =
-        common::test_app::create_test_app_with_context(Arc::from(router), app_context.clone());
+    let app = common::test_app::create_test_app_with_context(router, app_context.clone());
 
     println!("App created with logging middleware");
 

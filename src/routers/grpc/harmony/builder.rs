@@ -33,10 +33,8 @@ static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
 /// Uses HarmonyGptOss encoding which supports the gpt-oss model family.
 pub(super) fn get_harmony_encoding() -> &'static HarmonyEncoding {
     HARMONY_ENCODING.get_or_init(|| {
-        tokio::task::block_in_place(|| {
-            openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
-                .expect("Failed to load Harmony encoding")
-        })
+        openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
+            .expect("Failed to load Harmony encoding")
     })
 }
 
@@ -133,7 +131,7 @@ impl HarmonyBuilder {
     ///
     /// # Returns
     ///
-    /// HarmonyBuildOutput containing input_ids, stop_token_ids, selection_text, and messages
+    /// HarmonyBuildOutput containing input_ids, stop_token_ids, and messages
     pub fn build_from_chat(
         &self,
         request: &ChatCompletionRequest,
@@ -155,8 +153,6 @@ impl HarmonyBuilder {
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
             .map_err(|e| format!("Failed to encode Harmony conversation: {}", e))?;
 
-        let selection_text = self.extract_selection_text(&all_messages);
-
         // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
         let stop_token_ids: Vec<u32> = self
             .encoding
@@ -168,7 +164,6 @@ impl HarmonyBuilder {
         Ok(HarmonyBuildOutput {
             input_ids: token_ids,
             stop_token_ids,
-            selection_text,
             harmony_messages: all_messages
                 .into_iter()
                 .map(super::types::HarmonyMessage::from_openai_harmony)
@@ -184,7 +179,7 @@ impl HarmonyBuilder {
     ///
     /// # Returns
     ///
-    /// HarmonyBuildOutput containing input_ids, stop_token_ids, selection_text, and messages
+    /// HarmonyBuildOutput containing input_ids, stop_token_ids, and messages
     pub fn build_from_responses(
         &self,
         request: &ResponsesRequest,
@@ -196,8 +191,6 @@ impl HarmonyBuilder {
             .encoding
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
             .map_err(|e| format!("Failed to encode Harmony conversation: {}", e))?;
-
-        let selection_text = self.extract_selection_text(&all_messages);
 
         // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
         let stop_token_ids: Vec<u32> = self
@@ -224,7 +217,6 @@ impl HarmonyBuilder {
         Ok(HarmonyBuildOutput {
             input_ids: token_ids,
             stop_token_ids,
-            selection_text,
             harmony_messages: all_messages
                 .into_iter()
                 .map(super::types::HarmonyMessage::from_openai_harmony)
@@ -868,36 +860,6 @@ impl HarmonyBuilder {
         }
 
         Ok(harmony_messages)
-    }
-
-    /// Extract selection text for worker routing
-    ///
-    /// Uses the last user message for load balancing
-    fn extract_selection_text(&self, messages: &[HarmonyMessage]) -> String {
-        // Find the last user message
-        if let Some(last_user_msg) = messages.iter().rev().find(|m| m.author.role == Role::User) {
-            // Extract full text from content
-            return last_user_msg
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    Content::Text(tc) => Some(tc.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
-        }
-
-        // Fallback: concatenate all text
-        messages
-            .iter()
-            .flat_map(|m| &m.content)
-            .filter_map(|c| match c {
-                Content::Text(tc) => Some(tc.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
     }
 }
 

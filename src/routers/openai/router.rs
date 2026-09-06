@@ -123,19 +123,6 @@ mod error_responses {
     pub fn service_unavailable(message: impl Into<String>) -> Response {
         (StatusCode::SERVICE_UNAVAILABLE, message.into()).into_response()
     }
-
-    pub fn model_not_found(model: &str) -> Response {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": {
-                    "message": format!("No worker available for model '{}'", model),
-                    "type": "model_not_found",
-                }
-            })),
-        )
-            .into_response()
-    }
 }
 
 impl OpenAIRouter {
@@ -287,55 +274,13 @@ impl OpenAIRouter {
         join_all(futures).await;
     }
 
-    /// Find workers that can handle the given model and select the least loaded one
-    fn find_best_worker_for_model(&self, model_id: &str) -> Option<Arc<dyn Worker>> {
-        self.worker_registry
-            .get_workers_filtered(None, None, None, Some(RuntimeType::External), true)
-            .into_iter()
-            .filter(|w| w.supports_model(model_id) && w.circuit_breaker().can_execute())
-            .min_by_key(|w| w.load())
-    }
-
-    /// Check if any worker supports the model (regardless of circuit breaker state)
-    fn any_worker_supports_model(&self, model_id: &str) -> bool {
-        self.worker_registry
-            .get_workers_filtered(None, None, None, Some(RuntimeType::External), true)
-            .into_iter()
-            .any(|w| w.supports_model(model_id))
-    }
-
-    async fn select_worker_for_model(
-        &self,
-        model_id: &str,
-        auth_header: Option<&HeaderValue>,
-    ) -> Result<Arc<dyn Worker>, Response> {
+    async fn select_worker_for_model(&self) -> Result<Arc<dyn Worker>, Response> {
         if let Ok(Some(worker)) = SCHEDULED_EXTERNAL_WORKER.try_with(|worker| worker.clone()) {
             return Ok(worker);
         }
-
-        // Try to find a worker immediately
-        if let Some(worker) = self.find_best_worker_for_model(model_id) {
-            return Ok(worker);
-        }
-
-        // Refresh external models and try again
-        tracing::debug!(
-            "No worker found for model '{}', refreshing external worker models",
-            model_id
-        );
-        self.refresh_external_models(auth_header).await;
-
-        self.find_best_worker_for_model(model_id).ok_or_else(|| {
-            // Check if the model exists but all workers are circuit-broken
-            if self.any_worker_supports_model(model_id) {
-                error_responses::service_unavailable(format!(
-                    "All workers for model '{}' are temporarily unavailable",
-                    model_id
-                ))
-            } else {
-                error_responses::model_not_found(model_id)
-            }
-        })
+        Err(error_responses::service_unavailable(
+            "Request must be scheduled before entering the OpenAI router",
+        ))
     }
 
     /// Deserialize ResponseInputOutputItems from a JSON array value
@@ -514,12 +459,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             bool_to_static_str(streaming),
         );
 
-        let auth_header = extract_auth_header(headers, &None);
-
-        let worker = match self
-            .select_worker_for_model(body.model.as_str(), auth_header.as_ref())
-            .await
-        {
+        let worker = match self.select_worker_for_model().await {
             Ok(w) => w,
             Err(response) => {
                 Metrics::record_router_error(
@@ -757,12 +697,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             bool_to_static_str(streaming),
         );
 
-        let auth_header = extract_auth_header(headers, &None);
-
-        let worker = match self
-            .select_worker_for_model(model, auth_header.as_ref())
-            .await
-        {
+        let worker = match self.select_worker_for_model().await {
             Ok(w) => w,
             Err(response) => {
                 Metrics::record_router_error(

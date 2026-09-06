@@ -16,16 +16,19 @@ use crate::{
     config::RetryConfig,
     core::{
         is_retryable_status,
-        scheduler::{SchedulerOutput, WorkerSelection as ScheduledWorkerSelection},
-        AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType, UNKNOWN_MODEL_ID,
+        model_type::Endpoint,
+        retry::BackoffCalculator,
+        scheduler::{
+            Scheduler, SchedulerInput, SchedulerOutput, WorkerSelection as ScheduledWorkerSelection,
+        },
+        AttachedBody, ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -48,17 +51,16 @@ use crate::{
 /// Regular router that uses injected load balancing policies
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
-    policy_registry: Arc<PolicyRegistry>,
     client: Client,
     dp_aware: bool,
     retry_config: RetryConfig,
+    scheduler: Arc<Scheduler>,
 }
 
 impl std::fmt::Debug for Router {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Router")
             .field("worker_registry", &self.worker_registry)
-            .field("policy_registry", &self.policy_registry)
             .field("client", &self.client)
             .field("dp_aware", &self.dp_aware)
             .field("retry_config", &self.retry_config)
@@ -74,14 +76,17 @@ impl Router {
         }
     }
 
-    /// Create a new router with injected policy and client
+    /// Create a regular HTTP execution router.
     pub fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
-            policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
             dp_aware: ctx.config.routing.dp_aware,
             retry_config: ctx.config.workers.effective_retry_config(),
+            scheduler: Arc::new(Scheduler::new(
+                ctx.worker_registry.clone(),
+                ctx.policy_registry.clone(),
+            )),
         })
     }
 
@@ -143,65 +148,6 @@ impl Router {
         }
     }
 
-    /// Select worker for a specific model considering circuit breaker state
-    async fn select_worker_for_model(
-        &self,
-        model_id: Option<&str>,
-        text: Option<&str>,
-        headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
-        // Get workers for the specified model O(1), filtered by connection mode
-        let workers = self.worker_registry.get_workers_filtered(
-            model_id,
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Http),
-            None,  // any runtime type
-            false, // get all workers, we'll filter by is_available() next
-        );
-
-        let available: Vec<Arc<dyn Worker>> = workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-        if available.is_empty() {
-            return None;
-        }
-
-        // Get the appropriate policy for this model
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self
-            .worker_registry
-            .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID));
-
-        let idx = policy
-            .select_worker(
-                &available,
-                &SelectWorkerInfo {
-                    request_text: text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                    headers,
-                    hash_ring,
-                },
-            )
-            .await?;
-
-        // Record worker selection metric (Layer 3)
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
-            model_id.unwrap_or(UNKNOWN_MODEL_ID),
-            policy.name(),
-        );
-
-        Some(available[idx].clone())
-    }
-
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -209,8 +155,11 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request_internal(headers, typed_req, route, model_id, None)
-            .await
+        let _ = (headers, typed_req, route, model_id);
+        error::service_unavailable(
+            "scheduler_selection_required",
+            "Request must be scheduled before entering the HTTP router",
+        )
     }
 
     async fn route_typed_request_with_worker<T: GenerationRequest + serde::Serialize + Clone>(
@@ -221,7 +170,7 @@ impl Router {
         model_id: Option<&str>,
         worker: Arc<dyn Worker>,
     ) -> Response {
-        self.route_typed_request_internal(headers, typed_req, route, model_id, Some(worker))
+        self.route_typed_request_internal(headers, typed_req, route, model_id, worker)
             .await
     }
 
@@ -231,13 +180,15 @@ impl Router {
         typed_req: &T,
         route: &'static str,
         model_id: Option<&str>,
-        selected_worker: Option<Arc<dyn Worker>>,
+        selected_worker: Arc<dyn Worker>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
+        let scheduler_endpoint =
+            Endpoint::from_path(route).expect("router route must be a known endpoint");
 
         // Record request start (Layer 2)
         Metrics::record_router_request(
@@ -249,45 +200,62 @@ impl Router {
             bool_to_static_str(is_stream),
         );
 
-        let response = RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
-            // operation per attempt
-            |_: u32| async {
-                let res = self
-                    .route_typed_request_once(
-                        headers,
-                        typed_req,
-                        route,
-                        model_id,
-                        is_stream,
-                        &text,
-                        selected_worker.clone(),
+        let mut current_worker = selected_worker;
+        let mut attempted_worker_urls: Vec<String> = Vec::new();
+
+        let max_attempts = self.retry_config.max_retries.max(1);
+        let mut attempt = 0;
+        let response = loop {
+            if attempt > 0 {
+                let excluded_worker_urls: Vec<&str> =
+                    attempted_worker_urls.iter().map(String::as_str).collect();
+                if let Ok(selection) = self
+                    .scheduler
+                    .schedule_excluding(
+                        &SchedulerInput {
+                            model_id,
+                            endpoint: scheduler_endpoint,
+                            request_text: (!text.is_empty()).then_some(text.as_str()),
+                            token_ids: None,
+                            headers,
+                        },
+                        &excluded_worker_urls,
                     )
-                    .await;
+                    .await
+                {
+                    if let Some(worker) = Self::selected_regular_worker(&selection) {
+                        current_worker = worker;
+                    }
+                }
+            }
 
-                // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                Metrics::record_router_upstream_response(
-                    metrics_labels::ROUTER_HTTP,
-                    res.status().as_u16(),
-                    extract_error_code_from_response(&res),
-                );
+            let worker = current_worker.clone();
+            attempted_worker_urls.push(worker.url().to_string());
+            let response = self
+                .route_typed_request_once(headers, typed_req, route, model_id, is_stream, worker)
+                .await;
 
-                res
-            },
-            // should_retry predicate
-            |res, _attempt| is_retryable_status(res.status()),
-            // on_backoff hook
-            |delay, attempt| {
-                // Layer 3 worker metrics
-                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
-                Metrics::record_worker_retry_backoff(attempt, delay);
-            },
-            // on_exhausted hook
-            || {
+            Metrics::record_router_upstream_response(
+                metrics_labels::ROUTER_HTTP,
+                response.status().as_u16(),
+                extract_error_code_from_response(&response),
+            );
+
+            if !is_retryable_status(response.status()) {
+                break response;
+            }
+            if attempt + 1 >= max_attempts {
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
-            },
-        )
-        .await;
+                break response;
+            }
+
+            let delay = BackoffCalculator::calculate_delay(&self.retry_config, attempt);
+            let next_attempt = attempt + 1;
+            Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+            Metrics::record_worker_retry_backoff(next_attempt, delay);
+            tokio::time::sleep(delay).await;
+            attempt = next_attempt;
+        };
 
         if response.status().is_success() {
             let duration = start.elapsed();
@@ -318,36 +286,13 @@ impl Router {
         headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &'static str,
-        model_id: Option<&str>,
+        _model_id: Option<&str>,
         is_stream: bool,
-        text: &str,
-        selected_worker: Option<Arc<dyn Worker>>,
+        worker: Arc<dyn Worker>,
     ) -> Response {
-        let worker = match selected_worker {
-            Some(worker) => Some(worker),
-            None => {
-                self.select_worker_for_model(model_id, Some(text), headers)
-                    .await
-            }
-        };
-        let worker = match worker {
-            Some(w) => w,
-            None => {
-                return error::service_unavailable(
-                    "no_available_workers",
-                    "No available workers (all circuits open or unhealthy)",
-                );
-            }
-        };
-
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+        // Load is execution state, not a routing decision. Keep it attached for
+        // every scheduled worker so all Scheduler policies observe real load.
+        let load_guard = Some(WorkerLoadGuard::new(worker.clone(), headers));
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -1047,9 +992,6 @@ mod tests {
     fn create_test_regular_router() -> Router {
         // Create registries
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry =
-            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
-
         // Register test workers
         let worker1 = BasicWorkerBuilder::new("http://worker1:8080")
             .worker_type(WorkerType::Regular)
@@ -1061,11 +1003,16 @@ mod tests {
         worker_registry.register(Arc::new(worker2));
 
         Router {
-            worker_registry,
-            policy_registry,
+            worker_registry: worker_registry.clone(),
             dp_aware: false,
             client: Client::new(),
             retry_config: RetryConfig::default(),
+            scheduler: Arc::new(Scheduler::new(
+                worker_registry.clone(),
+                Arc::new(crate::policies::PolicyRegistry::new(
+                    crate::config::PolicyConfig::RoundRobin,
+                )),
+            )),
         }
     }
 
@@ -1074,28 +1021,6 @@ mod tests {
         let workers = router.worker_registry.get_all();
         workers[0].set_healthy(false);
         router
-    }
-
-    #[test]
-    fn test_router_get_worker_urls_regular() {
-        let router = create_test_regular_router();
-        let workers = router.worker_registry.get_all();
-        let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
-
-        assert_eq!(urls.len(), 2);
-        assert!(urls.contains(&"http://worker1:8080".to_string()));
-        assert!(urls.contains(&"http://worker2:8080".to_string()));
-    }
-
-    #[test]
-    fn test_select_first_worker_regular() {
-        let router = create_test_regular_router();
-        let result = router.select_first_worker();
-
-        assert!(result.is_ok());
-        let url = result.unwrap();
-        // DashMap doesn't guarantee order, so just check we get one of the workers
-        assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
     }
 
     #[test]

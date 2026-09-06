@@ -11,6 +11,7 @@ use crate::{
     core::{
         circuit_breaker::CircuitBreakerConfig,
         model_card::ModelCard,
+        model_type::ModelType,
         steps::workflow_data::LocalWorkerWorkflowData,
         worker::{HealthConfig, RuntimeType, WorkerType},
         BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
@@ -162,7 +163,7 @@ fn build_model_card(
     config: &WorkerConfigRequest,
     labels: &HashMap<String, String>,
 ) -> ModelCard {
-    let mut card = ModelCard::new(model_id);
+    let mut card = ModelCard::new(model_id).with_model_type(ModelType::SGLANG_LLM);
 
     if let Some(ref tokenizer_path) = config.tokenizer_path {
         card = card.with_tokenizer_path(tokenizer_path.clone());

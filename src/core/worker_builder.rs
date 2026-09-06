@@ -16,6 +16,7 @@ pub struct BasicWorkerBuilder {
     url: String,
     api_key: Option<String>,
     worker_type: WorkerType,
+    default_model_type: ModelType,
     connection_mode: ConnectionMode,
     runtime_type: RuntimeType,
     labels: HashMap<String, String>,
@@ -39,6 +40,7 @@ impl BasicWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            default_model_type: ModelType::SGLANG_LLM,
         }
     }
 
@@ -55,7 +57,13 @@ impl BasicWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            default_model_type: ModelType::SGLANG_LLM,
         }
+    }
+
+    pub fn default_model_type(mut self, model_type: ModelType) -> Self {
+        self.default_model_type = model_type;
+        self
     }
 
     /// Set the API key
@@ -150,9 +158,9 @@ impl BasicWorkerBuilder {
             health_config: self.health_config,
             bootstrap_host,
             bootstrap_port,
-            models: self.models,                // Empty = accepts any model
-            default_provider: None,             // Native/passthrough
-            default_model_type: ModelType::LLM, // Standard LLM capabilities
+            models: self.models,    // Empty = accepts any model
+            default_provider: None, // Native/passthrough
+            default_model_type: self.default_model_type,
         };
 
         // Use OnceCell for lock-free gRPC client access after initialization
@@ -196,6 +204,7 @@ pub struct DPAwareWorkerBuilder {
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
     runtime_type: RuntimeType,
+    default_model_type: ModelType,
     labels: HashMap<String, String>,
     models: Vec<ModelCard>,
     health_config: HealthConfig,
@@ -219,6 +228,7 @@ impl DPAwareWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            default_model_type: ModelType::SGLANG_LLM,
         }
     }
 
@@ -242,6 +252,7 @@ impl DPAwareWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            default_model_type: ModelType::SGLANG_LLM,
         }
     }
 
@@ -266,6 +277,12 @@ impl DPAwareWorkerBuilder {
     /// Set the runtime type (SGLang or vLLM)
     pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
         self.runtime_type = runtime_type;
+        self
+    }
+
+    /// Set the default model capabilities for workers without an explicit model card.
+    pub fn default_model_type(mut self, model_type: ModelType) -> Self {
+        self.default_model_type = model_type;
         self
     }
 
@@ -319,6 +336,7 @@ impl DPAwareWorkerBuilder {
             .worker_type(self.worker_type)
             .connection_mode(self.connection_mode)
             .runtime_type(self.runtime_type)
+            .default_model_type(self.default_model_type)
             .labels(self.labels)
             .health_config(self.health_config)
             .circuit_breaker_config(self.circuit_breaker_config);

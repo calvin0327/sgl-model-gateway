@@ -10,15 +10,17 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::core::scheduler::SchedulerOutput;
-use crate::protocols::{
-    chat::ChatCompletionRequest,
-    classify::ClassifyRequest,
-    completion::CompletionRequest,
-    embedding::EmbeddingRequest,
-    generate::GenerateRequest,
-    rerank::RerankRequest,
-    responses::{ResponsesGetParams, ResponsesRequest},
+use crate::{
+    core::scheduler::SchedulerOutput,
+    protocols::{
+        chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
 };
 
 pub mod app;

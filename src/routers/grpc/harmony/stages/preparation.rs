@@ -131,8 +131,6 @@ impl HarmonyPreparationStage {
             } else {
                 None
             },
-            harmony_mode: true,
-            selection_text: Some(build_output.selection_text),
             harmony_messages: Some(build_output.harmony_messages),
             harmony_stop_ids: Some(build_output.stop_token_ids),
         });
@@ -207,8 +205,6 @@ impl HarmonyPreparationStage {
             processed_messages: None,
             tool_constraints: constraint,
             filtered_request: None,
-            harmony_mode: true,
-            selection_text: Some(build_output.selection_text),
             harmony_messages: Some(build_output.harmony_messages),
             harmony_stop_ids: Some(build_output.stop_token_ids),
         });

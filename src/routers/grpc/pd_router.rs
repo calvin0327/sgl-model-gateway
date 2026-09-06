@@ -31,7 +31,6 @@ impl GrpcPDRouter {
     pub fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         // Get registries from context
         let worker_registry = ctx.worker_registry.clone();
-        let policy_registry = ctx.policy_registry.clone();
 
         // Get tokenizer registry (no longer requires pre-loaded tokenizer)
         let tokenizer_registry = ctx.tokenizer_registry.clone();
@@ -56,8 +55,6 @@ impl GrpcPDRouter {
 
         // Create PD pipeline
         let pipeline = RequestPipeline::new_pd(
-            worker_registry.clone(),
-            policy_registry.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),

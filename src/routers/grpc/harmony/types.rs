@@ -66,8 +66,7 @@ impl HarmonyMessage {
 
 /// Output from Harmony encoding process
 ///
-/// Contains the encoded input_ids, stop tokens, selection text for worker routing,
-/// and the Harmony message history.
+/// Contains the encoded input_ids, stop tokens, and Harmony message history.
 #[derive(Debug, Clone)]
 pub(crate) struct HarmonyBuildOutput {
     /// Encoded token IDs to send to the model
@@ -75,9 +74,6 @@ pub(crate) struct HarmonyBuildOutput {
 
     /// Stop token IDs for this model (injected into sampling params)
     pub stop_token_ids: Vec<u32>,
-
-    /// Selection text for worker routing (concise snippet from last user message)
-    pub selection_text: String,
 
     /// Harmony messages for this conversation (used for history tracking)
     pub harmony_messages: Vec<HarmonyMessage>,

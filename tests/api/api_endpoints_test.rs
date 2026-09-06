@@ -1393,7 +1393,7 @@ mod pd_mode_tests {
         let app_context = crate::common::create_test_context(config).await;
 
         // Create router - this might fail due to health check issues
-        let router_result = RouterFactory::create_regular_router(&app_context).await;
+        let router_result = RouterFactory::create_regular_router(&app_context);
 
         // Clean up workers
         prefill_worker.stop().await;

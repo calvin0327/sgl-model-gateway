@@ -41,6 +41,9 @@ bitflags! {
         const LLM = Self::CHAT.bits() | Self::COMPLETIONS.bits()
                   | Self::RESPONSES.bits() | Self::TOOLS.bits();
 
+        /// SGLang LLM: standard LLM APIs plus the native /generate API
+        const SGLANG_LLM = Self::LLM.bits() | Self::GENERATE.bits();
+
         /// Vision-capable LLM: LLM + vision
         const VISION_LLM = Self::LLM.bits() | Self::VISION.bits();
 

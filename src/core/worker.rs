@@ -2062,7 +2062,7 @@ mod tests {
             bootstrap_port: None,
             models: Vec::new(), // Empty = accepts any model
             default_provider: None,
-            default_model_type: ModelType::LLM,
+            default_model_type: ModelType::SGLANG_LLM,
         };
 
         // Empty models list should accept any model
@@ -2092,7 +2092,7 @@ mod tests {
             bootstrap_port: None,
             models: vec![model1, model2],
             default_provider: None,
-            default_model_type: ModelType::LLM,
+            default_model_type: ModelType::SGLANG_LLM,
         };
 
         // Find by primary ID

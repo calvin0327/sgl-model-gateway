@@ -127,6 +127,7 @@ pub(super) async fn execute_without_mcp(
             headers,
             model_id,
             ctx.components.clone(),
+            ctx.scheduled_selection.clone(),
         )
         .await?; // Preserve the Response error as-is
 
@@ -211,6 +212,7 @@ pub(super) async fn execute_tool_loop(
                 headers.clone(),
                 model_id.clone(),
                 ctx.components.clone(),
+                ctx.scheduled_selection.clone(),
             )
             .await?;
 

@@ -10,12 +10,11 @@ use http::HeaderMap;
 use thiserror::Error;
 
 use crate::{
-    config::RoutingConfig,
     core::{
         model_type::Endpoint, pd_group_id, ConnectionMode, RuntimeType, Worker, WorkerRegistry,
         WorkerType,
     },
-    policies::{LoadBalancingPolicy, PolicyFactory, PolicyRegistry, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
 };
 
 /// Input needed by the scheduler. Request bodies and clients do not belong here.
@@ -97,19 +96,11 @@ impl WorkerSelection {
 /// Selects workers and owns all request-routing policies.
 pub struct Scheduler {
     worker_registry: Arc<WorkerRegistry>,
-    policy_registry: PolicyRegistry,
+    policy_registry: Arc<PolicyRegistry>,
 }
 
 impl Scheduler {
-    pub fn new(worker_registry: Arc<WorkerRegistry>, config: &RoutingConfig) -> Self {
-        let policy_registry = PolicyRegistry::new(config.policy.clone());
-
-        let prefill_config = config.prefill_policy.as_ref().unwrap_or(&config.policy);
-        let decode_config = config.decode_policy.as_ref().unwrap_or(&config.policy);
-
-        policy_registry.set_prefill_policy(PolicyFactory::create_from_config(prefill_config));
-        policy_registry.set_decode_policy(PolicyFactory::create_from_config(decode_config));
-
+    pub fn new(worker_registry: Arc<WorkerRegistry>, policy_registry: Arc<PolicyRegistry>) -> Self {
         Self {
             worker_registry,
             policy_registry,
@@ -123,36 +114,75 @@ impl Scheduler {
         &self,
         req: &SchedulerInput<'_>,
     ) -> Result<SchedulerOutput, SchedulerError> {
+        self.schedule_excluding(req, &[]).await
+    }
+
+    /// Schedule a request while excluding workers that already failed an
+    /// attempt. This keeps retry/failover decisions inside the Scheduler.
+    pub async fn schedule_excluding(
+        &self,
+        req: &SchedulerInput<'_>,
+        excluded_worker_urls: &[&str],
+    ) -> Result<SchedulerOutput, SchedulerError> {
         let model_id = self.resolve_model_id(req.model_id)?;
-        let available_workers = self.available_workers(&model_id, req.endpoint);
+        let available_workers =
+            self.available_workers(&model_id, req.endpoint, excluded_worker_urls);
 
-        let mode = Self::select_by_mode(&available_workers).ok_or_else(|| {
-            SchedulerError::NoAvailableWorker {
-                model_id: model_id.clone(),
-                mode: "regular, external, or PD",
-                endpoint: req.endpoint,
-            }
-        })?;
+        let mode = match Self::select_by_mode(&available_workers) {
+            Some(mode) => mode,
+            None => {
+                let has_pd_worker = available_workers.iter().any(|worker| {
+                    !matches!(worker.metadata().runtime_type, RuntimeType::External)
+                        && matches!(
+                            worker.worker_type(),
+                            WorkerType::Prefill { .. } | WorkerType::Decode
+                        )
+                });
 
-        let selection = match mode {
-            WorkerMode::Regular => {
-                self.select_regular(&available_workers, &model_id, req)
-                    .await
+                return Err(if has_pd_worker {
+                    SchedulerError::NoAvailablePdPair {
+                        model_id: model_id.clone(),
+                        endpoint: req.endpoint,
+                    }
+                } else {
+                    SchedulerError::NoAvailableWorker {
+                        model_id: model_id.clone(),
+                        mode: "regular, external, or PD",
+                        endpoint: req.endpoint,
+                    }
+                });
             }
-            WorkerMode::External => self.select_external(&available_workers, &model_id),
-            WorkerMode::PrefillDecode => self.select_pd(&available_workers, &model_id, req).await,
         };
 
-        selection
-            .map(|worker_selection| SchedulerOutput {
+        let worker_selection = match mode {
+            WorkerMode::Regular => self
+                .select_regular(&available_workers, &model_id, req)
+                .await
+                .ok_or_else(|| SchedulerError::NoAvailableWorker {
+                    model_id: model_id.clone(),
+                    mode: "regular",
+                    endpoint: req.endpoint,
+                })?,
+            WorkerMode::External => self
+                .select_external(&available_workers, &model_id)
+                .ok_or_else(|| SchedulerError::NoAvailableWorker {
+                    model_id: model_id.clone(),
+                    mode: "external",
+                    endpoint: req.endpoint,
+                })?,
+            WorkerMode::PrefillDecode => self
+                .select_pd(&available_workers, &model_id, req)
+                .await
+                .ok_or_else(|| SchedulerError::NoAvailablePdPair {
                 model_id: model_id.clone(),
-                worker_selection,
-            })
-            .ok_or_else(|| SchedulerError::NoAvailableWorker {
-                model_id: model_id.clone(),
-                mode: "selected worker mode",
                 endpoint: req.endpoint,
-            })
+            })?,
+        };
+
+        Ok(SchedulerOutput {
+            model_id,
+            worker_selection,
+        })
     }
 
     /// Count worker categories and choose the routing mode.
@@ -200,12 +230,28 @@ impl Scheduler {
     /// Resolve an explicit model or infer the only registered model.
     /// A successful schedule therefore always carries a concrete model ID.
     fn resolve_model_id(&self, model_id: Option<&str>) -> Result<String, SchedulerError> {
-        if let Some(model_id) = model_id.map(str::trim).filter(|model| !model.is_empty()) {
+        if let Some(model_id) = model_id
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && *model != crate::core::UNKNOWN_MODEL_ID)
+        {
             return Ok(model_id.to_string());
         }
 
-        let models = self.worker_registry.get_models();
+        let models: Vec<_> = self
+            .worker_registry
+            .get_models()
+            .into_iter()
+            .filter(|model| model != crate::core::UNKNOWN_MODEL_ID)
+            .collect();
         match models.len() {
+            0 if self
+                .worker_registry
+                .get_all()
+                .iter()
+                .any(|worker| worker.is_available()) =>
+            {
+                Ok(crate::core::UNKNOWN_MODEL_ID.to_string())
+            }
             0 => Err(SchedulerError::NoModelsAvailable),
             1 => Ok(models[0].clone()),
             _ => Err(SchedulerError::ModelRequired {
@@ -216,18 +262,55 @@ impl Scheduler {
 
     /// Build one candidate snapshot before choosing a routing mode.
     /// `is_available()` includes health and circuit-breaker state.
-    fn available_workers(&self, model_id: &str, endpoint: Endpoint) -> Vec<Arc<dyn Worker>> {
+    fn available_workers(
+        &self,
+        model_id: &str,
+        endpoint: Endpoint,
+        excluded_worker_urls: &[&str],
+    ) -> Vec<Arc<dyn Worker>> {
         let model_was_provided = model_id != crate::core::UNKNOWN_MODEL_ID;
 
-        self.worker_registry
+        let workers: Vec<_> = self
+            .worker_registry
             .get_all()
             .into_iter()
             .filter(|worker| {
-                (!model_was_provided || worker.supports_model(model_id))
-                    && worker.supports_endpoint(model_id, endpoint)
+                if excluded_worker_urls.contains(&worker.url()) {
+                    return false;
+                }
+                // Workers registered before model discovery (or test/mock
+                // workers) carry UNKNOWN_MODEL_ID. They are intentionally
+                // wildcard workers until a concrete model card is discovered.
+                // Do not reject them merely because the request contains a
+                // model ID or because their provisional model type lacks an
+                // endpoint capability.
+                let unresolved_worker = worker.model_id() == crate::core::UNKNOWN_MODEL_ID;
+                (!model_was_provided || unresolved_worker || worker.supports_model(model_id))
+                    && (unresolved_worker || worker.supports_endpoint(model_id, endpoint))
                     && worker.is_available()
             })
-            .collect()
+            .collect();
+
+        if !workers.is_empty() || !model_was_provided {
+            return workers;
+        }
+
+        // In a single-model deployment, a request may use a provider-facing
+        // alias while discovery reports the worker's filesystem model path.
+        // Keep the only available model pool usable and let the backend apply
+        // its own model validation. Multi-model deployments remain strict.
+        if self.worker_registry.get_models().len() == 1 {
+            return self
+                .worker_registry
+                .get_all()
+                .into_iter()
+                .filter(|worker| {
+                    worker.is_available() && !excluded_worker_urls.contains(&worker.url())
+                })
+                .collect();
+        }
+
+        workers
     }
 
     async fn select_regular(
@@ -432,5 +515,175 @@ impl Scheduler {
             (ConnectionMode::Http, ConnectionMode::Http)
                 | (ConnectionMode::Grpc { .. }, ConnectionMode::Grpc { .. })
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::PolicyConfig, core::BasicWorkerBuilder};
+
+    const MODEL_ID: &str = "deepseek-v4-flash";
+
+    fn scheduler_with_workers(workers: Vec<Arc<dyn Worker>>) -> Scheduler {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for worker in workers {
+            worker_registry.register(worker);
+        }
+
+        Scheduler::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+        )
+    }
+
+    fn worker(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .build(),
+        )
+    }
+
+    fn external_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .runtime_type(RuntimeType::External)
+                .build(),
+        )
+    }
+
+    fn pd_worker(url: &str, worker_type: WorkerType, group: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .label("pd_group_id", group)
+                .build(),
+        )
+    }
+
+    fn request(endpoint: Endpoint) -> SchedulerInput<'static> {
+        SchedulerInput {
+            model_id: Some(MODEL_ID),
+            endpoint,
+            request_text: None,
+            token_ids: None,
+            headers: None,
+        }
+    }
+
+    #[test]
+    fn select_by_mode_uses_regular_before_external_and_pd() {
+        let workers = vec![
+            worker("http://regular", WorkerType::Regular),
+            external_worker("http://external"),
+            pd_worker(
+                "http://prefill",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "group-a",
+            ),
+            pd_worker("http://decode", WorkerType::Decode, "group-a"),
+        ];
+
+        assert_eq!(
+            Scheduler::select_by_mode(&workers),
+            Some(WorkerMode::Regular)
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_returns_regular_worker_when_available() {
+        let scheduler = scheduler_with_workers(vec![
+            worker("http://regular", WorkerType::Regular),
+            pd_worker(
+                "http://prefill",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "group-a",
+            ),
+            pd_worker("http://decode", WorkerType::Decode, "group-a"),
+        ]);
+
+        let selection = scheduler.schedule(&request(Endpoint::Chat)).await.unwrap();
+        assert!(matches!(
+            selection.worker_selection,
+            WorkerSelection::Regular { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn schedule_returns_external_when_regular_is_absent() {
+        let scheduler = scheduler_with_workers(vec![external_worker("http://external")]);
+
+        let selection = scheduler.schedule(&request(Endpoint::Chat)).await.unwrap();
+        assert!(matches!(
+            selection.worker_selection,
+            WorkerSelection::External { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn schedule_returns_pd_pair_when_regular_and_external_are_absent() {
+        let scheduler = scheduler_with_workers(vec![
+            pd_worker(
+                "http://prefill",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "group-a",
+            ),
+            pd_worker("http://decode", WorkerType::Decode, "group-a"),
+        ]);
+
+        let selection = scheduler.schedule(&request(Endpoint::Chat)).await.unwrap();
+        match selection.worker_selection {
+            WorkerSelection::PrefillDecode {
+                prefill,
+                decode,
+                pd_group_id,
+            } => {
+                assert_eq!(prefill.url(), "http://prefill");
+                assert_eq!(decode.url(), "http://decode");
+                assert_eq!(pd_group_id, "group-a");
+            }
+            other => panic!("expected PD selection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_rejects_pd_workers_without_a_matching_pair() {
+        let scheduler = scheduler_with_workers(vec![
+            pd_worker(
+                "http://prefill",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "group-a",
+            ),
+            pd_worker("http://decode", WorkerType::Decode, "group-b"),
+        ]);
+
+        let error = scheduler
+            .schedule(&request(Endpoint::Chat))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SchedulerError::NoAvailablePdPair { .. }));
+    }
+
+    #[tokio::test]
+    async fn default_sglang_worker_supports_generate() {
+        let scheduler = scheduler_with_workers(vec![worker("http://regular", WorkerType::Regular)]);
+
+        let selection = scheduler
+            .schedule(&request(Endpoint::Generate))
+            .await
+            .unwrap();
+        assert!(matches!(
+            selection.worker_selection,
+            WorkerSelection::Regular { .. }
+        ));
     }
 }

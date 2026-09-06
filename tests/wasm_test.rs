@@ -169,9 +169,8 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
     let app_context = create_test_context_with_wasm().await;
 
     // Create a dummy router (we only need the app for WASM endpoints)
-    let router = RouterFactory::create_regular_router(&app_context)
-        .await
-        .expect("Failed to create router");
+    let router =
+        RouterFactory::create_regular_router(&app_context).expect("Failed to create router");
     let router = Arc::from(router);
 
     let app_state = Arc::new(AppState {

@@ -104,9 +104,6 @@ impl ChatPreparationStage {
             } else {
                 None
             },
-            // Harmony fields (not used for regular preparation)
-            harmony_mode: false,
-            selection_text: None,
             harmony_messages: None,
             harmony_stop_ids: None,
         });

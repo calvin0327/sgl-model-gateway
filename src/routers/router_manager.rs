@@ -9,12 +9,11 @@ use axum::{
 };
 use dashmap::DashMap;
 use data_connector::{ResponseId, ResponseStorage};
-use serde_json::Value;
 use tracing::info;
 
 use crate::{
     app_context::AppContext,
-    config::{GatewayConfig, RoutingConfig},
+    config::GatewayConfig,
     core::{
         model_type::Endpoint,
         scheduler::{Scheduler, SchedulerError, SchedulerInput, SchedulerOutput, WorkerSelection},
@@ -68,11 +67,11 @@ pub struct RouterManager {
 impl RouterManager {
     pub fn new(
         worker_registry: Arc<WorkerRegistry>,
-        routing_config: &RoutingConfig,
+        policy_registry: Arc<crate::policies::PolicyRegistry>,
         response_storage: Arc<dyn ResponseStorage>,
     ) -> Self {
         Self {
-            scheduler: Arc::new(Scheduler::new(worker_registry.clone(), routing_config)),
+            scheduler: Arc::new(Scheduler::new(worker_registry.clone(), policy_registry)),
             worker_registry,
             response_storage,
             routers: Arc::new(DashMap::new()),
@@ -80,12 +79,12 @@ impl RouterManager {
     }
 
     pub fn from_config(
-        config: &GatewayConfig,
+        _config: &GatewayConfig,
         app_context: &Arc<AppContext>,
     ) -> Result<Arc<Self>, String> {
         let manager = Arc::new(Self::new(
             app_context.worker_registry.clone(),
-            &config.routing,
+            app_context.policy_registry.clone(),
             app_context.response_storage.clone(),
         ));
 
@@ -152,6 +151,20 @@ impl RouterManager {
         self.routers
             .get(router_id)
             .map(|entry| entry.value().clone())
+    }
+
+    /// Select the backend used by APIs that do not carry a model ID.
+    /// These endpoints retain their historical direct-backend behavior.
+    fn default_router(&self) -> Option<Arc<dyn RouterTrait>> {
+        [
+            router_ids::HTTP_REGULAR,
+            router_ids::HTTP_OPENAI,
+            router_ids::GRPC_REGULAR,
+            router_ids::HTTP_PD,
+            router_ids::GRPC_PD,
+        ]
+        .iter()
+        .find_map(|router_id| self.get_router(router_id))
     }
 
     async fn response_is_local(&self, response_id: &str) -> Result<bool, Response> {
@@ -241,16 +254,8 @@ impl RouterTrait for RouterManager {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // Keep the health check simple: the gateway is ready when at least one
-        // registered worker is healthy. Detailed worker selection is handled by
-        // the Scheduler when serving an actual request.
-        if self
-            .worker_registry
-            .get_all()
-            .iter()
-            .any(|worker| worker.is_healthy())
-        {
-            (StatusCode::OK, "At least one router has healthy workers").into_response()
+        if let Some(router) = self.default_router() {
+            router.health_generate(Request::new(Body::empty())).await
         } else {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -260,57 +265,23 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        // TODO: Aggregate info from all routers with healthy workers
-        (
-            StatusCode::OK,
-            serde_json::json!({
-                "router_manager": true,
-                "routers_count": self.routers.len(),
-                "workers_count": self.worker_registry.get_all().len()
-            })
-            .to_string(),
-        )
-            .into_response()
+    async fn get_server_info(&self, req: Request<Body>) -> Response {
+        match self.default_router() {
+            Some(router) => router.get_server_info(req).await,
+            None => (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response(),
+        }
     }
 
-    async fn get_models(&self, _req: Request<Body>) -> Response {
-        let model_names = self.worker_registry.get_models();
-
-        if model_names.is_empty() {
-            (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
-        } else {
-            // Convert model names to OpenAI-compatible model objects
-            let models: Vec<Value> = model_names
-                .iter()
-                .map(|name| {
-                    serde_json::json!({
-                        "id": name,
-                        "object": "model",
-                        "owned_by": "local"
-                    })
-                })
-                .collect();
-
-            (
-                StatusCode::OK,
-                serde_json::json!({
-                    "object": "list",
-                    "data": models
-                })
-                .to_string(),
-            )
-                .into_response()
+    async fn get_models(&self, req: Request<Body>) -> Response {
+        match self.default_router() {
+            Some(router) => router.get_models(req).await,
+            None => (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response(),
         }
     }
 
     // TODO: multi model
     async fn get_model_info(&self, req: Request<Body>) -> Response {
-        // Keep the existing no-model behavior: use the first registered
-        // router. Model-aware request APIs use Scheduler selections.
-        let router = self.routers.iter().next().map(|r| r.value().clone());
-
-        if let Some(router) = router {
+        if let Some(router) = self.default_router() {
             router.get_model_info(req).await
         } else {
             (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response()

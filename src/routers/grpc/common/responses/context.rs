@@ -7,7 +7,10 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage};
 use smg_mcp::McpManager;
 
-use crate::routers::grpc::{context::SharedComponents, pipeline::RequestPipeline};
+use crate::{
+    core::scheduler::SchedulerOutput,
+    routers::grpc::{context::SharedComponents, pipeline::RequestPipeline},
+};
 
 /// Context for /v1/responses endpoint
 ///
@@ -35,6 +38,9 @@ pub(crate) struct ResponsesContext {
 
     /// Server keys for MCP tools requested in this context
     pub requested_servers: Arc<StdRwLock<Vec<String>>>,
+
+    /// Worker selection made by RouterManager for this request.
+    pub scheduled_selection: Option<SchedulerOutput>,
 }
 
 impl ResponsesContext {
@@ -55,6 +61,20 @@ impl ResponsesContext {
             conversation_item_storage,
             mcp_manager,
             requested_servers: Arc::new(StdRwLock::new(Vec::new())),
+            scheduled_selection: None,
+        }
+    }
+
+    /// Return a request-scoped context that carries the Scheduler decision.
+    pub fn with_scheduled_selection(mut self, selection: SchedulerOutput) -> Self {
+        self.scheduled_selection = Some(selection);
+        self
+    }
+
+    pub fn with_scheduled_selection_if_present(self, selection: Option<SchedulerOutput>) -> Self {
+        match selection {
+            Some(selection) => self.with_scheduled_selection(selection),
+            None => self,
         }
     }
 }

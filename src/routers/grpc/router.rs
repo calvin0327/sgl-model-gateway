@@ -68,7 +68,6 @@ impl GrpcRouter {
             .clone();
 
         let worker_registry = ctx.worker_registry.clone();
-        let _policy_registry = ctx.policy_registry.clone();
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
@@ -79,8 +78,6 @@ impl GrpcRouter {
 
         // Create regular pipeline
         let pipeline = RequestPipeline::new_regular(
-            worker_registry.clone(),
-            _policy_registry.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -89,8 +86,6 @@ impl GrpcRouter {
 
         // Create Harmony pipelines
         let harmony_pipeline = RequestPipeline::new_harmony(
-            worker_registry.clone(),
-            _policy_registry.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -98,12 +93,10 @@ impl GrpcRouter {
         );
 
         // Create Embedding pipeline
-        let embedding_pipeline =
-            RequestPipeline::new_embeddings(worker_registry.clone(), _policy_registry.clone());
+        let embedding_pipeline = RequestPipeline::new_embeddings();
 
         // Create Classify pipeline
-        let classify_pipeline =
-            RequestPipeline::new_classify(worker_registry.clone(), _policy_registry.clone());
+        let classify_pipeline = RequestPipeline::new_classify();
 
         // Extract shared dependencies for responses contexts
         let mcp_manager = ctx
@@ -277,6 +270,7 @@ impl GrpcRouter {
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Response {
         // 0. Fast worker validation (fail-fast before expensive operations)
         let requested_model: Option<&str> = model_id.or(Some(body.model.as_str()));
@@ -306,7 +300,8 @@ impl GrpcRouter {
                     .conversation_item_storage
                     .clone(),
                 self.harmony_responses_context.mcp_manager.clone(),
-            );
+            )
+            .with_scheduled_selection_if_present(scheduled_selection.clone());
 
             if body.stream.unwrap_or(false) {
                 serve_harmony_responses_stream(&harmony_ctx, body.clone()).await
@@ -317,8 +312,12 @@ impl GrpcRouter {
                 }
             }
         } else {
+            let responses_context = self
+                .responses_context
+                .clone()
+                .with_scheduled_selection_if_present(scheduled_selection);
             responses::route_responses(
-                &self.responses_context,
+                &responses_context,
                 Arc::new(body.clone()),
                 headers.cloned(),
                 model_id.map(|s| s.to_string()),
@@ -438,7 +437,19 @@ impl RouterTrait for GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_responses_impl(headers, body, model_id).await
+        self.route_responses_impl(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_responses_with_selection(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+        selection: &SchedulerOutput,
+    ) -> Response {
+        self.route_responses_impl(headers, body, model_id, Some(selection.clone()))
+            .await
     }
 
     async fn get_response(

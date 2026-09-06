@@ -8,6 +8,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::core::{
     circuit_breaker::CircuitBreakerConfig,
+    model_type::ModelType,
     steps::workflow_data::{ExternalWorkerWorkflowData, WorkerList},
     worker::{HealthConfig, RuntimeType, WorkerType},
     BasicWorkerBuilder, ConnectionMode, Worker,
@@ -88,6 +89,7 @@ impl StepExecutor<ExternalWorkerWorkflowData> for CreateExternalWorkersStep {
                 .worker_type(WorkerType::Regular)
                 .connection_mode(ConnectionMode::Http)
                 .runtime_type(RuntimeType::External)
+                .default_model_type(ModelType::LLM)
                 .circuit_breaker_config(circuit_breaker_config.clone())
                 .health_config(health_config.clone());
 

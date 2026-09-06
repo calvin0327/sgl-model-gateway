@@ -34,7 +34,7 @@ use smg::{
     policies::PolicyRegistry,
     protocols::common::{Function, Tool},
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    routers::{RouterFactory, RouterTrait},
+    routers::{router_manager::RouterManager, RouterTrait},
     tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
 };
@@ -243,10 +243,7 @@ impl AppTestContext {
             }
         }
 
-        let router = RouterFactory::create_regular_router(&app_context)
-            .await
-            .unwrap();
-        let router = Arc::from(router);
+        let router = create_router_manager(&app_context);
 
         Self {
             workers,
@@ -268,6 +265,12 @@ impl AppTestContext {
             worker.stop().await;
         }
     }
+}
+
+/// Create the full request-entry router used by gateway integration tests.
+pub fn create_router_manager(app_context: &Arc<AppContext>) -> Arc<dyn RouterTrait> {
+    RouterManager::from_config(&app_context.config, app_context)
+        .expect("Failed to create router manager")
 }
 
 /// Helper function to create AppContext for tests
@@ -318,8 +321,8 @@ pub async fn create_test_context(config: GatewayConfig) -> Arc<AppContext> {
             .client(client)
             .rate_limiter(rate_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
-            .reasoning_parser_factory(None) // reasoning_parser_factory
-            .tool_parser_factory(None) // tool_parser_factory
+            .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
+            .tool_parser_factory(Some(ToolParserFactory::new()))
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
             .response_storage(response_storage)
@@ -564,8 +567,8 @@ pub async fn create_test_context_with_mcp_config(
             .client(client)
             .rate_limiter(rate_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
-            .reasoning_parser_factory(None) // reasoning_parser_factory
-            .tool_parser_factory(None) // tool_parser_factory
+            .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
+            .tool_parser_factory(Some(ToolParserFactory::new()))
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
             .response_storage(response_storage)

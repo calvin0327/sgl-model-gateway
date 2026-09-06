@@ -83,9 +83,7 @@ impl ParserTestContext {
         let app_context = crate::common::create_test_context_with_parsers(config.clone()).await;
 
         // Create router
-        let router = RouterFactory::create_regular_router(&app_context)
-            .await
-            .unwrap();
+        let router = RouterFactory::create_regular_router(&app_context).unwrap();
         let router = Arc::from(router);
 
         Self {

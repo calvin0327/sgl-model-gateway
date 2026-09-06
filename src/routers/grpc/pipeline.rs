@@ -29,9 +29,8 @@ use super::{
     utils::error_type_from_status,
 };
 use crate::{
-    core::{scheduler::SchedulerOutput, WorkerRegistry, UNKNOWN_MODEL_ID},
+    core::{scheduler::SchedulerOutput, UNKNOWN_MODEL_ID},
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
-    policies::PolicyRegistry,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         classify::ClassifyRequest,
@@ -57,8 +56,6 @@ pub(crate) struct RequestPipeline {
 impl RequestPipeline {
     /// Create a regular (single-worker) pipeline
     pub fn new_regular(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
@@ -81,11 +78,7 @@ impl RequestPipeline {
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::Regular,
-            )),
+            Box::new(WorkerSelectionStage::new(WorkerSelectionMode::Regular)),
             Box::new(ClientAcquisitionStage),
             Box::new(RequestBuildingStage::new(false)), // No PD metadata
             Box::new(DispatchMetadataStage),
@@ -101,8 +94,6 @@ impl RequestPipeline {
 
     /// Create a Harmony (single-worker) pipeline for Harmony-capable models
     pub fn new_harmony(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
         _tool_parser_factory: ToolParserFactory,
         _reasoning_parser_factory: ReasoningParserFactory,
         _configured_tool_parser: Option<String>,
@@ -110,11 +101,7 @@ impl RequestPipeline {
     ) -> Self {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(harmony::stages::HarmonyPreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::Regular,
-            )),
+            Box::new(WorkerSelectionStage::new(WorkerSelectionMode::Regular)),
             Box::new(ClientAcquisitionStage),
             Box::new(harmony::stages::HarmonyRequestBuildingStage::new(false)),
             Box::new(DispatchMetadataStage),
@@ -131,8 +118,6 @@ impl RequestPipeline {
     /// Create a Harmony PD (prefill-decode) pipeline
     #[allow(dead_code)]
     pub fn new_harmony_pd(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
         _tool_parser_factory: ToolParserFactory,
         _reasoning_parser_factory: ReasoningParserFactory,
         _configured_tool_parser: Option<String>,
@@ -141,8 +126,6 @@ impl RequestPipeline {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(harmony::stages::HarmonyPreparationStage::new()),
             Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
                 WorkerSelectionMode::PrefillDecode,
             )),
             Box::new(ClientAcquisitionStage),
@@ -160,8 +143,6 @@ impl RequestPipeline {
 
     /// Create a PD (prefill-decode) pipeline
     pub fn new_pd(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
@@ -185,8 +166,6 @@ impl RequestPipeline {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage::new()),
             Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
                 WorkerSelectionMode::PrefillDecode,
             )),
             Box::new(ClientAcquisitionStage),
@@ -203,17 +182,10 @@ impl RequestPipeline {
     }
 
     /// Create an embeddings pipeline
-    pub fn new_embeddings(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
-    ) -> Self {
+    pub fn new_embeddings() -> Self {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(EmbeddingPreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::Regular, // Embeddings are always single
-            )),
+            Box::new(WorkerSelectionStage::new(WorkerSelectionMode::Regular)),
             Box::new(ClientAcquisitionStage),
             Box::new(EmbeddingRequestBuildingStage::new()),
             Box::new(DispatchMetadataStage),
@@ -231,17 +203,10 @@ impl RequestPipeline {
     ///
     /// Classify reuses embedding stages for preparation and request building,
     /// but uses its own response processing for softmax + label mapping.
-    pub fn new_classify(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
-    ) -> Self {
+    pub fn new_classify() -> Self {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(EmbeddingPreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::Regular, // Classify is always single worker
-            )),
+            Box::new(WorkerSelectionStage::new(WorkerSelectionMode::Regular)),
             Box::new(ClientAcquisitionStage),
             Box::new(EmbeddingRequestBuildingStage::new()),
             Box::new(DispatchMetadataStage),
@@ -692,8 +657,12 @@ impl RequestPipeline {
         headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
+        scheduled_selection: Option<SchedulerOutput>,
     ) -> Result<ChatCompletionResponse, Response> {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+        if let Some(selection) = scheduled_selection.as_ref() {
+            ctx.set_scheduled_selection(selection);
+        }
 
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {
@@ -778,6 +747,9 @@ impl RequestPipeline {
             None, // Model ID already set in request
             harmony_ctx.components.clone(),
         );
+        if let Some(selection) = harmony_ctx.scheduled_selection.as_ref() {
+            ctx.set_scheduled_selection(selection);
+        }
 
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {
@@ -841,6 +813,9 @@ impl RequestPipeline {
             None,
             harmony_ctx.components.clone(),
         );
+        if let Some(selection) = harmony_ctx.scheduled_selection.as_ref() {
+            ctx.set_scheduled_selection(selection);
+        }
 
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {

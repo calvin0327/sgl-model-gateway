@@ -109,13 +109,6 @@ pub(crate) struct PreparationOutput {
     /// Filtered request (if tools were filtered)
     pub filtered_request: Option<ChatCompletionRequest>,
 
-    // Harmony-specific fields
-    /// Whether this is a Harmony request (default: false)
-    pub harmony_mode: bool,
-
-    /// Selection text for worker routing (Harmony only)
-    pub selection_text: Option<String>,
-
     /// Harmony messages for history tracking (Harmony only)
     #[allow(dead_code)]
     pub harmony_messages: Option<Vec<super::harmony::HarmonyMessage>>,
