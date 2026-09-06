@@ -675,7 +675,9 @@ impl Router {
             },
             workers: WorkerConfig {
                 regular_urls,
+                regular_preferred_context_tokens: None,
                 prefill_urls,
+                pd_preferred_context_tokens: None,
                 decode_urls,
                 openai_urls,
                 pd_group_id: None,

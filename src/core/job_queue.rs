@@ -27,7 +27,7 @@ use crate::{
             McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
             WasmModuleConfigRequest, WasmModuleRemovalRequest,
         },
-        PD_GROUP_ID_LABEL,
+        PD_GROUP_ID_LABEL, PREFERRED_CONTEXT_TOKENS_LABEL,
     },
     protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
     routers::router_manager::RouterManager,
@@ -586,6 +586,21 @@ impl JobQueue {
                         if let Some(group_id) = config.workers.pd_group_id.as_ref() {
                             labels.insert(PD_GROUP_ID_LABEL.to_string(), group_id.clone());
                         }
+                    }
+
+                    let preferred_context_tokens = match worker_type {
+                        "regular" if runtime != Some("external") => {
+                            config.workers.regular_preferred_context_tokens
+                        }
+                        "prefill" => config.workers.pd_preferred_context_tokens,
+                        // Decode workers do not participate in context-length routing.
+                        _ => None,
+                    };
+                    if let Some(tokens) = preferred_context_tokens {
+                        labels.insert(
+                            PREFERRED_CONTEXT_TOKENS_LABEL.to_string(),
+                            tokens.to_string(),
+                        );
                     }
 
                     let worker_config = WorkerConfigRequest {

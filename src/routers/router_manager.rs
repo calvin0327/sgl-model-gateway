@@ -33,6 +33,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{RouterFactory, RouterTrait},
+    tokenizer::registry::TokenizerRegistry,
 };
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -81,6 +82,7 @@ impl RouterManager {
             policy_registry,
             response_storage,
             RetryConfig::default(),
+            None,
         )
     }
 
@@ -89,9 +91,14 @@ impl RouterManager {
         policy_registry: Arc<crate::policies::PolicyRegistry>,
         response_storage: Arc<dyn ResponseStorage>,
         retry_config: RetryConfig,
+        tokenizer_registry: Option<Arc<TokenizerRegistry>>,
     ) -> Self {
         Self {
-            scheduler: Arc::new(Scheduler::new(worker_registry.clone(), policy_registry)),
+            scheduler: Arc::new(Scheduler::new_with_tokenizer_registry(
+                worker_registry.clone(),
+                policy_registry,
+                tokenizer_registry,
+            )),
             worker_registry,
             response_storage,
             routers: Arc::new(DashMap::new()),
@@ -108,6 +115,7 @@ impl RouterManager {
             app_context.policy_registry.clone(),
             app_context.response_storage.clone(),
             config.workers.effective_retry_config(),
+            Some(app_context.tokenizer_registry.clone()),
         ));
 
         info!("Initializing all router implementations");

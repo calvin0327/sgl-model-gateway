@@ -40,6 +40,9 @@ pub const PD_GROUP_ID_LABEL: &str = "pd_group_id";
 /// original single-PD-deployment behavior.
 pub const DEFAULT_PD_GROUP_ID: &str = "__default_pd_group__";
 
+/// Label used to configure a worker's preferred input context length.
+pub const PREFERRED_CONTEXT_TOKENS_LABEL: &str = "preferred_context_tokens";
+
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
@@ -625,6 +628,10 @@ pub struct WorkerMetadata {
     /// Models this worker can serve.
     /// If empty, worker accepts any model (backward compatible behavior).
     pub models: Vec<ModelCard>,
+    /// Preferred input context length for routing. This is not a hard limit.
+    /// For PD Prefill workers, `None` means no preferred length limit.
+    /// Decode workers do not use this field for context-based scheduling.
+    pub preferred_context_tokens: Option<usize>,
     /// Default provider for this worker (used when model doesn't specify one).
     /// `None` means native/passthrough.
     pub default_provider: Option<ProviderType>,
@@ -2061,6 +2068,7 @@ mod tests {
             bootstrap_host: "test".to_string(),
             bootstrap_port: None,
             models: Vec::new(), // Empty = accepts any model
+            preferred_context_tokens: None,
             default_provider: None,
             default_model_type: ModelType::SGLANG_LLM,
         };
@@ -2091,6 +2099,7 @@ mod tests {
             bootstrap_host: "test".to_string(),
             bootstrap_port: None,
             models: vec![model1, model2],
+            preferred_context_tokens: None,
             default_provider: None,
             default_model_type: ModelType::SGLANG_LLM,
         };

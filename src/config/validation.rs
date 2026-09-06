@@ -141,6 +141,25 @@ impl ConfigValidator {
     }
 
     fn validate_worker(workers: &WorkerConfig) -> ConfigResult<()> {
+        for (field, value) in [
+            (
+                "workers.regular_preferred_context_tokens",
+                workers.regular_preferred_context_tokens,
+            ),
+            (
+                "workers.pd_preferred_context_tokens",
+                workers.pd_preferred_context_tokens,
+            ),
+        ] {
+            if value == Some(0) {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: "0".to_string(),
+                    reason: "Must be > 0 when specified".to_string(),
+                });
+            }
+        }
+
         Self::validate_urls(&workers.regular_urls)?;
         Self::validate_urls(&workers.openai_urls)?;
         Self::validate_urls(

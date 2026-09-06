@@ -283,7 +283,18 @@ impl PolicyConfig {
 pub struct WorkerConfig {
     pub regular_urls: Vec<String>,
 
+    /// Preferred input context length for regular workers. This is a routing
+    /// preference, not a hard limit.
+    #[serde(default)]
+    pub regular_preferred_context_tokens: Option<usize>,
+
     pub prefill_urls: Vec<(String, Option<u16>)>,
+
+    /// Preferred input context length for PD prefill workers. This is a
+    /// routing preference, not a hard limit. `None` means no length limit.
+    /// Decode workers do not use it.
+    #[serde(default)]
+    pub pd_preferred_context_tokens: Option<usize>,
 
     pub decode_urls: Vec<String>,
 
@@ -342,7 +353,9 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             regular_urls: Vec::new(),
+            regular_preferred_context_tokens: None,
             prefill_urls: Vec::new(),
+            pd_preferred_context_tokens: None,
             decode_urls: Vec::new(),
             pd_group_id: None,
             openai_urls: Vec::new(),

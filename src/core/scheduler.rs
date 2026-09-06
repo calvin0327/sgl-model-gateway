@@ -15,6 +15,7 @@ use crate::{
         WorkerType,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    tokenizer::registry::TokenizerRegistry,
 };
 
 /// Input needed by the scheduler. Request bodies and clients do not belong here.
@@ -97,19 +98,26 @@ impl WorkerSelection {
 pub struct Scheduler {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
+    tokenizer_registry: Option<Arc<TokenizerRegistry>>,
 }
 
 impl Scheduler {
     pub fn new(worker_registry: Arc<WorkerRegistry>, policy_registry: Arc<PolicyRegistry>) -> Self {
+        Self::new_with_tokenizer_registry(worker_registry, policy_registry, None)
+    }
+
+    pub fn new_with_tokenizer_registry(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+        tokenizer_registry: Option<Arc<TokenizerRegistry>>,
+    ) -> Self {
         Self {
             worker_registry,
             policy_registry,
+            tokenizer_registry,
         }
     }
 
-    /// Schedule with the first-version priority: Regular -> External -> PD.
-    /// Context-length-based mode selection is intentionally not part of this
-    /// version.
     pub async fn schedule(
         &self,
         req: &SchedulerInput<'_>,
@@ -117,61 +125,209 @@ impl Scheduler {
         let model_id = self.resolve_model_id(req.model_id)?;
         let available_workers = self.available_workers(&model_id, req.endpoint);
 
-        let mode = match Self::select_by_mode(&available_workers) {
-            Some(mode) => mode,
-            None => {
-                let has_pd_worker = available_workers.iter().any(|worker| {
-                    !matches!(worker.metadata().runtime_type, RuntimeType::External)
-                        && matches!(
-                            worker.worker_type(),
-                            WorkerType::Prefill { .. } | WorkerType::Decode
-                        )
-                });
+        let context_tokens = self.context_tokens(req, &model_id);
+        let mut mode_order = Vec::with_capacity(3);
 
-                return Err(if has_pd_worker {
-                    SchedulerError::NoAvailablePdPair {
-                        model_id: model_id.clone(),
-                        endpoint: req.endpoint,
-                    }
-                } else {
-                    SchedulerError::NoAvailableWorker {
-                        model_id: model_id.clone(),
-                        mode: "regular, external, or PD",
-                        endpoint: req.endpoint,
-                    }
-                });
+        if let Some(preferred_mode) =
+            self.context_preferred_mode(&available_workers, context_tokens)
+        {
+            mode_order.push(preferred_mode);
+        } else if let Some(default_mode) = Self::select_by_mode(&available_workers) {
+            mode_order.push(default_mode);
+        }
+
+        // Context length determines the first choice only. The remaining
+        // modes are fallback choices, so Regular and PD can recover from one
+        // another when one side is unhealthy or has no complete PD pair.
+        for mode in [
+            WorkerMode::Regular,
+            WorkerMode::External,
+            WorkerMode::PrefillDecode,
+        ] {
+            if !mode_order.contains(&mode) {
+                mode_order.push(mode);
             }
-        };
+        }
 
-        let worker_selection = match mode {
-            WorkerMode::Regular => self
-                .select_regular(&available_workers, &model_id, req)
-                .await
-                .ok_or_else(|| SchedulerError::NoAvailableWorker {
+        let mut worker_selection = None;
+        for mode in mode_order {
+            let selection = match mode {
+                WorkerMode::Regular => {
+                    self.select_regular(&available_workers, &model_id, req)
+                        .await
+                }
+                WorkerMode::External => self.select_external(&available_workers, &model_id),
+                WorkerMode::PrefillDecode => {
+                    self.select_pd(&available_workers, &model_id, context_tokens, req)
+                        .await
+                }
+            };
+
+            if selection.is_some() {
+                worker_selection = selection;
+                break;
+            }
+        }
+
+        let worker_selection = worker_selection.ok_or_else(|| {
+            let has_pd_worker = available_workers.iter().any(|worker| {
+                !matches!(worker.metadata().runtime_type, RuntimeType::External)
+                    && matches!(
+                        worker.worker_type(),
+                        WorkerType::Prefill { .. } | WorkerType::Decode
+                    )
+            });
+
+            if has_pd_worker {
+                SchedulerError::NoAvailablePdPair {
                     model_id: model_id.clone(),
-                    mode: "regular",
                     endpoint: req.endpoint,
-                })?,
-            WorkerMode::External => self
-                .select_external(&available_workers, &model_id)
-                .ok_or_else(|| SchedulerError::NoAvailableWorker {
+                }
+            } else {
+                SchedulerError::NoAvailableWorker {
                     model_id: model_id.clone(),
-                    mode: "external",
+                    mode: "regular, external, or PD",
                     endpoint: req.endpoint,
-                })?,
-            WorkerMode::PrefillDecode => self
-                .select_pd(&available_workers, &model_id, req)
-                .await
-                .ok_or_else(|| SchedulerError::NoAvailablePdPair {
-                model_id: model_id.clone(),
-                endpoint: req.endpoint,
-            })?,
-        };
+                }
+            }
+        })?;
 
         Ok(SchedulerOutput {
             model_id,
             worker_selection,
         })
+    }
+
+    fn context_tokens(&self, req: &SchedulerInput<'_>, model_id: &str) -> Option<usize> {
+        if let Some(token_ids) = req.token_ids {
+            return Some(token_ids.len());
+        }
+
+        let request_text = req.request_text?;
+        if request_text.is_empty() {
+            return Some(0);
+        }
+
+        let tokenizer = self
+            .tokenizer_registry
+            .as_ref()
+            .and_then(|registry| registry.get(model_id));
+
+        tokenizer
+            .and_then(|tokenizer| {
+                tokenizer
+                    .encode(request_text, false)
+                    .ok()
+                    .map(|encoding| encoding.token_ids().len())
+            })
+            .or_else(|| Some(Self::estimate_context_tokens(request_text)))
+    }
+
+    /// Estimate input tokens when the model tokenizer is not available.
+    /// ASCII text is approximated as four characters per token; non-ASCII
+    /// characters are counted conservatively as one token each.
+    fn estimate_context_tokens(text: &str) -> usize {
+        let ascii_chars = text
+            .chars()
+            .filter(|character| character.is_ascii())
+            .count();
+        let non_ascii_chars = text
+            .chars()
+            .filter(|character| !character.is_ascii())
+            .count();
+        ascii_chars.div_ceil(4) + non_ascii_chars
+    }
+
+    fn context_preferred_mode(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        context_tokens: Option<usize>,
+    ) -> Option<WorkerMode> {
+        let context_tokens = context_tokens?;
+        let has_context_config = workers
+            .iter()
+            .any(|worker| worker.metadata().preferred_context_tokens.is_some());
+
+        if !has_context_config {
+            return None;
+        }
+
+        let regular_limit = workers
+            .iter()
+            .filter(|worker| {
+                matches!(worker.worker_type(), WorkerType::Regular)
+                    && !matches!(worker.metadata().runtime_type, RuntimeType::External)
+            })
+            .filter_map(|worker| Self::matching_context_limit(worker.as_ref(), context_tokens))
+            .min();
+
+        // A PD Prefill worker without `preferred_context_tokens` has no
+        // preferred upper bound. This makes the usual configuration
+        // `regular=10, pd=None` mean: Regular up to 10 tokens, PD above 10.
+        let pd_limit = Self::matching_pd_context_limit(workers, context_tokens);
+
+        match (regular_limit, pd_limit) {
+            (Some(regular), Some(pd)) if regular <= pd => Some(WorkerMode::Regular),
+            (Some(_), Some(_)) => Some(WorkerMode::PrefillDecode),
+            (Some(_), None) => Some(WorkerMode::Regular),
+            (None, Some(_)) => Some(WorkerMode::PrefillDecode),
+            (None, None) => None,
+        }
+    }
+
+    fn matching_context_limit(worker: &dyn Worker, context_tokens: usize) -> Option<usize> {
+        worker
+            .metadata()
+            .preferred_context_tokens
+            .filter(|limit| context_tokens <= *limit)
+    }
+
+    /// Check whether a PD Prefill worker is eligible for the request's
+    /// context length. `None` means that the worker has no preferred upper
+    /// bound and is therefore eligible for any context length.
+    fn matches_pd_context_preference(worker: &dyn Worker, context_tokens: usize) -> bool {
+        worker
+            .metadata()
+            .preferred_context_tokens
+            .is_none_or(|limit| context_tokens <= limit)
+    }
+
+    fn matching_pd_context_limit(
+        workers: &[Arc<dyn Worker>],
+        context_tokens: usize,
+    ) -> Option<usize> {
+        let prefill_workers: Vec<_> = workers
+            .iter()
+            .filter(|worker| {
+                !matches!(worker.metadata().runtime_type, RuntimeType::External)
+                    && matches!(worker.worker_type(), WorkerType::Prefill { .. })
+                    && Self::matches_pd_context_preference(worker.as_ref(), context_tokens)
+            })
+            .cloned()
+            .collect();
+        let decode_workers: Vec<_> = workers
+            .iter()
+            .filter(|worker| {
+                !matches!(worker.metadata().runtime_type, RuntimeType::External)
+                    && matches!(worker.worker_type(), WorkerType::Decode)
+            })
+            .cloned()
+            .collect();
+
+        Self::select_pd_group(&prefill_workers, &decode_workers)?;
+
+        Some(
+            prefill_workers
+                .iter()
+                .map(|worker| {
+                    worker
+                        .metadata()
+                        .preferred_context_tokens
+                        .unwrap_or(usize::MAX)
+                })
+                .max()
+                .unwrap_or(usize::MAX),
+        )
     }
 
     /// Count worker categories and choose the routing mode.
@@ -343,6 +499,7 @@ impl Scheduler {
         &self,
         available_workers: &[Arc<dyn Worker>],
         model_id: &str,
+        context_tokens: Option<usize>,
         req: &SchedulerInput<'_>,
     ) -> Option<WorkerSelection> {
         let available: Vec<_> = available_workers
@@ -362,8 +519,25 @@ impl Scheduler {
             .cloned()
             .collect();
 
-        let (group_id, transport) = Self::select_pd_group(&prefill_workers, &decode_workers)?;
-        let prefill_workers: Vec<_> = prefill_workers
+        let preferred_prefill_workers: Vec<_> = context_tokens
+            .map(|tokens| {
+                prefill_workers
+                    .iter()
+                    .filter(|worker| Self::matches_pd_context_preference(worker.as_ref(), tokens))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let prefill_candidates = if !preferred_prefill_workers.is_empty()
+            && Self::select_pd_group(&preferred_prefill_workers, &decode_workers).is_some()
+        {
+            preferred_prefill_workers
+        } else {
+            prefill_workers
+        };
+
+        let (group_id, transport) = Self::select_pd_group(&prefill_candidates, &decode_workers)?;
+        let prefill_workers: Vec<_> = prefill_candidates
             .into_iter()
             .filter(|worker| {
                 pd_group_id(worker.as_ref()) == group_id

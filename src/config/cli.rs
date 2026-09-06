@@ -123,6 +123,10 @@ pub struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     worker_urls: Vec<String>,
 
+    /// Preferred input context length for regular workers (tokens; not a hard limit)
+    #[arg(long, help_heading = "Worker Configuration")]
+    regular_preferred_context_tokens: Option<usize>,
+
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     openai_urls: Vec<String>,
 
@@ -197,6 +201,10 @@ pub struct CliArgs {
         help_heading = "PD Disaggregation"
     )]
     prefill: Vec<Vec<String>>,
+
+    /// Preferred input context length for PD prefill workers (tokens; omit for no length limit)
+    #[arg(long, help_heading = "PD Disaggregation")]
+    pd_preferred_context_tokens: Option<usize>,
 
     /// Decode server URLs; may be specified multiple times
     #[arg(long, action = ArgAction::Append, help_heading = "PD Disaggregation")]
@@ -945,8 +953,10 @@ impl CliArgs {
             },
             workers: WorkerConfig {
                 regular_urls: self.worker_urls.clone(),
+                regular_preferred_context_tokens: self.regular_preferred_context_tokens,
                 openai_urls: self.openai_urls.clone(),
                 prefill_urls: prefill_urls.clone(),
+                pd_preferred_context_tokens: self.pd_preferred_context_tokens,
                 decode_urls: self.decode.clone(),
                 pd_group_id: None,
                 request_timeout_secs: self.request_timeout_secs,

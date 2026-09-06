@@ -7,6 +7,7 @@ use super::{
     worker::{
         parse_bootstrap_host_from_url, BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig,
         RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
+        PREFERRED_CONTEXT_TOKENS_LABEL,
     },
 };
 use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
@@ -21,6 +22,7 @@ pub struct BasicWorkerBuilder {
     runtime_type: RuntimeType,
     labels: HashMap<String, String>,
     models: Vec<ModelCard>,
+    preferred_context_tokens: Option<usize>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     grpc_client: Option<GrpcClient>,
@@ -37,6 +39,7 @@ impl BasicWorkerBuilder {
             runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
             models: Vec::new(),
+            preferred_context_tokens: None,
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -54,6 +57,7 @@ impl BasicWorkerBuilder {
             runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
             models: Vec::new(),
+            preferred_context_tokens: None,
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -132,6 +136,12 @@ impl BasicWorkerBuilder {
         self
     }
 
+    /// Set the preferred input context length used by the scheduler.
+    pub fn preferred_context_tokens(mut self, tokens: usize) -> Self {
+        self.preferred_context_tokens = Some(tokens);
+        self
+    }
+
     /// Build the BasicWorker instance
     pub fn build(self) -> BasicWorker {
         use std::sync::{
@@ -148,6 +158,12 @@ impl BasicWorkerBuilder {
             _ => None,
         };
 
+        let preferred_context_tokens = self.preferred_context_tokens.or_else(|| {
+            self.labels
+                .get(PREFERRED_CONTEXT_TOKENS_LABEL)
+                .and_then(|value| value.parse::<usize>().ok())
+        });
+
         let metadata = WorkerMetadata {
             url: self.url.clone(),
             api_key: self.api_key,
@@ -158,7 +174,8 @@ impl BasicWorkerBuilder {
             health_config: self.health_config,
             bootstrap_host,
             bootstrap_port,
-            models: self.models,    // Empty = accepts any model
+            models: self.models, // Empty = accepts any model
+            preferred_context_tokens,
             default_provider: None, // Native/passthrough
             default_model_type: self.default_model_type,
         };
@@ -207,6 +224,7 @@ pub struct DPAwareWorkerBuilder {
     default_model_type: ModelType,
     labels: HashMap<String, String>,
     models: Vec<ModelCard>,
+    preferred_context_tokens: Option<usize>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     grpc_client: Option<GrpcClient>,
@@ -225,6 +243,7 @@ impl DPAwareWorkerBuilder {
             runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
             models: Vec::new(),
+            preferred_context_tokens: None,
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -249,6 +268,7 @@ impl DPAwareWorkerBuilder {
             runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
             models: Vec::new(),
+            preferred_context_tokens: None,
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -328,6 +348,12 @@ impl DPAwareWorkerBuilder {
         self
     }
 
+    /// Set the preferred input context length used by the scheduler.
+    pub fn preferred_context_tokens(mut self, tokens: usize) -> Self {
+        self.preferred_context_tokens = Some(tokens);
+        self
+    }
+
     /// Build the DPAwareWorker instance
     pub fn build(self) -> DPAwareWorker {
         let worker_url = format!("{}@{}", self.base_url, self.dp_rank);
@@ -340,6 +366,10 @@ impl DPAwareWorkerBuilder {
             .labels(self.labels)
             .health_config(self.health_config)
             .circuit_breaker_config(self.circuit_breaker_config);
+
+        if let Some(tokens) = self.preferred_context_tokens {
+            builder = builder.preferred_context_tokens(tokens);
+        }
 
         if let Some(client) = self.grpc_client {
             builder = builder.grpc_client(client);

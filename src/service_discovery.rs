@@ -24,7 +24,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     app_context::AppContext,
-    core::Job,
+    core::{Job, PREFERRED_CONTEXT_TOKENS_LABEL},
     observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerConfigRequest,
 };
@@ -411,6 +411,21 @@ async fn handle_pod_event(
                 _ => None,
             };
 
+            let preferred_context_tokens = match &pod_info.pod_type {
+                Some(PodType::Regular) => {
+                    app_context.config.workers.regular_preferred_context_tokens
+                }
+                Some(PodType::Prefill) => app_context.config.workers.pd_preferred_context_tokens,
+                _ => None,
+            };
+            let mut labels = HashMap::new();
+            if let Some(tokens) = preferred_context_tokens {
+                labels.insert(
+                    PREFERRED_CONTEXT_TOKENS_LABEL.to_string(),
+                    tokens.to_string(),
+                );
+            }
+
             let config = WorkerConfigRequest {
                 url: worker_url.clone(),
                 model_id: None,
@@ -418,7 +433,7 @@ async fn handle_pod_event(
                 priority: None,
                 cost: None,
                 runtime: None,
-                labels: HashMap::new(),
+                labels,
                 bootstrap_port,
                 tokenizer_path: None,
                 reasoning_parser: None,
