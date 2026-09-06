@@ -13,14 +13,8 @@ use tracing::{debug, error};
 
 use crate::{
     app_context::AppContext,
-    config::RetryConfig,
     core::{
-        is_retryable_status,
-        model_type::Endpoint,
-        retry::BackoffCalculator,
-        scheduler::{
-            Scheduler, SchedulerInput, SchedulerOutput, WorkerSelection as ScheduledWorkerSelection,
-        },
+        scheduler::{SchedulerOutput, WorkerSelection as ScheduledWorkerSelection},
         AttachedBody, ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
         UNKNOWN_MODEL_ID,
     },
@@ -40,7 +34,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error::{self, extract_error_code_from_response},
+        current_scheduled_selection, error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
         streaming_utils::BreakerTrackedStream,
@@ -53,8 +47,6 @@ pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     client: Client,
     dp_aware: bool,
-    retry_config: RetryConfig,
-    scheduler: Arc<Scheduler>,
 }
 
 impl std::fmt::Debug for Router {
@@ -63,7 +55,6 @@ impl std::fmt::Debug for Router {
             .field("worker_registry", &self.worker_registry)
             .field("client", &self.client)
             .field("dp_aware", &self.dp_aware)
-            .field("retry_config", &self.retry_config)
             .finish()
     }
 }
@@ -82,11 +73,6 @@ impl Router {
             worker_registry: ctx.worker_registry.clone(),
             client: ctx.client.clone(),
             dp_aware: ctx.config.routing.dp_aware,
-            retry_config: ctx.config.workers.effective_retry_config(),
-            scheduler: Arc::new(Scheduler::new(
-                ctx.worker_registry.clone(),
-                ctx.policy_registry.clone(),
-            )),
         })
     }
 
@@ -184,11 +170,8 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
-        let scheduler_endpoint =
-            Endpoint::from_path(route).expect("router route must be a known endpoint");
 
         // Record request start (Layer 2)
         Metrics::record_router_request(
@@ -200,62 +183,18 @@ impl Router {
             bool_to_static_str(is_stream),
         );
 
-        let mut current_worker = selected_worker;
-        let mut attempted_worker_urls: Vec<String> = Vec::new();
-
-        let max_attempts = self.retry_config.max_retries.max(1);
-        let mut attempt = 0;
-        let response = loop {
-            if attempt > 0 {
-                let excluded_worker_urls: Vec<&str> =
-                    attempted_worker_urls.iter().map(String::as_str).collect();
-                if let Ok(selection) = self
-                    .scheduler
-                    .schedule_excluding(
-                        &SchedulerInput {
-                            model_id,
-                            endpoint: scheduler_endpoint,
-                            request_text: (!text.is_empty()).then_some(text.as_str()),
-                            token_ids: None,
-                            headers,
-                        },
-                        &excluded_worker_urls,
-                    )
-                    .await
-                {
-                    if let Some(worker) = Self::selected_regular_worker(&selection) {
-                        current_worker = worker;
-                    }
-                }
-            }
-
-            let worker = current_worker.clone();
-            attempted_worker_urls.push(worker.url().to_string());
-            let response = self
-                .route_typed_request_once(headers, typed_req, route, model_id, is_stream, worker)
-                .await;
-
-            Metrics::record_router_upstream_response(
-                metrics_labels::ROUTER_HTTP,
-                response.status().as_u16(),
-                extract_error_code_from_response(&response),
-            );
-
-            if !is_retryable_status(response.status()) {
-                break response;
-            }
-            if attempt + 1 >= max_attempts {
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
-                break response;
-            }
-
-            let delay = BackoffCalculator::calculate_delay(&self.retry_config, attempt);
-            let next_attempt = attempt + 1;
-            Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
-            Metrics::record_worker_retry_backoff(next_attempt, delay);
-            tokio::time::sleep(delay).await;
-            attempt = next_attempt;
-        };
+        // Worker selection and retry ownership belong to RouterManager. This
+        // router executes exactly the worker selected for this attempt.
+        let response = self
+            .route_typed_request_once(
+                headers,
+                typed_req,
+                route,
+                model_id,
+                is_stream,
+                selected_worker,
+            )
+            .await;
 
         if response.status().is_success() {
             let duration = start.elapsed();
@@ -267,7 +206,7 @@ impl Router {
                 endpoint,
                 duration,
             );
-        } else if !is_retryable_status(response.status()) {
+        } else {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_REGULAR,
@@ -307,12 +246,8 @@ impl Router {
         events::RequestReceivedEvent {}.emit();
 
         let status = response.status();
-        // For streaming responses, the wrapped body (`BreakerTrackedStream`)
-        // records the circuit-breaker outcome once the stream actually
-        // terminates (success on clean end, failure on mid-stream error).
-        // Recording it eagerly here based on the initial status code would
-        // mask "200-then-broken" workers — every request would tick a
-        // success before the stream had a chance to error out.
+        // Keep circuit-breaker accounting separate from routing selection.
+        // Scheduler uses HealthCheck state for candidate filtering.
         if !is_stream {
             worker.record_outcome(status.is_success());
         }
@@ -564,19 +499,10 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // For streaming requests the caller skips the eager
-                // `record_outcome` on the assumption that a
-                // `BreakerTrackedStream` will tick the breaker on drop —
-                // but no tracked stream is installed when send() fails
-                // before any response stream exists. Record the failure
-                // here so a worker flapping at the TCP layer doesn't
-                // stay permanently selectable. Non-streaming requests
-                // are already covered by the caller's
-                // `worker.record_outcome(status.is_success())`, so
-                // gating on `is_stream` avoids double-counting.
                 if is_stream {
                     worker.record_outcome(false);
                 }
+
                 return convert_reqwest_error(e);
             }
         };
@@ -612,14 +538,7 @@ impl Router {
             // Pass the reqwest byte stream straight through as the response body.
             // Dropping the response body drops this stream, which closes the
             // upstream HTTP connection and lets the engine abort generation —
-            // no spawned task or channel needed. `BreakerTrackedStream`
-            // updates the worker's circuit breaker exactly once on drop:
-            // success on clean end, failure on stream error, neither on
-            // client disconnect. For non-2xx responses we pre-mark the
-            // wrapper as Errored — otherwise the small error body would
-            // stream cleanly to `None` and Drop would record a spurious
-            // success (and the streaming branch also skips the eager
-            // `record_outcome` above).
+            // no spawned task or channel needed.
             let mut tracked = BreakerTrackedStream::new(
                 res.bytes_stream(),
                 worker.clone(),
@@ -745,18 +664,13 @@ impl RouterTrait for Router {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
-            .await
-    }
-
-    async fn route_generate_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
-        selection: &SchedulerOutput,
-    ) -> Response {
-        let Some(worker) = Self::selected_regular_worker(selection) else {
+        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP router",
+            );
+        };
+        let Some(worker) = Self::selected_regular_worker(&selection) else {
             return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
         };
         self.route_typed_request_with_worker(headers, body, "/generate", model_id, worker.clone())
@@ -769,18 +683,13 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
-    }
-
-    async fn route_chat_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-        selection: &SchedulerOutput,
-    ) -> Response {
-        let Some(worker) = Self::selected_regular_worker(selection) else {
+        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP router",
+            );
+        };
+        let Some(worker) = Self::selected_regular_worker(&selection) else {
             return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
         };
         self.route_typed_request_with_worker(
@@ -799,18 +708,13 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
-            .await
-    }
-
-    async fn route_completion_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
-        model_id: Option<&str>,
-        selection: &SchedulerOutput,
-    ) -> Response {
-        let Some(worker) = Self::selected_regular_worker(selection) else {
+        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP router",
+            );
+        };
+        let Some(worker) = Self::selected_regular_worker(&selection) else {
             return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
         };
         self.route_typed_request_with_worker(
@@ -829,18 +733,13 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
-            .await
-    }
-
-    async fn route_responses_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ResponsesRequest,
-        model_id: Option<&str>,
-        selection: &SchedulerOutput,
-    ) -> Response {
-        let Some(worker) = Self::selected_regular_worker(selection) else {
+        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP router",
+            );
+        };
+        let Some(worker) = Self::selected_regular_worker(&selection) else {
             return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
         };
         self.route_typed_request_with_worker(
@@ -874,18 +773,13 @@ impl RouterTrait for Router {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/embeddings", model_id)
-            .await
-    }
-
-    async fn route_embeddings_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &EmbeddingRequest,
-        model_id: Option<&str>,
-        selection: &SchedulerOutput,
-    ) -> Response {
-        let Some(worker) = Self::selected_regular_worker(selection) else {
+        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP router",
+            );
+        };
+        let Some(worker) = Self::selected_regular_worker(&selection) else {
             return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
         };
         self.route_typed_request_with_worker(
@@ -904,18 +798,13 @@ impl RouterTrait for Router {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/classify", model_id)
-            .await
-    }
-
-    async fn route_classify_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ClassifyRequest,
-        model_id: Option<&str>,
-        selection: &SchedulerOutput,
-    ) -> Response {
-        let Some(worker) = Self::selected_regular_worker(selection) else {
+        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP router",
+            );
+        };
+        let Some(worker) = Self::selected_regular_worker(&selection) else {
             return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
         };
         self.route_typed_request_with_worker(
@@ -934,33 +823,13 @@ impl RouterTrait for Router {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
-            .await;
-        if response.status().is_success() {
-            match Self::build_rerank_response(body, response).await {
-                Ok(rerank_response) => rerank_response,
-                Err(e) => {
-                    error!("Failed to build rerank response: {}", e);
-                    return error::internal_error(
-                        "rerank_response_build_failed",
-                        "Failed to build rerank response",
-                    );
-                }
-            }
-        } else {
-            response
-        }
-    }
-
-    async fn route_rerank_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &RerankRequest,
-        model_id: Option<&str>,
-        selection: &SchedulerOutput,
-    ) -> Response {
-        let Some(worker) = Self::selected_regular_worker(selection) else {
+        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP router",
+            );
+        };
+        let Some(worker) = Self::selected_regular_worker(&selection) else {
             return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
         };
         let response = self
@@ -1006,13 +875,6 @@ mod tests {
             worker_registry: worker_registry.clone(),
             dp_aware: false,
             client: Client::new(),
-            retry_config: RetryConfig::default(),
-            scheduler: Arc::new(Scheduler::new(
-                worker_registry.clone(),
-                Arc::new(crate::policies::PolicyRegistry::new(
-                    crate::config::PolicyConfig::RoundRobin,
-                )),
-            )),
         }
     }
 

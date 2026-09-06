@@ -14,7 +14,7 @@ use crate::{
     },
     observability::metrics::{metrics_labels, Metrics},
     protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
-    routers::RouterTrait,
+    routers::{current_scheduled_selection, RouterTrait},
 };
 
 /// gRPC PD (Prefill-Decode) router implementation for SGLang
@@ -27,6 +27,16 @@ pub struct GrpcPDRouter {
 }
 
 impl GrpcPDRouter {
+    fn retry_config_for_selection(&self, scheduled: bool) -> RetryConfig {
+        if !scheduled {
+            return self.retry_config.clone();
+        }
+
+        let mut config = self.retry_config.clone();
+        config.max_retries = 1;
+        config
+    }
+
     /// Create a new gRPC PD router
     pub fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         // Get registries from context
@@ -90,7 +100,7 @@ impl GrpcPDRouter {
         let pipeline = &self.pipeline;
 
         RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
+            &self.retry_config_for_selection(scheduled_selection.is_some()),
             |_attempt| {
                 let request = Arc::clone(&request);
                 let headers = headers_cloned.clone();
@@ -156,7 +166,7 @@ impl GrpcPDRouter {
         let pipeline = &self.pipeline;
 
         RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
+            &self.retry_config_for_selection(scheduled_selection.is_some()),
             |_attempt| {
                 let request = Arc::clone(&request);
                 let headers = headers_cloned.clone();
@@ -233,18 +243,7 @@ impl RouterTrait for GrpcPDRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_generate_impl(headers, body, model_id, None)
-            .await
-    }
-
-    async fn route_generate_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
-        selection: &SchedulerOutput,
-    ) -> Response {
-        self.route_generate_impl(headers, body, model_id, Some(selection.clone()))
+        self.route_generate_impl(headers, body, model_id, current_scheduled_selection())
             .await
     }
 
@@ -254,17 +253,7 @@ impl RouterTrait for GrpcPDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_chat_impl(headers, body, model_id, None).await
-    }
-
-    async fn route_chat_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-        selection: &SchedulerOutput,
-    ) -> Response {
-        self.route_chat_impl(headers, body, model_id, Some(selection.clone()))
+        self.route_chat_impl(headers, body, model_id, current_scheduled_selection())
             .await
     }
 

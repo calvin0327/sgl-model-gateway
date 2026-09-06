@@ -114,19 +114,8 @@ impl Scheduler {
         &self,
         req: &SchedulerInput<'_>,
     ) -> Result<SchedulerOutput, SchedulerError> {
-        self.schedule_excluding(req, &[]).await
-    }
-
-    /// Schedule a request while excluding workers that already failed an
-    /// attempt. This keeps retry/failover decisions inside the Scheduler.
-    pub async fn schedule_excluding(
-        &self,
-        req: &SchedulerInput<'_>,
-        excluded_worker_urls: &[&str],
-    ) -> Result<SchedulerOutput, SchedulerError> {
         let model_id = self.resolve_model_id(req.model_id)?;
-        let available_workers =
-            self.available_workers(&model_id, req.endpoint, excluded_worker_urls);
+        let available_workers = self.available_workers(&model_id, req.endpoint);
 
         let mode = match Self::select_by_mode(&available_workers) {
             Some(mode) => mode,
@@ -248,7 +237,7 @@ impl Scheduler {
                 .worker_registry
                 .get_all()
                 .iter()
-                .any(|worker| worker.is_available()) =>
+                .any(|worker| worker.is_healthy()) =>
             {
                 Ok(crate::core::UNKNOWN_MODEL_ID.to_string())
             }
@@ -261,13 +250,9 @@ impl Scheduler {
     }
 
     /// Build one candidate snapshot before choosing a routing mode.
-    /// `is_available()` includes health and circuit-breaker state.
-    fn available_workers(
-        &self,
-        model_id: &str,
-        endpoint: Endpoint,
-        excluded_worker_urls: &[&str],
-    ) -> Vec<Arc<dyn Worker>> {
+    /// Worker health is owned by HealthCheck. Request failures and retry
+    /// attempts must not change the scheduler's candidate set.
+    fn available_workers(&self, model_id: &str, endpoint: Endpoint) -> Vec<Arc<dyn Worker>> {
         let model_was_provided = model_id != crate::core::UNKNOWN_MODEL_ID;
 
         let workers: Vec<_> = self
@@ -275,9 +260,6 @@ impl Scheduler {
             .get_all()
             .into_iter()
             .filter(|worker| {
-                if excluded_worker_urls.contains(&worker.url()) {
-                    return false;
-                }
                 // Workers registered before model discovery (or test/mock
                 // workers) carry UNKNOWN_MODEL_ID. They are intentionally
                 // wildcard workers until a concrete model card is discovered.
@@ -287,7 +269,7 @@ impl Scheduler {
                 let unresolved_worker = worker.model_id() == crate::core::UNKNOWN_MODEL_ID;
                 (!model_was_provided || unresolved_worker || worker.supports_model(model_id))
                     && (unresolved_worker || worker.supports_endpoint(model_id, endpoint))
-                    && worker.is_available()
+                    && worker.is_healthy()
             })
             .collect();
 
@@ -304,9 +286,7 @@ impl Scheduler {
                 .worker_registry
                 .get_all()
                 .into_iter()
-                .filter(|worker| {
-                    worker.is_available() && !excluded_worker_urls.contains(&worker.url())
-                })
+                .filter(|worker| worker.is_healthy())
                 .collect();
         }
 

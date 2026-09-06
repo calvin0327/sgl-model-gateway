@@ -39,6 +39,16 @@ pub mod router_manager;
 pub mod streaming_utils;
 pub mod tokenize;
 
+// Request-scoped worker selection supplied by RouterManager.
+// Concrete routers execute this selection; they do not perform scheduling.
+tokio::task_local! {
+    pub(crate) static SCHEDULED_SELECTION: Option<SchedulerOutput>;
+}
+
+pub(crate) fn current_scheduled_selection() -> Option<SchedulerOutput> {
+    SCHEDULED_SELECTION.try_with(Clone::clone).ok().flatten()
+}
+
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience
 pub use http::{pd_router, pd_types, router};
@@ -94,20 +104,6 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
-    /// Execute a request using a worker selected by the Scheduler.
-    /// Implementations that have not migrated yet fall back to their legacy
-    /// method; RouterManager only uses this method after migration-aware
-    /// routing has selected the corresponding router.
-    async fn route_generate_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
-        _selection: &SchedulerOutput,
-    ) -> Response {
-        self.route_generate(headers, body, model_id).await
-    }
-
     /// Route a chat completion request
     async fn route_chat(
         &self,
@@ -115,16 +111,6 @@ pub trait RouterTrait: Send + Sync + Debug {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response;
-
-    async fn route_chat_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-        _selection: &SchedulerOutput,
-    ) -> Response {
-        self.route_chat(headers, body, model_id).await
-    }
 
     /// Route a completion request
     async fn route_completion(
@@ -140,16 +126,6 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
-    async fn route_completion_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
-        model_id: Option<&str>,
-        _selection: &SchedulerOutput,
-    ) -> Response {
-        self.route_completion(headers, body, model_id).await
-    }
-
     /// Route a responses request
     async fn route_responses(
         &self,
@@ -162,16 +138,6 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Responses endpoint not implemented",
         )
             .into_response()
-    }
-
-    async fn route_responses_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ResponsesRequest,
-        model_id: Option<&str>,
-        _selection: &SchedulerOutput,
-    ) -> Response {
-        self.route_responses(headers, body, model_id).await
     }
 
     /// Retrieve a stored/background response by id
@@ -225,16 +191,6 @@ pub trait RouterTrait: Send + Sync + Debug {
         (StatusCode::NOT_IMPLEMENTED, "Embeddings not implemented").into_response()
     }
 
-    async fn route_embeddings_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &EmbeddingRequest,
-        model_id: Option<&str>,
-        _selection: &SchedulerOutput,
-    ) -> Response {
-        self.route_embeddings(headers, body, model_id).await
-    }
-
     /// Route classification requests (OpenAI-compatible /v1/classify)
     async fn route_classify(
         &self,
@@ -245,16 +201,6 @@ pub trait RouterTrait: Send + Sync + Debug {
         (StatusCode::NOT_IMPLEMENTED, "Classify not implemented").into_response()
     }
 
-    async fn route_classify_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ClassifyRequest,
-        model_id: Option<&str>,
-        _selection: &SchedulerOutput,
-    ) -> Response {
-        self.route_classify(headers, body, model_id).await
-    }
-
     /// Route rerank requests
     async fn route_rerank(
         &self,
@@ -263,16 +209,6 @@ pub trait RouterTrait: Send + Sync + Debug {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not implemented").into_response()
-    }
-
-    async fn route_rerank_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &RerankRequest,
-        model_id: Option<&str>,
-        _selection: &SchedulerOutput,
-    ) -> Response {
-        self.route_rerank(headers, body, model_id).await
     }
 
     /// Get router type name

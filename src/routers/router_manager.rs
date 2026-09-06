@@ -9,16 +9,18 @@ use axum::{
 };
 use dashmap::DashMap;
 use data_connector::{ResponseId, ResponseStorage};
+use futures_util::future::BoxFuture;
 use tracing::info;
 
 use crate::{
     app_context::AppContext,
-    config::GatewayConfig,
+    config::{GatewayConfig, RetryConfig},
     core::{
+        is_retryable_status,
         model_type::Endpoint,
         scheduler::{Scheduler, SchedulerError, SchedulerInput, SchedulerOutput, WorkerSelection},
         worker::Worker,
-        ConnectionMode, WorkerRegistry,
+        ConnectionMode, RetryExecutor, WorkerRegistry,
     },
     protocols::{
         chat::ChatCompletionRequest,
@@ -57,11 +59,15 @@ pub mod router_ids {
     pub const GRPC_PD: RouterId = RouterId::new("grpc-pd");
 }
 
+type ScheduledExecution =
+    Arc<dyn Fn(Arc<dyn RouterTrait>) -> BoxFuture<'static, Response> + Send + Sync>;
+
 pub struct RouterManager {
     worker_registry: Arc<WorkerRegistry>,
     response_storage: Arc<dyn ResponseStorage>,
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
     scheduler: Arc<Scheduler>,
+    retry_config: RetryConfig,
 }
 
 impl RouterManager {
@@ -70,22 +76,38 @@ impl RouterManager {
         policy_registry: Arc<crate::policies::PolicyRegistry>,
         response_storage: Arc<dyn ResponseStorage>,
     ) -> Self {
+        Self::new_with_retry_config(
+            worker_registry,
+            policy_registry,
+            response_storage,
+            RetryConfig::default(),
+        )
+    }
+
+    fn new_with_retry_config(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<crate::policies::PolicyRegistry>,
+        response_storage: Arc<dyn ResponseStorage>,
+        retry_config: RetryConfig,
+    ) -> Self {
         Self {
             scheduler: Arc::new(Scheduler::new(worker_registry.clone(), policy_registry)),
             worker_registry,
             response_storage,
             routers: Arc::new(DashMap::new()),
+            retry_config,
         }
     }
 
     pub fn from_config(
-        _config: &GatewayConfig,
+        config: &GatewayConfig,
         app_context: &Arc<AppContext>,
     ) -> Result<Arc<Self>, String> {
-        let manager = Arc::new(Self::new(
+        let manager = Arc::new(Self::new_with_retry_config(
             app_context.worker_registry.clone(),
             app_context.policy_registry.clone(),
             app_context.response_storage.clone(),
+            config.workers.effective_retry_config(),
         ));
 
         info!("Initializing all router implementations");
@@ -245,6 +267,52 @@ impl RouterManager {
                 (status, error.to_string()).into_response()
             })
     }
+
+    /// Schedule and execute one request attempt.
+    ///
+    /// Retry ownership deliberately lives here rather than in Scheduler or a
+    /// concrete Router. Every retry gets a fresh Scheduler snapshot and the
+    /// resulting selection is passed to exactly one matching Router.
+    async fn execute_with_retry(
+        &self,
+        model_id: Option<&str>,
+        endpoint: Endpoint,
+        request_text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        execute: ScheduledExecution,
+    ) -> Response {
+        RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_attempt| {
+                let execute = Arc::clone(&execute);
+                async move {
+                    let selection = match self
+                        .schedule_request(model_id, endpoint, request_text, headers)
+                        .await
+                    {
+                        Ok(selection) => selection,
+                        Err(response) => return response,
+                    };
+
+                    let Some(router) = self.select_router(&selection) else {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "No router available for the scheduled worker",
+                        )
+                            .into_response();
+                    };
+
+                    crate::routers::SCHEDULED_SELECTION
+                        .scope(Some(selection), execute(router))
+                        .await
+                }
+            },
+            |response, _attempt| is_retryable_status(response.status()),
+            |_delay, _next_attempt| {},
+            || {},
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -295,32 +363,25 @@ impl RouterTrait for RouterManager {
         model_id: Option<&str>,
     ) -> Response {
         let model_id = model_id.or_else(|| body.get_model());
-        let selection = match self
-            .schedule_request(model_id, Endpoint::Generate, body.text.as_deref(), headers)
-            .await
-        {
-            Ok(selection) => selection,
-            Err(response) => return response,
-        };
+        let request = Arc::new(body.clone());
+        let request_headers = headers.cloned();
 
-        let router = self.select_router(&selection);
-
-        if let Some(router) = router {
-            router
-                .route_generate_with_selection(
-                    headers,
-                    body,
-                    Some(selection.model_id.as_str()),
-                    &selection,
-                )
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                "No router available for this request",
-            )
-                .into_response()
-        }
+        self.execute_with_retry(
+            model_id,
+            Endpoint::Generate,
+            body.text.as_deref(),
+            headers,
+            Arc::new(move |router| {
+                let request = Arc::clone(&request);
+                let headers = request_headers.clone();
+                Box::pin(async move {
+                    router
+                        .route_generate(headers.as_ref(), &request, None)
+                        .await
+                })
+            }),
+        )
+        .await
     }
 
     async fn route_chat(
@@ -331,38 +392,21 @@ impl RouterTrait for RouterManager {
     ) -> Response {
         let model_id = model_id.or_else(|| body.get_model());
         let request_text = body.extract_text_for_routing();
+        let request = Arc::new(body.clone());
+        let request_headers = headers.cloned();
 
-        let selection = match self
-            .schedule_request(
-                model_id,
-                Endpoint::Chat,
-                (!request_text.is_empty()).then_some(request_text.as_str()),
-                headers,
-            )
-            .await
-        {
-            Ok(selection) => selection,
-            Err(response) => return response,
-        };
-
-        let router = self.select_router(&selection);
-
-        if let Some(router) = router {
-            router
-                .route_chat_with_selection(
-                    headers,
-                    body,
-                    Some(selection.model_id.as_str()),
-                    &selection,
-                )
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
-            )
-                .into_response()
-        }
+        self.execute_with_retry(
+            model_id,
+            Endpoint::Chat,
+            (!request_text.is_empty()).then_some(request_text.as_str()),
+            headers,
+            Arc::new(move |router| {
+                let request = Arc::clone(&request);
+                let headers = request_headers.clone();
+                Box::pin(async move { router.route_chat(headers.as_ref(), &request, None).await })
+            }),
+        )
+        .await
     }
 
     async fn route_completion(
@@ -373,38 +417,25 @@ impl RouterTrait for RouterManager {
     ) -> Response {
         let model_id = model_id.or_else(|| body.get_model());
         let request_text = body.extract_text_for_routing();
+        let request = Arc::new(body.clone());
+        let request_headers = headers.cloned();
 
-        let selection = match self
-            .schedule_request(
-                model_id,
-                Endpoint::Completions,
-                (!request_text.is_empty()).then_some(request_text.as_str()),
-                headers,
-            )
-            .await
-        {
-            Ok(selection) => selection,
-            Err(response) => return response,
-        };
-
-        let router = self.select_router(&selection);
-
-        if let Some(router) = router {
-            router
-                .route_completion_with_selection(
-                    headers,
-                    body,
-                    Some(selection.model_id.as_str()),
-                    &selection,
-                )
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
-            )
-                .into_response()
-        }
+        self.execute_with_retry(
+            model_id,
+            Endpoint::Completions,
+            (!request_text.is_empty()).then_some(request_text.as_str()),
+            headers,
+            Arc::new(move |router| {
+                let request = Arc::clone(&request);
+                let headers = request_headers.clone();
+                Box::pin(async move {
+                    router
+                        .route_completion(headers.as_ref(), &request, None)
+                        .await
+                })
+            }),
+        )
+        .await
     }
 
     async fn route_responses(
@@ -414,32 +445,25 @@ impl RouterTrait for RouterManager {
         model_id: Option<&str>,
     ) -> Response {
         let model_id = model_id.or_else(|| body.get_model());
-        let selection = match self
-            .schedule_request(model_id, Endpoint::Responses, None, headers)
-            .await
-        {
-            Ok(selection) => selection,
-            Err(response) => return response,
-        };
+        let request = Arc::new(body.clone());
+        let request_headers = headers.cloned();
 
-        let router = self.select_router(&selection);
-
-        if let Some(router) = router {
-            router
-                .route_responses_with_selection(
-                    headers,
-                    body,
-                    Some(selection.model_id.as_str()),
-                    &selection,
-                )
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                "No router available to handle responses request",
-            )
-                .into_response()
-        }
+        self.execute_with_retry(
+            model_id,
+            Endpoint::Responses,
+            None,
+            headers,
+            Arc::new(move |router| {
+                let request = Arc::clone(&request);
+                let headers = request_headers.clone();
+                Box::pin(async move {
+                    router
+                        .route_responses(headers.as_ref(), &request, None)
+                        .await
+                })
+            }),
+        )
+        .await
     }
 
     async fn get_response(
@@ -455,6 +479,7 @@ impl RouterTrait for RouterManager {
             Ok(router) => router,
             Err(response) => return response,
         };
+
         if let Some(router) = router {
             router.get_response(headers, response_id, params).await
         } else {
@@ -474,6 +499,7 @@ impl RouterTrait for RouterManager {
             Ok(router) => router,
             Err(response) => return response,
         };
+
         if let Some(router) = router {
             router.cancel_response(headers, response_id).await
         } else {
@@ -505,6 +531,7 @@ impl RouterTrait for RouterManager {
             Ok(router) => router,
             Err(response) => return response,
         };
+
         if let Some(router) = router {
             router.list_response_input_items(headers, response_id).await
         } else {
@@ -523,32 +550,24 @@ impl RouterTrait for RouterManager {
         model_id: Option<&str>,
     ) -> Response {
         let model_id = model_id.or_else(|| body.get_model());
-        let selection = match self
-            .schedule_request(model_id, Endpoint::Embeddings, None, headers)
-            .await
-        {
-            Ok(selection) => selection,
-            Err(response) => return response,
-        };
-
-        let router = self.select_router(&selection);
-
-        if let Some(router) = router {
-            router
-                .route_embeddings_with_selection(
-                    headers,
-                    body,
-                    Some(selection.model_id.as_str()),
-                    &selection,
-                )
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
-            )
-                .into_response()
-        }
+        let request = Arc::new(body.clone());
+        let request_headers = headers.cloned();
+        self.execute_with_retry(
+            model_id,
+            Endpoint::Embeddings,
+            None,
+            headers,
+            Arc::new(move |router| {
+                let request = Arc::clone(&request);
+                let headers = request_headers.clone();
+                Box::pin(async move {
+                    router
+                        .route_embeddings(headers.as_ref(), &request, None)
+                        .await
+                })
+            }),
+        )
+        .await
     }
 
     async fn route_classify(
@@ -558,31 +577,25 @@ impl RouterTrait for RouterManager {
         model_id: Option<&str>,
     ) -> Response {
         let model_id = model_id.or_else(|| body.get_model());
-        let selection = match self
-            .schedule_request(model_id, Endpoint::Models, None, headers)
-            .await
-        {
-            Ok(selection) => selection,
-            Err(response) => return response,
-        };
-        let router = self.select_router(&selection);
+        let request = Arc::new(body.clone());
+        let request_headers = headers.cloned();
 
-        if let Some(router) = router {
-            router
-                .route_classify_with_selection(
-                    headers,
-                    body,
-                    Some(selection.model_id.as_str()),
-                    &selection,
-                )
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
-            )
-                .into_response()
-        }
+        self.execute_with_retry(
+            model_id,
+            Endpoint::Models,
+            None,
+            headers,
+            Arc::new(move |router| {
+                let request = Arc::clone(&request);
+                let headers = request_headers.clone();
+                Box::pin(async move {
+                    router
+                        .route_classify(headers.as_ref(), &request, None)
+                        .await
+                })
+            }),
+        )
+        .await
     }
 
     async fn route_rerank(
@@ -592,36 +605,21 @@ impl RouterTrait for RouterManager {
         model_id: Option<&str>,
     ) -> Response {
         let model_id = model_id.or_else(|| body.get_model());
-        let selection = match self
-            .schedule_request(
-                model_id,
-                Endpoint::Rerank,
-                Some(body.query.as_str()),
-                headers,
-            )
-            .await
-        {
-            Ok(selection) => selection,
-            Err(response) => return response,
-        };
-        let router = self.select_router(&selection);
+        let request = Arc::new(body.clone());
+        let request_headers = headers.cloned();
 
-        if let Some(router) = router {
-            router
-                .route_rerank_with_selection(
-                    headers,
-                    body,
-                    Some(selection.model_id.as_str()),
-                    &selection,
-                )
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                "No router available for rerank request",
-            )
-                .into_response()
-        }
+        self.execute_with_retry(
+            model_id,
+            Endpoint::Rerank,
+            Some(body.query.as_str()),
+            headers,
+            Arc::new(move |router| {
+                let request = Arc::clone(&request);
+                let headers = request_headers.clone();
+                Box::pin(async move { router.route_rerank(headers.as_ref(), &request, None).await })
+            }),
+        )
+        .await
     }
 
     fn router_type(&self) -> &'static str {

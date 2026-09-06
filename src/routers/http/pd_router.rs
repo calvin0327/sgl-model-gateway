@@ -39,7 +39,7 @@ use crate::{
         rerank::RerankRequest,
     },
     routers::{
-        error,
+        current_scheduled_selection, error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
         streaming_utils::BreakerTrackedStream,
@@ -391,8 +391,12 @@ impl PDRouter {
         // Clone request once outside the retry loop, then use Arc to share across attempts
         // This avoids O(retries) clones by sharing the same data
         let shared_request = Arc::new(original_request.clone());
+        // RouterManager owns request retries. Keep this execution path to a
+        // single attempt so PD dispatch cannot create nested retries.
+        let mut single_attempt_config = self.retry_config.clone();
+        single_attempt_config.max_retries = 1;
         let response = RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
+            &single_attempt_config,
             {
                 move |attempt: u32| {
                     // Clone Arc (cheap reference count increment) instead of cloning the entire request
@@ -1456,59 +1460,13 @@ impl RouterTrait for PDRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let _ = (headers, body, model_id);
-        error::service_unavailable(
-            "scheduler_selection_required",
-            "Request must be scheduled before entering the HTTP PD router",
-        )
-    }
-
-    async fn route_chat(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let _ = (headers, body, model_id);
-        error::service_unavailable(
-            "scheduler_selection_required",
-            "Request must be scheduled before entering the HTTP PD router",
-        )
-    }
-
-    async fn route_completion(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let _ = (headers, body, model_id);
-        error::service_unavailable(
-            "scheduler_selection_required",
-            "Request must be scheduled before entering the HTTP PD router",
-        )
-    }
-
-    async fn route_rerank(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &RerankRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let _ = (headers, body, model_id);
-        error::service_unavailable(
-            "scheduler_selection_required",
-            "Request must be scheduled before entering the HTTP PD router",
-        )
-    }
-
-    async fn route_generate_with_selection(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
-        selection: &SchedulerOutput,
-    ) -> Response {
+        let Some(selection) = current_scheduled_selection() else {
+            let _ = (headers, body, model_id);
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP PD router",
+            );
+        };
         self.execute_dual_dispatch_selected(
             headers,
             body,
@@ -1519,18 +1477,24 @@ impl RouterTrait for PDRouter {
                 return_logprob: body.return_logprob.unwrap_or(false),
                 model_id,
             },
-            selection,
+            &selection,
         )
         .await
     }
 
-    async fn route_chat_with_selection(
+    async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
-        selection: &SchedulerOutput,
     ) -> Response {
+        let Some(selection) = current_scheduled_selection() else {
+            let _ = (headers, body, model_id);
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP PD router",
+            );
+        };
         self.execute_dual_dispatch_selected(
             headers,
             body,
@@ -1541,18 +1505,24 @@ impl RouterTrait for PDRouter {
                 return_logprob: body.logprobs,
                 model_id,
             },
-            selection,
+            &selection,
         )
         .await
     }
 
-    async fn route_completion_with_selection(
+    async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
-        selection: &SchedulerOutput,
     ) -> Response {
+        let Some(selection) = current_scheduled_selection() else {
+            let _ = (headers, body, model_id);
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP PD router",
+            );
+        };
         self.execute_dual_dispatch_selected(
             headers,
             body,
@@ -1563,18 +1533,24 @@ impl RouterTrait for PDRouter {
                 return_logprob: body.logprobs.is_some(),
                 model_id,
             },
-            selection,
+            &selection,
         )
         .await
     }
 
-    async fn route_rerank_with_selection(
+    async fn route_rerank(
         &self,
         headers: Option<&HeaderMap>,
         body: &RerankRequest,
         model_id: Option<&str>,
-        selection: &SchedulerOutput,
     ) -> Response {
+        let Some(selection) = current_scheduled_selection() else {
+            let _ = (headers, body, model_id);
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP PD router",
+            );
+        };
         self.execute_dual_dispatch_selected(
             headers,
             body,
@@ -1585,7 +1561,7 @@ impl RouterTrait for PDRouter {
                 return_logprob: false,
                 model_id,
             },
-            selection,
+            &selection,
         )
         .await
     }
