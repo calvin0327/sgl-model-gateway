@@ -5,6 +5,7 @@
 //! WorkerRegistry and JobQueue operations.
 
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use axum::{
     http::StatusCode,
@@ -149,11 +150,34 @@ impl IntoResponse for UpdateWorkerResult {
 /// Result of listing workers
 #[derive(Debug)]
 pub struct ListWorkersResult {
-    pub workers: Vec<WorkerInfo>,
+    pub workers: Vec<WorkerInfoResponse>,
     pub total: usize,
     pub prefill_count: usize,
     pub decode_count: usize,
     pub regular_count: usize,
+}
+
+/// Worker information returned by the gateway control-plane API.
+///
+/// `WorkerInfo::metadata` already contains the worker labels, but exposing
+/// them as a dedicated top-level field makes the API easier to consume while
+/// preserving the existing metadata field for backward compatibility.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkerInfoResponse {
+    #[serde(flatten)]
+    pub worker: WorkerInfo,
+
+    /// Labels configured for or discovered from this worker.
+    pub labels: HashMap<String, String>,
+}
+
+impl WorkerInfoResponse {
+    fn from_worker_info(worker: WorkerInfo) -> Self {
+        Self {
+            labels: worker.metadata.clone(),
+            worker,
+        }
+    }
 }
 
 impl IntoResponse for ListWorkersResult {
@@ -172,7 +196,7 @@ impl IntoResponse for ListWorkersResult {
 }
 
 /// Wrapper for WorkerInfo to implement IntoResponse
-pub struct GetWorkerResponse(pub WorkerInfo);
+pub struct GetWorkerResponse(pub WorkerInfoResponse);
 
 impl IntoResponse for GetWorkerResponse {
     fn into_response(self) -> Response {
@@ -261,12 +285,12 @@ impl WorkerService {
     /// List all workers with their info
     pub fn list_workers(&self) -> ListWorkersResult {
         let workers = self.worker_registry.get_all_with_ids();
-        let worker_infos: Vec<WorkerInfo> = workers
+        let worker_infos: Vec<WorkerInfoResponse> = workers
             .iter()
             .map(|(worker_id, worker)| {
                 let mut info = worker_to_info(worker);
                 info.id = worker_id.as_str().to_string();
-                info
+                WorkerInfoResponse::from_worker_info(info)
             })
             .collect();
 
@@ -292,15 +316,15 @@ impl WorkerService {
             if let Some(status) = job_queue.get_status(&worker_url) {
                 worker_info.job_status = Some(status);
             }
-            return Ok(GetWorkerResponse(worker_info));
+            return Ok(GetWorkerResponse(WorkerInfoResponse::from_worker_info(
+                worker_info,
+            )));
         }
 
         if let Some(worker_url) = self.worker_registry.get_url_by_id(&worker_id) {
             if let Some(status) = job_queue.get_status(&worker_url) {
-                return Ok(GetWorkerResponse(WorkerInfo::pending(
-                    worker_id.as_str(),
-                    worker_url,
-                    Some(status),
+                return Ok(GetWorkerResponse(WorkerInfoResponse::from_worker_info(
+                    WorkerInfo::pending(worker_id.as_str(), worker_url, Some(status)),
                 )));
             }
         }
