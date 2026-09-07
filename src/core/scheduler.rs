@@ -4,10 +4,11 @@
 //! Routers are intentionally not involved here: they only execute the selection
 //! returned by this module.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use http::HeaderMap;
 use thiserror::Error;
+use tracing::info;
 
 use crate::{
     core::{
@@ -33,6 +34,12 @@ pub struct SchedulerInput<'a> {
 pub enum SchedulerError {
     #[error("no models are available")]
     NoModelsAvailable,
+
+    #[error("model '{model_id}' is not available for endpoint '{endpoint}'")]
+    ModelNotFound {
+        model_id: String,
+        endpoint: Endpoint,
+    },
 
     #[error("model must be specified when multiple models are available: {models}")]
     ModelRequired { models: String },
@@ -62,7 +69,6 @@ pub struct SchedulerOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerMode {
     Regular,
-    External,
     PrefillDecode,
 }
 
@@ -77,18 +83,13 @@ pub enum WorkerSelection {
         decode: Arc<dyn Worker>,
         pd_group_id: String,
     },
-    External {
-        worker: Arc<dyn Worker>,
-    },
 }
 
 impl WorkerSelection {
     /// Returns the transport used by a selection.
     pub fn connection_mode(&self) -> ConnectionMode {
         match self {
-            Self::Regular { worker } | Self::External { worker } => {
-                worker.connection_mode().clone()
-            }
+            Self::Regular { worker } => worker.connection_mode().clone(),
             Self::PrefillDecode { prefill, .. } => prefill.connection_mode().clone(),
         }
     }
@@ -123,7 +124,7 @@ impl Scheduler {
         req: &SchedulerInput<'_>,
     ) -> Result<SchedulerOutput, SchedulerError> {
         let model_id = self.resolve_model_id(req.model_id)?;
-        let available_workers = self.available_workers(&model_id, req.endpoint);
+        let available_workers = self.available_workers(&model_id, req.endpoint)?;
 
         let context_tokens = self.context_tokens(req, &model_id);
         let mut mode_order = Vec::with_capacity(3);
@@ -139,11 +140,7 @@ impl Scheduler {
         // Context length determines the first choice only. The remaining
         // modes are fallback choices, so Regular and PD can recover from one
         // another when one side is unhealthy or has no complete PD pair.
-        for mode in [
-            WorkerMode::Regular,
-            WorkerMode::External,
-            WorkerMode::PrefillDecode,
-        ] {
+        for mode in [WorkerMode::Regular, WorkerMode::PrefillDecode] {
             if !mode_order.contains(&mode) {
                 mode_order.push(mode);
             }
@@ -156,7 +153,6 @@ impl Scheduler {
                     self.select_regular(&available_workers, &model_id, req)
                         .await
                 }
-                WorkerMode::External => self.select_external(&available_workers, &model_id),
                 WorkerMode::PrefillDecode => {
                     self.select_pd(&available_workers, &model_id, context_tokens, req)
                         .await
@@ -186,11 +182,41 @@ impl Scheduler {
             } else {
                 SchedulerError::NoAvailableWorker {
                     model_id: model_id.clone(),
-                    mode: "regular, external, or PD",
+                    mode: "regular or PD",
                     endpoint: req.endpoint,
                 }
             }
         })?;
+
+        match &worker_selection {
+            WorkerSelection::Regular { worker } => {
+                info!(
+                    model_id = %model_id,
+                    endpoint = ?req.endpoint,
+                    context_tokens = ?context_tokens,
+                    worker_url = %worker.url(),
+                    worker_type = ?worker.worker_type(),
+                    runtime_type = %worker.metadata().runtime_type,
+                    "Request scheduled to worker"
+                );
+            }
+            WorkerSelection::PrefillDecode {
+                prefill,
+                decode,
+                pd_group_id,
+            } => {
+                info!(
+                    model_id = %model_id,
+                    endpoint = ?req.endpoint,
+                    context_tokens = ?context_tokens,
+                    prefill_url = %prefill.url(),
+                    decode_url = %decode.url(),
+                    pd_group_id = %pd_group_id,
+                    runtime_type = %prefill.metadata().runtime_type,
+                    "Request scheduled to PD workers"
+                );
+            }
+        }
 
         Ok(SchedulerOutput {
             model_id,
@@ -346,14 +372,8 @@ impl Scheduler {
         let mut num_regular = 0;
         let mut num_prefill = 0;
         let mut num_decode = 0;
-        let mut num_external = 0;
 
         for worker in workers {
-            if matches!(worker.metadata().runtime_type, RuntimeType::External) {
-                num_external += 1;
-                continue;
-            }
-
             match worker.worker_type() {
                 WorkerType::Regular => num_regular += 1,
                 WorkerType::Prefill { .. } => num_prefill += 1,
@@ -363,8 +383,6 @@ impl Scheduler {
 
         if num_regular > 0 {
             Some(WorkerMode::Regular)
-        } else if num_external > 0 {
-            Some(WorkerMode::External)
         } else if num_prefill > 0 && num_decode > 0 {
             Some(WorkerMode::PrefillDecode)
         } else {
@@ -408,7 +426,11 @@ impl Scheduler {
     /// Build one candidate snapshot before choosing a routing mode.
     /// Worker health is owned by HealthCheck. Request failures and retry
     /// attempts must not change the scheduler's candidate set.
-    fn available_workers(&self, model_id: &str, endpoint: Endpoint) -> Vec<Arc<dyn Worker>> {
+    fn available_workers(
+        &self,
+        model_id: &str,
+        endpoint: Endpoint,
+    ) -> Result<Vec<Arc<dyn Worker>>, SchedulerError> {
         let model_was_provided = model_id != crate::core::UNKNOWN_MODEL_ID;
 
         let workers: Vec<_> = self
@@ -430,23 +452,20 @@ impl Scheduler {
             .collect();
 
         if !workers.is_empty() || !model_was_provided {
-            return workers;
+            return Ok(workers);
         }
 
-        // In a single-model deployment, a request may use a provider-facing
-        // alias while discovery reports the worker's filesystem model path.
-        // Keep the only available model pool usable and let the backend apply
-        // its own model validation. Multi-model deployments remain strict.
-        if self.worker_registry.get_models().len() == 1 {
-            return self
-                .worker_registry
-                .get_all()
-                .into_iter()
-                .filter(|worker| worker.is_healthy())
-                .collect();
+        let model_is_known = self.worker_registry.get_all().iter().any(|worker| {
+            worker.model_id() == crate::core::UNKNOWN_MODEL_ID || worker.supports_model(model_id)
+        });
+        if model_is_known {
+            Ok(workers)
+        } else {
+            Err(SchedulerError::ModelNotFound {
+                model_id: model_id.to_string(),
+                endpoint,
+            })
         }
-
-        workers
     }
 
     async fn select_regular(
@@ -474,25 +493,6 @@ impl Scheduler {
             .await?;
 
         Some(WorkerSelection::Regular { worker })
-    }
-
-    fn select_external(
-        &self,
-        available_workers: &[Arc<dyn Worker>],
-        model_id: &str,
-    ) -> Option<WorkerSelection> {
-        // External workers can discover models dynamically, so select from the
-        // complete External pool rather than relying only on the model index.
-        let worker = available_workers
-            .iter()
-            .filter(|worker| {
-                matches!(worker.metadata().runtime_type, RuntimeType::External)
-                    && worker.supports_model(model_id)
-            })
-            .min_by_key(|worker| worker.load())
-            .cloned();
-
-        worker.map(|worker| WorkerSelection::External { worker })
     }
 
     async fn select_pd(
@@ -536,12 +536,14 @@ impl Scheduler {
             prefill_workers
         };
 
-        let (group_id, transport) = Self::select_pd_group(&prefill_candidates, &decode_workers)?;
+        let (group_id, transport, runtime_type) =
+            Self::select_pd_group(&prefill_candidates, &decode_workers)?;
         let prefill_workers: Vec<_> = prefill_candidates
             .into_iter()
             .filter(|worker| {
                 pd_group_id(worker.as_ref()) == group_id
                     && Self::same_transport(worker.connection_mode(), &transport)
+                    && worker.metadata().runtime_type == runtime_type
             })
             .collect();
         let decode_workers: Vec<_> = decode_workers
@@ -549,6 +551,7 @@ impl Scheduler {
             .filter(|worker| {
                 pd_group_id(worker.as_ref()) == group_id
                     && Self::same_transport(worker.connection_mode(), &transport)
+                    && worker.metadata().runtime_type == runtime_type
             })
             .collect();
 
@@ -572,6 +575,10 @@ impl Scheduler {
         if !Self::same_transport(prefill.connection_mode(), decode.connection_mode()) {
             return None;
         }
+        debug_assert_eq!(
+            prefill.metadata().runtime_type,
+            decode.metadata().runtime_type
+        );
 
         Some(WorkerSelection::PrefillDecode {
             prefill,
@@ -583,57 +590,44 @@ impl Scheduler {
     fn select_pd_group(
         prefill_workers: &[Arc<dyn Worker>],
         decode_workers: &[Arc<dyn Worker>],
-    ) -> Option<(String, ConnectionMode)> {
-        let prefill_groups: BTreeSet<String> = prefill_workers
+    ) -> Option<(String, ConnectionMode, RuntimeType)> {
+        let mut seen = HashSet::new();
+        let candidates: Vec<(String, ConnectionMode, RuntimeType, usize)> = prefill_workers
             .iter()
-            .map(|worker| pd_group_id(worker.as_ref()).to_string())
-            .collect();
-        let decode_groups: BTreeSet<String> = decode_workers
-            .iter()
-            .map(|worker| pd_group_id(worker.as_ref()).to_string())
-            .collect();
+            .filter_map(|prefill| {
+                let group = pd_group_id(prefill.as_ref()).to_string();
+                let transport = prefill.connection_mode().clone();
+                let runtime_type = prefill.metadata().runtime_type.clone();
+                if !seen.insert((group.clone(), transport.clone(), runtime_type.clone())) {
+                    return None;
+                }
+                let has_matching_decode = decode_workers.iter().any(|decode| {
+                    pd_group_id(decode.as_ref()) == group
+                        && Self::same_transport(decode.connection_mode(), &transport)
+                        && decode.metadata().runtime_type == runtime_type
+                });
+                if !has_matching_decode {
+                    return None;
+                }
 
-        let candidates: Vec<(String, ConnectionMode, usize)> = prefill_groups
-            .intersection(&decode_groups)
-            .flat_map(|group| {
-                let transports: Vec<ConnectionMode> = prefill_workers
+                let load: usize = prefill_workers
                     .iter()
-                    .filter(|worker| pd_group_id(worker.as_ref()) == group.as_str())
-                    .map(|worker| worker.connection_mode().clone())
-                    .filter(|transport| {
-                        decode_workers.iter().any(|worker| {
-                            pd_group_id(worker.as_ref()) == group.as_str()
-                                && Self::same_transport(worker.connection_mode(), transport)
-                        })
+                    .chain(decode_workers)
+                    .filter(|worker| {
+                        pd_group_id(worker.as_ref()) == group
+                            && Self::same_transport(worker.connection_mode(), &transport)
+                            && worker.metadata().runtime_type == runtime_type
                     })
-                    .collect();
-
-                transports.into_iter().map(|transport| {
-                    let prefill_load: usize = prefill_workers
-                        .iter()
-                        .filter(|worker| {
-                            pd_group_id(worker.as_ref()) == group.as_str()
-                                && Self::same_transport(worker.connection_mode(), &transport)
-                        })
-                        .map(|worker| worker.load())
-                        .sum();
-                    let decode_load: usize = decode_workers
-                        .iter()
-                        .filter(|worker| {
-                            pd_group_id(worker.as_ref()) == group.as_str()
-                                && Self::same_transport(worker.connection_mode(), &transport)
-                        })
-                        .map(|worker| worker.load())
-                        .sum();
-                    (group.clone(), transport, prefill_load + decode_load)
-                })
+                    .map(|worker| worker.load())
+                    .sum();
+                Some((group, transport, runtime_type, load))
             })
             .collect();
 
         candidates
             .into_iter()
-            .min_by_key(|(group, _transport, load)| (*load, group.clone()))
-            .map(|(group, transport, _)| (group, transport))
+            .min_by_key(|(group, _transport, _runtime_type, load)| (*load, group.clone()))
+            .map(|(group, transport, runtime_type, _)| (group, transport, runtime_type))
     }
 
     async fn select_by_policy(
@@ -664,18 +658,17 @@ impl Scheduler {
     }
 
     fn same_transport(left: &ConnectionMode, right: &ConnectionMode) -> bool {
-        matches!(
-            (left, right),
-            (ConnectionMode::Http, ConnectionMode::Http)
-                | (ConnectionMode::Grpc { .. }, ConnectionMode::Grpc { .. })
-        )
+        left == right
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::PolicyConfig, core::BasicWorkerBuilder};
+    use crate::{
+        config::PolicyConfig,
+        core::{model_card::ModelCard, BasicWorkerBuilder},
+    };
 
     const MODEL_ID: &str = "deepseek-v4-flash";
 
@@ -716,9 +709,34 @@ mod tests {
         )
     }
 
+    fn pd_worker_with_runtime(
+        url: &str,
+        worker_type: WorkerType,
+        group: &str,
+        runtime_type: RuntimeType,
+    ) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(runtime_type)
+                .label("pd_group_id", group)
+                .build(),
+        )
+    }
+
     fn request(endpoint: Endpoint) -> SchedulerInput<'static> {
         SchedulerInput {
             model_id: Some(MODEL_ID),
+            endpoint,
+            request_text: None,
+            token_ids: None,
+            headers: None,
+        }
+    }
+
+    fn request_with_model(endpoint: Endpoint, model_id: &'static str) -> SchedulerInput<'static> {
+        SchedulerInput {
+            model_id: Some(model_id),
             endpoint,
             request_text: None,
             token_ids: None,
@@ -769,13 +787,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schedule_returns_external_when_regular_is_absent() {
-        let scheduler = scheduler_with_workers(vec![external_worker("http://external")]);
+    async fn schedule_rejects_unmatched_model_in_single_model_deployment() {
+        let scheduler = scheduler_with_workers(vec![Arc::new(
+            BasicWorkerBuilder::new("http://regular")
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new(MODEL_ID))
+                .build(),
+        ) as Arc<dyn Worker>]);
 
-        let selection = scheduler.schedule(&request(Endpoint::Chat)).await.unwrap();
+        let error = scheduler
+            .schedule(&request_with_model(Endpoint::Chat, "invalid-model"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SchedulerError::ModelNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn schedule_accepts_configured_model_alias() {
+        let model_card = ModelCard::new(MODEL_ID).with_alias("model-alias");
+        let scheduler = scheduler_with_workers(vec![Arc::new(
+            BasicWorkerBuilder::new("http://regular")
+                .worker_type(WorkerType::Regular)
+                .model(model_card)
+                .build(),
+        ) as Arc<dyn Worker>]);
+
+        let selection = scheduler
+            .schedule(&request_with_model(Endpoint::Chat, "model-alias"))
+            .await
+            .unwrap();
         assert!(matches!(
             selection.worker_selection,
-            WorkerSelection::External { .. }
+            WorkerSelection::Regular { .. }
         ));
     }
 
@@ -825,6 +868,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, SchedulerError::NoAvailablePdPair { .. }));
+    }
+
+    #[tokio::test]
+    async fn schedule_selects_a_pd_pair_with_matching_runtime() {
+        let scheduler = scheduler_with_workers(vec![
+            pd_worker_with_runtime(
+                "http://sglang-prefill",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "group-a",
+                RuntimeType::Sglang,
+            ),
+            pd_worker_with_runtime(
+                "http://vllm-prefill",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "group-a",
+                RuntimeType::Vllm,
+            ),
+            pd_worker_with_runtime(
+                "http://sglang-decode",
+                WorkerType::Decode,
+                "group-a",
+                RuntimeType::Sglang,
+            ),
+            pd_worker_with_runtime(
+                "http://vllm-decode",
+                WorkerType::Decode,
+                "group-a",
+                RuntimeType::Vllm,
+            ),
+        ]);
+
+        let selection = scheduler.schedule(&request(Endpoint::Chat)).await.unwrap();
+        match selection.worker_selection {
+            WorkerSelection::PrefillDecode {
+                prefill, decode, ..
+            } => {
+                assert_eq!(
+                    prefill.metadata().runtime_type,
+                    decode.metadata().runtime_type
+                );
+            }
+            other => panic!("expected PD selection, got {other:?}"),
+        }
     }
 
     #[tokio::test]

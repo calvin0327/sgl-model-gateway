@@ -10,7 +10,6 @@ use std::{
 };
 
 use dashmap::DashMap;
-use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 use wfaas::WorkflowId;
@@ -20,16 +19,14 @@ use crate::{
     config::GatewayConfig,
     core::{
         steps::{
-            create_external_worker_workflow_data, create_local_worker_workflow_data,
-            create_mcp_workflow_data, create_tokenizer_workflow_data,
-            create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
+            create_local_worker_workflow_data, create_tokenizer_workflow_data,
             create_worker_removal_workflow_data, create_worker_update_workflow_data,
-            McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
-            WasmModuleConfigRequest, WasmModuleRemovalRequest,
+            TokenizerConfigRequest, TokenizerRemovalRequest,
         },
         PD_GROUP_ID_LABEL, PREFERRED_CONTEXT_TOKENS_LABEL,
     },
-    protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
+    protocol_compat::{WorkerConfigRequest, WorkerUpdateRequest},
+    protocols::worker::JobStatus,
     routers::router_manager::RouterManager,
 };
 
@@ -49,18 +46,6 @@ pub enum Job {
     InitializeWorkersFromConfig {
         gateway_config: Box<GatewayConfig>,
     },
-    InitializeMcpServers {
-        mcp_config: Box<McpConfig>,
-    },
-    RegisterMcpServer {
-        config: Box<McpServerConfigRequest>,
-    },
-    AddWasmModule {
-        config: Box<WasmModuleConfigRequest>,
-    },
-    RemoveWasmModule {
-        request: Box<WasmModuleRemovalRequest>,
-    },
     AddTokenizer {
         config: Box<TokenizerConfigRequest>,
     },
@@ -77,26 +62,18 @@ impl Job {
             Job::UpdateWorker { .. } => "UpdateWorker",
             Job::RemoveWorker { .. } => "RemoveWorker",
             Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
-            Job::InitializeMcpServers { .. } => "InitializeMcpServers",
-            Job::RegisterMcpServer { .. } => "RegisterMcpServer",
-            Job::AddWasmModule { .. } => "AddWasmModule",
-            Job::RemoveWasmModule { .. } => "RemoveWasmModule",
             Job::AddTokenizer { .. } => "AddTokenizer",
             Job::RemoveTokenizer { .. } => "RemoveTokenizer",
         }
     }
 
-    /// Get worker URL, MCP server name, WASM module, or tokenizer identifier for logging and status tracking
+    /// Get worker URL or tokenizer identifier for logging and status tracking
     pub fn worker_url(&self) -> &str {
         match self {
             Job::AddWorker { config } => &config.url,
             Job::UpdateWorker { url, .. } => url,
             Job::RemoveWorker { url } => url,
             Job::InitializeWorkersFromConfig { .. } => "startup",
-            Job::InitializeMcpServers { .. } => "startup",
-            Job::RegisterMcpServer { config } => &config.name,
-            Job::AddWasmModule { config } => &config.descriptor.name,
-            Job::RemoveWasmModule { request } => &request.uuid_string,
             Job::AddTokenizer { config } => &config.id,
             Job::RemoveTokenizer { request } => &request.id,
         }
@@ -325,69 +302,31 @@ impl JobQueue {
                 let timeout_duration =
                     Duration::from_secs(context.config.workers.startup_timeout_secs + 30);
 
-                // Select workflow based on runtime field
-                match config.runtime.as_deref() {
-                    Some("external") => {
-                        let workflow_data = create_external_worker_workflow_data(
-                            (**config).clone(),
-                            Arc::clone(context),
-                            router_manager.clone(),
-                        );
-                        let instance_id = engines
-                            .external_worker
-                            .start_workflow(
-                                WorkflowId::new("external_worker_registration"),
-                                workflow_data,
-                            )
-                            .await
-                            .map_err(|e| {
-                                format!(
-                                    "Failed to start external worker registration workflow: {:?}",
-                                    e
-                                )
-                            })?;
+                let workflow_data = create_local_worker_workflow_data(
+                    (**config).clone(),
+                    Arc::clone(context),
+                    router_manager,
+                );
+                let instance_id = engines
+                    .local_worker
+                    .start_workflow(WorkflowId::new("local_worker_registration"), workflow_data)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Failed to start local worker registration workflow: {:?}",
+                            e
+                        )
+                    })?;
 
-                        debug!(
-                            "Started external worker registration workflow for {} (instance: {})",
-                            config.url, instance_id
-                        );
+                debug!(
+                    "Started local worker registration workflow for {} (instance: {})",
+                    config.url, instance_id
+                );
 
-                        engines
-                            .external_worker
-                            .wait_for_completion(instance_id, &config.url, timeout_duration)
-                            .await
-                    }
-                    _ => {
-                        let workflow_data = create_local_worker_workflow_data(
-                            (**config).clone(),
-                            Arc::clone(context),
-                            router_manager,
-                        );
-                        let instance_id = engines
-                            .local_worker
-                            .start_workflow(
-                                WorkflowId::new("local_worker_registration"),
-                                workflow_data,
-                            )
-                            .await
-                            .map_err(|e| {
-                                format!(
-                                    "Failed to start local worker registration workflow: {:?}",
-                                    e
-                                )
-                            })?;
-
-                        debug!(
-                            "Started local worker registration workflow for {} (instance: {})",
-                            config.url, instance_id
-                        );
-
-                        engines
-                            .local_worker
-                            .wait_for_completion(instance_id, &config.url, timeout_duration)
-                            .await
-                    }
-                }
+                engines
+                    .local_worker
+                    .wait_for_completion(instance_id, &config.url, timeout_duration)
+                    .await
             }
             Job::UpdateWorker { url, update } => {
                 let engines = context
@@ -456,79 +395,13 @@ impl JobQueue {
 
                 result
             }
-            Job::AddWasmModule { config } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
-
-                let workflow_data =
-                    create_wasm_registration_workflow_data(*config.clone(), Arc::clone(context));
-
-                let instance_id = engines
-                    .wasm_registration
-                    .start_workflow(WorkflowId::new("wasm_module_registration"), workflow_data)
-                    .await
-                    .map_err(|e| {
-                        format!("Failed to start WASM module registration workflow: {:?}", e)
-                    })?;
-
-                debug!(
-                    "Started WASM module registration workflow for {} (instance: {})",
-                    config.descriptor.name, instance_id
-                );
-
-                let timeout_duration = Duration::from_secs(300); // 5 minutes
-
-                engines
-                    .wasm_registration
-                    .wait_for_completion(instance_id, &config.descriptor.name, timeout_duration)
-                    .await
-            }
-            Job::RemoveWasmModule { request } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
-
-                let workflow_data =
-                    create_wasm_removal_workflow_data(*request.clone(), Arc::clone(context));
-
-                let instance_id = engines
-                    .wasm_removal
-                    .start_workflow(WorkflowId::new("wasm_module_removal"), workflow_data)
-                    .await
-                    .map_err(|e| {
-                        format!("Failed to start WASM module removal workflow: {:?}", e)
-                    })?;
-
-                debug!(
-                    "Started WASM module removal workflow for {} (instance: {})",
-                    request.module_uuid, instance_id
-                );
-
-                let timeout_duration = Duration::from_secs(60); // 1 minute
-
-                engines
-                    .wasm_removal
-                    .wait_for_completion(
-                        instance_id,
-                        &request.module_uuid.to_string(),
-                        timeout_duration,
-                    )
-                    .await
-            }
             Job::InitializeWorkersFromConfig {
                 gateway_config: config,
             } => {
                 let api_key = config.server.api_key.clone();
 
-                let mut worker_specs: Vec<(
-                    String,
-                    &'static str,
-                    Option<u16>,
-                    Option<&'static str>,
-                )> = Vec::new();
+                let mut worker_specs: Vec<(String, &'static str, Option<u16>, Option<String>)> =
+                    Vec::new();
 
                 // Regular workers
                 worker_specs.extend(
@@ -537,19 +410,20 @@ impl JobQueue {
                         .regular_urls
                         .iter()
                         .cloned()
-                        .map(|url| (url, "regular", None, None)),
+                        .map(|url| (url, "regular", None, config.workers.runtime.clone())),
                 );
 
                 // Prefill workers
-                worker_specs.extend(
-                    config
-                        .workers
-                        .prefill_urls
-                        .iter()
-                        .map(|(url, bootstrap_port)| {
-                            (url.clone(), "prefill", *bootstrap_port, None)
-                        }),
-                );
+                worker_specs.extend(config.workers.prefill_urls.iter().map(
+                    |(url, bootstrap_port)| {
+                        (
+                            url.clone(),
+                            "prefill",
+                            *bootstrap_port,
+                            config.workers.runtime.clone(),
+                        )
+                    },
+                ));
 
                 // Decode workers
                 worker_specs.extend(
@@ -558,17 +432,7 @@ impl JobQueue {
                         .decode_urls
                         .iter()
                         .cloned()
-                        .map(|url| (url, "decode", None, None)),
-                );
-
-                // OpenAI workers
-                worker_specs.extend(
-                    config
-                        .workers
-                        .openai_urls
-                        .iter()
-                        .cloned()
-                        .map(|url| (url, "regular", None, Some("external"))),
+                        .map(|url| (url, "decode", None, config.workers.runtime.clone())),
                 );
 
                 debug!(
@@ -589,7 +453,7 @@ impl JobQueue {
                     }
 
                     let preferred_context_tokens = match worker_type {
-                        "regular" if runtime != Some("external") => {
+                        "regular" if runtime.as_deref() != Some("external") => {
                             config.workers.regular_preferred_context_tokens
                         }
                         "prefill" => config.workers.pd_preferred_context_tokens,
@@ -602,13 +466,16 @@ impl JobQueue {
                             tokens.to_string(),
                         );
                     }
+                    let is_external = runtime.as_deref() == Some("external");
 
                     let worker_config = WorkerConfigRequest {
                         url,
                         api_key: api_key.clone(),
 
                         worker_type: Some(worker_type.to_string()),
-                        runtime: runtime.map(str::to_string),
+                        runtime,
+                        kv_connector: config.workers.kv_connector.clone(),
+                        kv_engine_id: config.workers.kv_engine_id.clone(),
 
                         labels,
                         model_id: None,
@@ -630,7 +497,7 @@ impl JobQueue {
 
                         max_connection_attempts: health_check.success_threshold.saturating_mul(10),
 
-                        dp_aware: if runtime == Some("external") {
+                        dp_aware: if is_external {
                             false
                         } else {
                             config.routing.dp_aware
@@ -657,67 +524,6 @@ impl JobQueue {
                 }
 
                 Ok(format!("Submitted {} AddWorker jobs", submitted_count))
-            }
-            Job::InitializeMcpServers { mcp_config } => {
-                let mut server_count = 0;
-
-                debug!(
-                    "Creating RegisterMcpServer jobs for {} MCP servers from config",
-                    mcp_config.servers.len()
-                );
-
-                // Submit RegisterMcpServer jobs for each server in the config
-                for server_config in &mcp_config.servers {
-                    let mcp_server_request = McpServerConfigRequest {
-                        name: server_config.name.clone(),
-                        config: server_config.clone(),
-                    };
-
-                    let job = Job::RegisterMcpServer {
-                        config: Box::new(mcp_server_request),
-                    };
-
-                    if let Some(queue) = context.worker_job_queue.get() {
-                        queue.submit(job).await.map_err(|e| {
-                            format!(
-                                "Failed to submit RegisterMcpServer job for '{}': {}",
-                                server_config.name, e
-                            )
-                        })?;
-                        server_count += 1;
-                    } else {
-                        return Err("JobQueue not available".to_string());
-                    }
-                }
-
-                Ok(format!("Submitted {} RegisterMcpServer jobs", server_count))
-            }
-            Job::RegisterMcpServer { config } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
-
-                let workflow_data =
-                    create_mcp_workflow_data((**config).clone(), Arc::clone(context));
-
-                let instance_id = engines
-                    .mcp
-                    .start_workflow(WorkflowId::new("mcp_registration"), workflow_data)
-                    .await
-                    .map_err(|e| format!("Failed to start MCP registration workflow: {:?}", e))?;
-
-                debug!(
-                    "Started MCP registration workflow for {} (instance: {})",
-                    config.name, instance_id
-                );
-
-                let timeout_duration = Duration::from_secs(7200 + 30); // 2hr + margin
-
-                engines
-                    .mcp
-                    .wait_for_completion(instance_id, &config.name, timeout_duration)
-                    .await
             }
             Job::AddTokenizer { config } => {
                 let engines = context

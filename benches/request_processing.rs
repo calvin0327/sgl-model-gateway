@@ -33,7 +33,7 @@ fn get_bootstrap_info(worker: &BasicWorker) -> (String, Option<u16>) {
 fn default_generate_request() -> GenerateRequest {
     GenerateRequest {
         text: None,
-        model: None,
+        model: String::new(),
         input_ids: None,
         input_embeds: None,
         image_data: None,
@@ -67,6 +67,7 @@ fn default_generate_request() -> GenerateRequest {
         return_bytes: false,
         return_entropy: false,
         rid: None,
+        other: serde_json::Map::new(),
     }
 }
 
@@ -121,6 +122,7 @@ fn default_completion_request() -> CompletionRequest {
         session_params: None,
         return_hidden_states: false,
         sampling_seed: None,
+        rid: None,
         other: serde_json::Map::new(),
     }
 }

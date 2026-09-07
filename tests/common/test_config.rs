@@ -4,8 +4,8 @@
 //! for common test scenarios.
 
 use smg::config::{
-    CircuitBreakerConfig, ConfigResult, GatewayConfig, HistoryBackend, ManualAssignmentMode,
-    OracleConfig, PolicyConfig, RetryConfig,
+    CircuitBreakerConfig, ConfigResult, GatewayConfig, ManualAssignmentMode, PolicyConfig,
+    RetryConfig,
 };
 
 use super::mock_worker::{HealthStatus, MockWorkerConfig, WorkerType};
@@ -286,17 +286,6 @@ impl TestGatewayConfigBuilder {
     pub fn enable_trace(mut self, endpoint: impl Into<String>) -> Self {
         self.config.observability.enable_trace = true;
         self.config.observability.otlp_traces_endpoint = endpoint.into();
-        self
-    }
-
-    pub fn history_backend(mut self, history_backend: HistoryBackend) -> Self {
-        self.config.storage.history_backend = history_backend;
-        self
-    }
-
-    pub fn oracle_history(mut self, oracle: OracleConfig) -> Self {
-        self.config.storage.history_backend = HistoryBackend::Oracle;
-        self.config.storage.oracle = Some(oracle);
         self
     }
 

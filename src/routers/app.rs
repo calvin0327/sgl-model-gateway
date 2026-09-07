@@ -7,21 +7,15 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use smg_mesh::{RateLimitConfig, GLOBAL_RATE_LIMIT_COUNTER_KEY, GLOBAL_RATE_LIMIT_KEY};
-use tracing::{info, warn};
-use uuid::Uuid;
+use serde::Deserialize;
+use serde_json::json;
+use validator::Validate;
 
 use crate::{
     app_state::AppState,
-    core::{
-        job_queue::Job,
-        steps::{WasmModuleConfigRequest, WasmModuleRemovalRequest},
-        worker_manager::WorkerManager,
-        UNKNOWN_MODEL_ID,
-    },
+    core::{worker_manager::WorkerManager, UNKNOWN_MODEL_ID},
     middleware::{self, AuthConfig},
+    protocol_compat::{ResponsesGetParams, WorkerConfigRequest, WorkerUpdateRequest},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -30,16 +24,11 @@ use crate::{
         generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, V1RerankReqInput},
-        responses::{ResponsesGetParams, ResponsesRequest},
+        responses::ResponsesRequest,
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-        validated::ValidatedJson,
-        worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
+        validated::{Normalizable, ValidatedJson},
     },
-    routers::{conversations, parse, tokenize},
-    wasm::{
-        WasmMetrics, WasmModuleAddRequest, WasmModuleAddResponse, WasmModuleAddResult,
-        WasmModuleListResponse,
-    },
+    routers::{parse, tokenize},
 };
 
 fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLayer {
@@ -76,7 +65,7 @@ async fn generate(
     headers: HeaderMap,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
-    let model_id = body.model.as_deref();
+    let model_id = Some(body.model.as_str());
     state
         .router
         .route_generate(Some(&headers), &body, model_id)
@@ -143,8 +132,27 @@ struct RerankRequestInput {
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
+    Json(mut body): Json<ResponsesRequest>,
 ) -> Response {
+    let store_was_specified = body.store.is_some();
+    body.normalize();
+    if let Err(errors) = body.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": errors.to_string(),
+                    "type": "invalid_request_error",
+                    "code": 400
+                }
+            })),
+        )
+            .into_response();
+    }
+    if !store_was_specified {
+        body.store = Some(false);
+    }
+
     state
         .router
         .route_responses(Some(&headers), &body, Some(&body.model))
@@ -351,110 +359,6 @@ async fn update_worker(
     }
 }
 
-async fn v1_conversations_create(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Response {
-    conversations::create_conversation(&state.context.conversation_storage, body).await
-}
-
-async fn v1_conversations_get(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<String>,
-) -> Response {
-    conversations::get_conversation(&state.context.conversation_storage, &conversation_id).await
-}
-
-async fn v1_conversations_update(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<String>,
-    Json(body): Json<Value>,
-) -> Response {
-    conversations::update_conversation(&state.context.conversation_storage, &conversation_id, body)
-        .await
-}
-
-async fn v1_conversations_delete(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<String>,
-) -> Response {
-    conversations::delete_conversation(&state.context.conversation_storage, &conversation_id).await
-}
-
-#[derive(Deserialize, Default)]
-struct ListItemsQuery {
-    limit: Option<usize>,
-    order: Option<String>,
-    after: Option<String>,
-}
-
-async fn v1_conversations_list_items(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<String>,
-    Query(ListItemsQuery {
-        limit,
-        order,
-        after,
-    }): Query<ListItemsQuery>,
-) -> Response {
-    conversations::list_conversation_items(
-        &state.context.conversation_storage,
-        &state.context.conversation_item_storage,
-        &conversation_id,
-        limit,
-        order.as_deref(),
-        after.as_deref(),
-    )
-    .await
-}
-
-#[derive(Deserialize, Default)]
-struct GetItemQuery {
-    include: Option<Vec<String>>,
-}
-
-async fn v1_conversations_create_items(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<String>,
-    Json(body): Json<Value>,
-) -> Response {
-    conversations::create_conversation_items(
-        &state.context.conversation_storage,
-        &state.context.conversation_item_storage,
-        &conversation_id,
-        body,
-    )
-    .await
-}
-
-async fn v1_conversations_get_item(
-    State(state): State<Arc<AppState>>,
-    Path((conversation_id, item_id)): Path<(String, String)>,
-    Query(query): Query<GetItemQuery>,
-) -> Response {
-    conversations::get_conversation_item(
-        &state.context.conversation_storage,
-        &state.context.conversation_item_storage,
-        &conversation_id,
-        &item_id,
-        query.include,
-    )
-    .await
-}
-
-async fn v1_conversations_delete_item(
-    State(state): State<Arc<AppState>>,
-    Path((conversation_id, item_id)): Path<(String, String)>,
-) -> Response {
-    conversations::delete_conversation_item(
-        &state.context.conversation_storage,
-        &state.context.conversation_item_storage,
-        &conversation_id,
-        &item_id,
-    )
-    .await
-}
-
 async fn parse_function_call_http(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ParseFunctionCallRequest>,
@@ -515,568 +419,6 @@ async fn v1_tokenizers_remove(
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ClusterStatusResponse {
-    node_name: String,
-    node_count: usize,
-    nodes: Vec<NodeInfo>,
-    stores: StoreStatus,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct NodeInfo {
-    name: String,
-    address: String,
-    status: String,
-    version: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct StoreStatus {
-    membership_count: usize,
-    worker_count: usize,
-    policy_count: usize,
-    app_count: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct MeshHealthResponse {
-    status: String,
-    node_name: String,
-    cluster_size: usize,
-    stores_healthy: bool,
-}
-
-async fn get_cluster_status(State(app_state): State<Arc<AppState>>) -> Response {
-    let handler = match &app_state.mesh_handler {
-        Some(handler) => handler,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "mesh not enabled"})),
-            )
-                .into_response();
-        }
-    };
-    let state = handler.state.read();
-    let nodes: Vec<NodeInfo> = state
-        .values()
-        .map(|node| NodeInfo {
-            name: node.name.clone(),
-            address: node.address.clone(),
-            status: format!("{:?}", node.status),
-            version: node.version,
-        })
-        .collect();
-    let stores = StoreStatus {
-        membership_count: state.len(),
-        worker_count: 0,
-        policy_count: 0,
-        app_count: 0,
-    };
-
-    (
-        StatusCode::OK,
-        Json(ClusterStatusResponse {
-            node_name: handler.self_name.clone(),
-            node_count: nodes.len(),
-            nodes,
-            stores,
-        }),
-    )
-        .into_response()
-}
-
-async fn get_mesh_health(State(app_state): State<Arc<AppState>>) -> Response {
-    let handler = match &app_state.mesh_handler {
-        Some(handler) => handler,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "mesh not enabled"})),
-            )
-                .into_response();
-        }
-    };
-    let cluster_size = handler.state.read().len();
-    (
-        StatusCode::OK,
-        Json(MeshHealthResponse {
-            status: "healthy".to_string(),
-            node_name: handler.self_name.clone(),
-            cluster_size,
-            stores_healthy: true,
-        }),
-    )
-        .into_response()
-}
-
-async fn get_worker_states(State(app_state): State<Arc<AppState>>) -> Response {
-    match &app_state.mesh_sync_manager {
-        Some(manager) => (StatusCode::OK, Json(manager.get_all_worker_states())).into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "mesh sync manager not available"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn get_policy_states(State(app_state): State<Arc<AppState>>) -> Response {
-    match &app_state.mesh_sync_manager {
-        Some(manager) => (StatusCode::OK, Json(manager.get_all_policy_states())).into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "mesh sync manager not available"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn get_worker_state(
-    Path(worker_id): Path<String>,
-    State(app_state): State<Arc<AppState>>,
-) -> Response {
-    match &app_state.mesh_sync_manager {
-        Some(manager) => match manager.get_worker_state(&worker_id) {
-            Some(state) => (StatusCode::OK, Json(state)).into_response(),
-            None => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "Worker not found"})),
-            )
-                .into_response(),
-        },
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "mesh sync manager not available"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn get_policy_state(
-    Path(model_id): Path<String>,
-    State(app_state): State<Arc<AppState>>,
-) -> Response {
-    match &app_state.mesh_sync_manager {
-        Some(manager) => match manager.get_policy_state(&model_id) {
-            Some(state) => (StatusCode::OK, Json(state)).into_response(),
-            None => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "Policy not found"})),
-            )
-                .into_response(),
-        },
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "mesh sync manager not available"})),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateAppConfigRequest {
-    key: String,
-    value: String,
-}
-
-async fn update_app_config(
-    State(app_state): State<Arc<AppState>>,
-    Json(request): Json<UpdateAppConfigRequest>,
-) -> Response {
-    let handler = match &app_state.mesh_handler {
-        Some(handler) => handler,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "mesh not enabled"})),
-            )
-                .into_response();
-        }
-    };
-
-    let value = if request.value.len() % 2 == 0 {
-        match (0..request.value.len())
-            .step_by(2)
-            .map(|index| u8::from_str_radix(&request.value[index..index + 2], 16))
-            .collect::<Result<Vec<u8>, _>>()
-        {
-            Ok(value) => value,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "Invalid hex encoding"})),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Hex string must have even length"})),
-        )
-            .into_response();
-    };
-
-    handler.write_data(request.key.clone(), value);
-    info!(key = %request.key, "Updated mesh app config");
-    (
-        StatusCode::OK,
-        Json(json!({"status": "updated", "key": request.key})),
-    )
-        .into_response()
-}
-
-async fn get_app_config(
-    Path(key): Path<String>,
-    State(app_state): State<Arc<AppState>>,
-) -> Response {
-    let handler = match &app_state.mesh_handler {
-        Some(handler) => handler,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "mesh not enabled"})),
-            )
-                .into_response();
-        }
-    };
-
-    match handler.read_data(key.clone()) {
-        Some(value) => {
-            let hex_value: String = value.iter().map(|byte| format!("{byte:02x}")).collect();
-            (
-                StatusCode::OK,
-                Json(json!({"key": key, "value": hex_value, "format": "hex"})),
-            )
-                .into_response()
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Config not found"})),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct SetRateLimitRequest {
-    limit_per_second: u64,
-}
-
-async fn set_global_rate_limit(
-    State(app_state): State<Arc<AppState>>,
-    Json(request): Json<SetRateLimitRequest>,
-) -> Response {
-    let config = RateLimitConfig {
-        limit_per_second: request.limit_per_second,
-    };
-    let config_bytes = match serde_json::to_vec(&config) {
-        Ok(config_bytes) => config_bytes,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Failed to serialize rate limit config"})),
-            )
-                .into_response();
-        }
-    };
-    let handler = match &app_state.mesh_handler {
-        Some(handler) => handler,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "mesh not enabled"})),
-            )
-                .into_response();
-        }
-    };
-
-    handler.write_data(GLOBAL_RATE_LIMIT_KEY.to_string(), config_bytes);
-    info!(
-        limit_per_second = request.limit_per_second,
-        "Set global rate limit"
-    );
-    (
-        StatusCode::OK,
-        Json(json!({
-            "status": "updated",
-            "limit_per_second": request.limit_per_second
-        })),
-    )
-        .into_response()
-}
-
-async fn get_global_rate_limit(State(app_state): State<Arc<AppState>>) -> Response {
-    let handler = match &app_state.mesh_handler {
-        Some(handler) => handler,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "mesh not enabled"})),
-            )
-                .into_response();
-        }
-    };
-
-    match handler.read_data(GLOBAL_RATE_LIMIT_KEY.to_string()) {
-        Some(value) => match serde_json::from_slice::<RateLimitConfig>(&value) {
-            Ok(config) => (
-                StatusCode::OK,
-                Json(json!({"limit_per_second": config.limit_per_second})),
-            )
-                .into_response(),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Failed to deserialize rate limit config"})),
-            )
-                .into_response(),
-        },
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Global rate limit not configured"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn get_global_rate_limit_stats(State(app_state): State<Arc<AppState>>) -> Response {
-    let sync_manager = match &app_state.mesh_sync_manager {
-        Some(manager) => manager,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "mesh sync manager not available"})),
-            )
-                .into_response();
-        }
-    };
-    let handler = match &app_state.mesh_handler {
-        Some(handler) => handler,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "mesh not enabled"})),
-            )
-                .into_response();
-        }
-    };
-    let config = handler
-        .read_data(GLOBAL_RATE_LIMIT_KEY.to_string())
-        .and_then(|value| serde_json::from_slice::<RateLimitConfig>(&value).ok())
-        .unwrap_or_default();
-    let current_count = sync_manager
-        .get_rate_limit_value(GLOBAL_RATE_LIMIT_COUNTER_KEY)
-        .unwrap_or(0);
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "limit_per_second": config.limit_per_second,
-            "current_count": current_count,
-            "remaining": if config.limit_per_second > 0 {
-                (config.limit_per_second as i64).saturating_sub(current_count).max(0)
-            } else {
-                -1
-            }
-        })),
-    )
-        .into_response()
-}
-
-async fn trigger_graceful_shutdown(State(app_state): State<Arc<AppState>>) -> Response {
-    let handler = match &app_state.mesh_handler {
-        Some(handler) => handler.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "mesh not enabled"})),
-            )
-                .into_response();
-        }
-    };
-    info!("Graceful shutdown triggered via API");
-    tokio::spawn(async move {
-        if let Err(error) = handler.graceful_shutdown().await {
-            warn!(%error, "Mesh graceful shutdown failed");
-        }
-    });
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"status": "shutdown initiated"})),
-    )
-        .into_response()
-}
-
-async fn wait_for_wasm_job_completion(
-    job_queue: &crate::core::job_queue::JobQueue,
-    status_key: &str,
-    timeout: Duration,
-) -> Result<(), String> {
-    let start = std::time::Instant::now();
-    let mut poll_interval = Duration::from_millis(100);
-    let max_poll_interval = Duration::from_secs(2);
-    let poll_backoff = Duration::from_millis(200);
-
-    loop {
-        if start.elapsed() > timeout {
-            return Err(format!("Job timeout after {}s", timeout.as_secs()));
-        }
-
-        match job_queue.get_status(status_key) {
-            Some(job_status) => match job_status.status.as_str() {
-                "pending" | "processing" => {
-                    tokio::time::sleep(poll_interval).await;
-                    poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
-                }
-                "failed" => {
-                    let error = job_status
-                        .message
-                        .unwrap_or_else(|| "Unknown error".to_string());
-                    job_queue.remove_status(status_key);
-                    return Err(error);
-                }
-                _ => {
-                    job_queue.remove_status(status_key);
-                    return Err("Unexpected job status".to_string());
-                }
-            },
-            // Successful jobs remove their status record during completion.
-            None => return Ok(()),
-        }
-    }
-}
-
-async fn add_wasm_module(
-    State(state): State<Arc<AppState>>,
-    Json(config): Json<WasmModuleAddRequest>,
-) -> Response {
-    if state.context.wasm_manager.is_none() || state.context.worker_job_queue.get().is_none() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    let job_queue = state.context.worker_job_queue.get().expect("checked above");
-    let mut status = StatusCode::OK;
-    let mut modules = config.modules.clone();
-
-    for module in &mut modules {
-        let job = Job::AddWasmModule {
-            config: Box::new(WasmModuleConfigRequest {
-                descriptor: module.clone(),
-            }),
-        };
-        let worker_url = job.worker_url().to_string();
-
-        match job_queue.submit(job).await {
-            Ok(()) => {
-                match wait_for_wasm_job_completion(job_queue, &worker_url, Duration::from_secs(300))
-                    .await
-                {
-                    Ok(()) => {
-                        let result = state
-                            .context
-                            .wasm_manager
-                            .as_ref()
-                            .and_then(|manager| manager.get_modules().ok())
-                            .and_then(|modules| {
-                                modules
-                                    .iter()
-                                    .find(|registered| registered.module_meta.name == module.name)
-                                    .map(|registered| registered.module_uuid)
-                            });
-                        match result {
-                            Some(module_uuid) => {
-                                module.add_result = Some(WasmModuleAddResult::Success(module_uuid));
-                            }
-                            None => {
-                                module.add_result = Some(WasmModuleAddResult::Error(
-                                    "Module registered but UUID not found".to_string(),
-                                ));
-                                status = StatusCode::BAD_REQUEST;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        module.add_result = Some(WasmModuleAddResult::Error(error));
-                        status = StatusCode::BAD_REQUEST;
-                    }
-                }
-            }
-            Err(error) => {
-                module.add_result = Some(WasmModuleAddResult::Error(format!(
-                    "Failed to submit job: {error}"
-                )));
-                status = StatusCode::BAD_REQUEST;
-            }
-        }
-    }
-
-    (status, Json(WasmModuleAddResponse { modules })).into_response()
-}
-
-async fn remove_wasm_module(
-    State(state): State<Arc<AppState>>,
-    Path(module_uuid): Path<String>,
-) -> Response {
-    let Ok(module_uuid) = Uuid::parse_str(&module_uuid) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    if state.context.wasm_manager.is_none() || state.context.worker_job_queue.get().is_none() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    let job_queue = state.context.worker_job_queue.get().expect("checked above");
-    let job = Job::RemoveWasmModule {
-        request: Box::new(WasmModuleRemovalRequest::new(module_uuid)),
-    };
-    let worker_url = job.worker_url().to_string();
-
-    match job_queue.submit(job).await {
-        Ok(()) => {
-            match wait_for_wasm_job_completion(job_queue, &worker_url, Duration::from_secs(60))
-                .await
-            {
-                Ok(()) => (StatusCode::OK, "Module removed successfully").into_response(),
-                Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
-            }
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to submit job: {error}"),
-        )
-            .into_response(),
-    }
-}
-
-async fn list_wasm_modules(State(state): State<Arc<AppState>>) -> Response {
-    let Some(wasm_manager) = state.context.wasm_manager.as_ref() else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    match wasm_manager.get_modules() {
-        Ok(modules) => {
-            let (total, successful, failed, total_time_ms, max_time_ms) =
-                wasm_manager.get_metrics();
-            let average_execution_time_ms =
-                (total > 0).then_some(total_time_ms as f64 / total as f64);
-            (
-                StatusCode::OK,
-                Json(WasmModuleListResponse {
-                    modules,
-                    metrics: WasmMetrics {
-                        total_executions: total,
-                        successful_executions: successful,
-                        failed_executions: failed,
-                        total_execution_time_ms: total_time_ms,
-                        max_execution_time_ms: max_time_ms,
-                        average_execution_time_ms,
-                    },
-                }),
-            )
-                .into_response()
-        }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-
 pub fn build_app(
     app_state: Arc<AppState>,
     auth_config: AuthConfig,
@@ -1103,21 +445,6 @@ pub fn build_app(
             "/v1/responses/{response_id}/input_items",
             get(v1_responses_list_input_items),
         )
-        .route("/v1/conversations", post(v1_conversations_create))
-        .route(
-            "/v1/conversations/{conversation_id}",
-            get(v1_conversations_get)
-                .post(v1_conversations_update)
-                .delete(v1_conversations_delete),
-        )
-        .route(
-            "/v1/conversations/{conversation_id}/items",
-            get(v1_conversations_list_items).post(v1_conversations_create_items),
-        )
-        .route(
-            "/v1/conversations/{conversation_id}/items/{item_id}",
-            get(v1_conversations_get_item).delete(v1_conversations_delete_item),
-        )
         // Tokenize / Detokenize endpoints
         .route("/v1/tokenize", post(v1_tokenize))
         .route("/v1/detokenize", post(v1_detokenize))
@@ -1128,10 +455,6 @@ pub fn build_app(
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
-        ))
-        .route_layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            middleware::wasm_middleware,
         ));
 
     let public_routes = Router::new()
@@ -1156,9 +479,6 @@ pub fn build_app(
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call_http))
         .route("/parse/reasoning", post(parse_reasoning_http))
-        .route("/wasm", post(add_wasm_module))
-        .route("/wasm/{module_uuid}", delete(remove_wasm_module))
-        .route("/wasm", get(list_wasm_modules))
         // Tokenizer management endpoints
         .route(
             "/v1/tokenizers",
@@ -1198,31 +518,11 @@ pub fn build_app(
     let admin_routes = apply_control_plane_auth(admin_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
 
-    // HA management routes
-    let mesh_routes = Router::new()
-        .route("/ha/status", get(get_cluster_status))
-        .route("/ha/health", get(get_mesh_health))
-        .route("/ha/workers", get(get_worker_states))
-        .route("/ha/workers/{worker_id}", get(get_worker_state))
-        .route("/ha/policies", get(get_policy_states))
-        .route("/ha/policies/{model_id}", get(get_policy_state))
-        .route("/ha/config/{key}", get(get_app_config))
-        .route("/ha/config", post(update_app_config))
-        .route("/ha/rate-limit", post(set_global_rate_limit))
-        .route("/ha/rate-limit", get(get_global_rate_limit))
-        .route("/ha/rate-limit/stats", get(get_global_rate_limit_stats))
-        .route("/ha/shutdown", post(trigger_graceful_shutdown))
-        .route_layer(axum::middleware::from_fn_with_state(
-            auth_config.clone(),
-            middleware::auth_middleware,
-        ));
-
     Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
-        .merge(mesh_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,

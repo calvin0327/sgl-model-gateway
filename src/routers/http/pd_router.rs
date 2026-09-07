@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::BTreeSet, sync::Arc, time::Instant};
+use std::{borrow::Cow, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -17,12 +17,11 @@ use tracing::{debug, error, warn};
 
 use super::pd_types::api_path;
 use crate::{
-    config::RetryConfig,
     core::{
         is_retryable_status, pd_group_id,
         scheduler::{SchedulerOutput, WorkerSelection as ScheduledWorkerSelection},
-        ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
-        UNKNOWN_MODEL_ID,
+        worker::RuntimeType,
+        ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -39,9 +38,15 @@ use crate::{
         rerank::RerankRequest,
     },
     routers::{
-        current_scheduled_selection, error,
-        grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils,
+        common::kv_transfer::{
+            connector_mode_for_worker, mooncake_decode_params, mooncake_prefill_params,
+            KvConnectorMode,
+        },
+        current_scheduled_selection, error, header_utils,
+        http::{
+            error_type_from_status, route_to_endpoint,
+            router::{send_with_stale_conn_retry, strip_default_sglang_fields},
+        },
         streaming_utils::BreakerTrackedStream,
         RouterTrait,
     },
@@ -51,7 +56,6 @@ use crate::{
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub client: Client,
-    pub retry_config: RetryConfig,
     pub api_key: Option<String>,
 }
 
@@ -195,7 +199,6 @@ impl PDRouter {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             client: ctx.client.clone(),
-            retry_config: ctx.config.workers.effective_retry_config(),
             api_key: ctx.config.server.api_key.clone(),
         })
     }
@@ -366,6 +369,300 @@ impl PDRouter {
         Ok((prefill_request, decode_request))
     }
 
+    fn sampling_n(json: &Value) -> u64 {
+        json.get("n").and_then(Value::as_u64).unwrap_or(1)
+    }
+
+    fn sanitize_prefill_for_kv_handoff(json: &mut Value, route: &str) {
+        let Some(object) = json.as_object_mut() else {
+            return;
+        };
+
+        object.insert("stream".to_string(), Value::Bool(false));
+        object.remove("stream_options");
+        if object.contains_key("n") {
+            object.insert("n".to_string(), Value::from(1));
+        }
+        object.remove("min_tokens");
+        match route {
+            "/v1/chat/completions" if object.contains_key("max_completion_tokens") => {
+                object.insert("max_completion_tokens".to_string(), Value::from(1));
+                object.remove("max_tokens");
+            }
+            "/v1/responses" => {
+                object.insert("max_output_tokens".to_string(), Value::from(1));
+            }
+            _ => {
+                object.insert("max_tokens".to_string(), Value::from(1));
+            }
+        }
+    }
+
+    async fn execute_vllm_sequential_dispatch(
+        &self,
+        headers: Option<&HeaderMap>,
+        json_request: Value,
+        context: PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    ) -> Response {
+        let mode = connector_mode_for_worker(prefill.as_ref());
+        let transfer_id = match &mode {
+            KvConnectorMode::Mooncake {
+                engine_id: Some(_), ..
+            } => Some(format!("xfer-{}", uuid::Uuid::new_v4())),
+            _ => None,
+        };
+
+        let mut prefill_json = json_request.clone();
+        let mut decode_json = json_request;
+        strip_default_sglang_fields(&mut prefill_json);
+        strip_default_sglang_fields(&mut decode_json);
+
+        let relay = Self::sampling_n(&decode_json) <= 1;
+        Self::sanitize_prefill_for_kv_handoff(&mut prefill_json, context.route);
+        if relay {
+            let params: Option<Value> = match (&mode, &transfer_id) {
+                (KvConnectorMode::Nixl, _) => Some(json!({
+                    "do_remote_decode": true,
+                    "do_remote_prefill": false,
+                })),
+                (KvConnectorMode::Mooncake { .. }, Some(transfer_id)) => {
+                    Some(mooncake_prefill_params(transfer_id))
+                }
+                _ => None,
+            };
+            if let (Some(object), Some(params)) = (prefill_json.as_object_mut(), params) {
+                object.insert("kv_transfer_params".to_string(), params);
+            }
+        }
+
+        let prefill_request = match Self::prepare_worker_request(
+            context.route,
+            prefill.as_ref(),
+            Cow::Owned(prefill_json),
+        )
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => return error::internal_error("pd_request_preparation_failed", error),
+        };
+        let decode_request = match Self::prepare_worker_request(
+            context.route,
+            decode.as_ref(),
+            Cow::Owned(decode_json),
+        )
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => return error::internal_error("pd_request_preparation_failed", error),
+        };
+
+        self.execute_vllm_sequential_dispatch_internal(
+            headers,
+            prefill_request.body.into_owned(),
+            decode_request.body.into_owned(),
+            mode,
+            transfer_id,
+            context,
+            prefill,
+            decode,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_vllm_sequential_dispatch_internal(
+        &self,
+        headers: Option<&HeaderMap>,
+        prefill_json: Value,
+        mut decode_json: Value,
+        mode: KvConnectorMode,
+        transfer_id: Option<String>,
+        context: PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    ) -> Response {
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
+        let relay = Self::sampling_n(&decode_json) <= 1;
+
+        let harvested = if relay {
+            events::RequestPDSentEvent {
+                prefill_url: prefill.url(),
+                decode_url: decode.url(),
+            }
+            .emit();
+
+            let prefill_request = self.build_post_with_headers(
+                &self.client,
+                &Self::worker_endpoint_url(prefill.as_ref(), context.route),
+                &prefill_json,
+                headers,
+                prefill.api_key().as_deref(),
+                false,
+            );
+            let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    prefill.record_outcome(false);
+                    let mut response = error::bad_gateway(
+                        "prefill_request_failed",
+                        format!("Prefill transport error: {}", error),
+                    );
+                    response.extensions_mut().insert(BreakerOutcomesRecorded);
+                    return response;
+                }
+            };
+
+            let status = StatusCode::from_u16(prefill_response.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            if !status.is_success() {
+                prefill.record_outcome(status.is_client_error());
+                let mut response = Self::prefill_error_response(status, prefill_response).await;
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                return response;
+            }
+
+            let prefill_body = match prefill_response.bytes().await {
+                Ok(body) => body,
+                Err(error) => {
+                    prefill.record_outcome(false);
+                    let mut response = error::bad_gateway(
+                        "prefill_read_failed",
+                        format!("Failed to read prefill response: {}", error),
+                    );
+                    response.extensions_mut().insert(BreakerOutcomesRecorded);
+                    return response;
+                }
+            };
+            prefill.record_outcome(true);
+
+            serde_json::from_slice::<Value>(&prefill_body)
+                .ok()
+                .and_then(|json| json.get("kv_transfer_params").cloned())
+                .filter(|params| !params.is_null())
+        } else {
+            debug!("vLLM PD with n>1 cannot consume a KV handoff; dispatching decode only");
+            None
+        };
+
+        let decode_params: Option<Value> = match (&mode, harvested) {
+            (
+                KvConnectorMode::Mooncake {
+                    host,
+                    port,
+                    engine_id: Some(engine_id),
+                },
+                _,
+            ) if relay && transfer_id.is_some() => {
+                let transfer_id = transfer_id.as_deref().unwrap_or_default();
+                Some(mooncake_decode_params(transfer_id, engine_id, host, *port))
+            }
+            (KvConnectorMode::Mooncake { .. }, _) => {
+                warn!("vLLM Mooncake PD without an engine ID; decode recomputes the prompt");
+                None
+            }
+            (KvConnectorMode::Nixl | KvConnectorMode::Passthrough, Some(params)) => Some(params),
+            (KvConnectorMode::Nixl, None) => {
+                warn!("vLLM NIXL PD returned no kv_transfer_params; decode recomputes the prompt");
+                None
+            }
+            _ => None,
+        };
+        if let (Some(object), Some(params)) = (decode_json.as_object_mut(), decode_params) {
+            object.insert("kv_transfer_params".to_string(), params);
+        }
+
+        let decode_request = self.build_post_with_headers(
+            &self.client,
+            &Self::worker_endpoint_url(decode.as_ref(), context.route),
+            &decode_json,
+            headers,
+            decode.api_key().as_deref(),
+            false,
+        );
+        let decode_response = match send_with_stale_conn_retry(decode_request).await {
+            Ok(response) => response,
+            Err(error) => {
+                decode.record_outcome(false);
+                let mut response = error::bad_gateway(
+                    "decode_request_failed",
+                    format!("Decode transport error: {}", error),
+                );
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                return response;
+            }
+        };
+
+        let status = StatusCode::from_u16(decode_response.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if !status.is_success() {
+            if !context.is_stream {
+                decode.record_outcome(status.is_client_error());
+            }
+            let mut response = self
+                .handle_decode_error_response(decode_response, &context, prefill, decode)
+                .await;
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            return response;
+        }
+
+        if context.is_stream {
+            let response_headers =
+                header_utils::preserve_response_headers(decode_response.headers());
+            let mut response = self.create_streaming_response(
+                decode_response.bytes_stream(),
+                status,
+                None,
+                false,
+                Some(response_headers),
+                prefill,
+                decode,
+            );
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            return response;
+        }
+
+        decode.record_outcome(true);
+        let response_headers = header_utils::preserve_response_headers(decode_response.headers());
+        let mut response = match decode_response.bytes().await {
+            Ok(body) => {
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = status;
+                *response.headers_mut() = response_headers;
+                response
+            }
+            Err(error) => {
+                decode.record_outcome(false);
+                error::internal_error(
+                    "read_response_failed",
+                    format!("Failed to read decode response: {}", error),
+                )
+            }
+        };
+        response.extensions_mut().insert(BreakerOutcomesRecorded);
+        response
+    }
+
+    async fn prefill_error_response(status: StatusCode, response: reqwest::Response) -> Response {
+        let message = match response.bytes().await {
+            Ok(body) => serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|json| {
+                    json.get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                        .or_else(|| json.get("message").and_then(Value::as_str))
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| String::from_utf8_lossy(&body).to_string()),
+            Err(error) => format!("Prefill server error: {}", error),
+        };
+        error::create_error(status, "prefill_upstream_error", message)
+    }
+
     async fn execute_dual_dispatch<T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -388,109 +685,72 @@ impl PDRouter {
             endpoint,
             bool_to_static_str(context.is_stream),
         );
-        // Clone request once outside the retry loop, then use Arc to share across attempts
-        // This avoids O(retries) clones by sharing the same data
-        let shared_request = Arc::new(original_request.clone());
-        // RouterManager owns request retries. Keep this execution path to a
-        // single attempt so PD dispatch cannot create nested retries.
-        let mut single_attempt_config = self.retry_config.clone();
-        single_attempt_config.max_retries = 1;
-        let response = RetryExecutor::execute_response_with_retry(
-            &single_attempt_config,
-            {
-                move |attempt: u32| {
-                    // Clone Arc (cheap reference count increment) instead of cloning the entire request
-                    let shared_request = Arc::clone(&shared_request);
-                    let context = context.clone();
-                    let selected_pair = selected_pair.clone();
-                    async move {
-                        let (prefill, decode) = selected_pair;
+        let (prefill, decode) = selected_pair;
 
-                        debug!(
-                            "PD retry attempt {} using prefill={} decode={}",
-                            attempt,
-                            prefill.url(),
-                            decode.url()
-                        );
+        let mut json_request = match serde_json::to_value(original_request) {
+            Ok(value) => value,
+            Err(error) => return Self::handle_serialization_error(error),
+        };
 
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
+        if prefill.metadata().runtime_type == RuntimeType::Vllm {
+            return self
+                .execute_vllm_sequential_dispatch(headers, json_request, context, prefill, decode)
+                .await;
+        }
 
-                        json_request = match Self::inject_bootstrap_into_value(
-                            json_request,
-                            prefill.as_ref(),
-                            context.batch_size,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
+        json_request = match Self::inject_bootstrap_into_value(
+            json_request,
+            prefill.as_ref(),
+            context.batch_size,
+        ) {
+            Ok(value) => value,
+            Err(error) => return Self::handle_serialization_error(error),
+        };
 
-                        let ctx_is_stream = context.is_stream;
-                        let response = self
-                            .execute_dual_dispatch_internal(
-                                headers,
-                                json_request,
-                                context,
-                                Arc::clone(&prefill),
-                                Arc::clone(&decode),
-                                start_time,
-                            )
-                            .await;
+        let is_stream = context.is_stream;
+        let response = self
+            .execute_dual_dispatch_internal(
+                headers,
+                json_request,
+                context,
+                Arc::clone(&prefill),
+                Arc::clone(&decode),
+                start_time,
+            )
+            .await;
 
-                        let status = response.status();
-                        let outcomes_already_recorded = response
-                            .extensions()
-                            .get::<BreakerOutcomesRecorded>()
-                            .is_some();
-                        if !outcomes_already_recorded {
-                            let not_error = status.is_success() || status.is_client_error();
-                            // Prefill is always non-streaming and fully read before
-                            // we get here, so its outcome is final.
-                            prefill.record_outcome(not_error);
-                            // Decode for a streaming request is still mid-flight at
-                            // this point; the `BreakerTrackedStream` wrapped around
-                            // its byte stream records the outcome on drop. Skip the
-                            // eager success record to avoid masking "200-then-broken"
-                            // decode workers.
-                            if !ctx_is_stream {
-                                decode.record_outcome(not_error);
-                            }
-                        }
+        let status = response.status();
+        let outcomes_already_recorded = response
+            .extensions()
+            .get::<BreakerOutcomesRecorded>()
+            .is_some();
+        if !outcomes_already_recorded {
+            let not_error = status.is_success() || status.is_client_error();
+            // Prefill is always non-streaming and fully read before we get
+            // here, so its outcome is final.
+            prefill.record_outcome(not_error);
+            // Decode for a streaming request is still mid-flight at this
+            // point; the stream wrapper records its final outcome on drop.
+            if !is_stream {
+                decode.record_outcome(not_error);
+            }
+        }
 
-                        // Record worker errors for server errors (5xx)
-                        if status.is_server_error() {
-                            let error_type = error_type_from_status(status);
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_PREFILL,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_DECODE,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
-                        }
+        if status.is_server_error() {
+            let error_type = error_type_from_status(status);
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_PREFILL,
+                metrics_labels::CONNECTION_HTTP,
+                error_type,
+            );
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_DECODE,
+                metrics_labels::CONNECTION_HTTP,
+                error_type,
+            );
+        }
 
-                        response
-                    }
-                }
-            },
-            |res, _attempt| is_retryable_status(res.status()),
-            |delay, attempt| {
-                // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
-                Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
-                Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
-                Metrics::record_worker_retry_backoff(attempt, delay);
-            },
-            || {
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
-            },
-        )
-        .await;
+        let response = response;
 
         // Record Layer 2 metrics
         let duration = start_time.elapsed();
@@ -697,6 +957,7 @@ impl PDRouter {
             &prepared_prefill.endpoint_url,
             &prepared_prefill.body,
             headers,
+            prefill.api_key().as_deref(),
             false,
         );
         let decode_request = self.build_post_with_headers(
@@ -704,6 +965,7 @@ impl PDRouter {
             &prepared_decode.endpoint_url,
             &prepared_decode.body,
             headers,
+            decode.api_key().as_deref(),
             false,
         );
 
@@ -716,8 +978,8 @@ impl PDRouter {
         }
         .emit();
 
-        let prefill_fut = prefill_request.send();
-        let decode_fut = decode_request.send();
+        let prefill_fut = send_with_stale_conn_retry(prefill_request);
+        let decode_fut = send_with_stale_conn_retry(decode_request);
         tokio::pin!(prefill_fut);
         tokio::pin!(decode_fut);
 
@@ -974,23 +1236,14 @@ impl PDRouter {
                 matches!(worker.worker_type(), WorkerType::Decode) && worker.is_available()
             })
             .collect();
-        let groups: BTreeSet<_> = prefill_workers
-            .iter()
-            .map(|worker| pd_group_id(worker.as_ref()))
-            .filter(|group| {
-                decode_workers
-                    .iter()
-                    .any(|worker| pd_group_id(worker.as_ref()) == *group)
-            })
-            .collect();
-        let group = groups.into_iter().next()?.to_string();
-        let prefill = prefill_workers
-            .into_iter()
-            .find(|worker| pd_group_id(worker.as_ref()) == group.as_str())?;
-        let decode = decode_workers
-            .into_iter()
-            .find(|worker| pd_group_id(worker.as_ref()) == group.as_str())?;
-        Some((prefill.clone(), decode.clone()))
+        prefill_workers.into_iter().find_map(|prefill| {
+            let decode = decode_workers.iter().find(|decode| {
+                pd_group_id(decode.as_ref()) == pd_group_id(prefill.as_ref())
+                    && decode.connection_mode() == prefill.connection_mode()
+                    && decode.metadata().runtime_type == prefill.metadata().runtime_type
+            })?;
+            Some((prefill.clone(), (*decode).clone()))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1254,9 +1507,13 @@ impl PDRouter {
         endpoint_url: &str,
         json_request: &Value,
         headers: Option<&HeaderMap>,
+        api_key: Option<&str>,
         connection_close: bool,
     ) -> reqwest::RequestBuilder {
         let mut request = client.post(endpoint_url).json(json_request);
+        if let Some(api_key) = api_key {
+            request = request.bearer_auth(api_key);
+        }
         if connection_close {
             request = request.header("Connection", "close");
         }
@@ -1610,7 +1867,6 @@ mod tests {
         PDRouter {
             worker_registry,
             client: Client::new(),
-            retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
         }
     }
@@ -1621,6 +1877,224 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    async fn spawn_recording_worker(
+        response: Value,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::{extract::State, routing::post, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = (requests.clone(), response);
+        let app = AxumRouter::new()
+            .route(
+                "/v1/chat/completions",
+                post(
+                    |State((requests, response)): State<(
+                        Arc<std::sync::Mutex<Vec<Value>>>,
+                        Value,
+                    )>,
+                     axum::Json(body): axum::Json<Value>| async move {
+                        requests
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(body);
+                        axum::Json(response)
+                    },
+                ),
+            )
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{}", address), requests)
+    }
+
+    fn vllm_context() -> PDRequestContext<'static> {
+        PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            model_id: Some("test-model"),
+        }
+    }
+
+    #[test]
+    fn pd_post_builder_adds_worker_api_key() {
+        let router = create_test_pd_router();
+        let request = json!({"model": "test-model"});
+        let builder = router.build_post_with_headers(
+            &Client::new(),
+            "http://worker:8000/v1/chat/completions",
+            &request,
+            None,
+            Some("worker-api-key"),
+            false,
+        );
+
+        let request = builder.build().unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer worker-api-key")
+        );
+    }
+
+    #[test]
+    fn select_health_pd_pair_matches_runtime() {
+        let router = create_test_pd_router();
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://sglang-prefill")
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: None,
+                    })
+                    .label("pd_group_id", "group-a")
+                    .build(),
+            ) as Arc<dyn Worker>,
+            Arc::new(
+                BasicWorkerBuilder::new("http://vllm-prefill")
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: None,
+                    })
+                    .runtime_type(RuntimeType::Vllm)
+                    .label("pd_group_id", "group-a")
+                    .build(),
+            ) as Arc<dyn Worker>,
+            Arc::new(
+                BasicWorkerBuilder::new("http://sglang-decode")
+                    .worker_type(WorkerType::Decode)
+                    .label("pd_group_id", "group-a")
+                    .build(),
+            ) as Arc<dyn Worker>,
+            Arc::new(
+                BasicWorkerBuilder::new("http://vllm-decode")
+                    .worker_type(WorkerType::Decode)
+                    .runtime_type(RuntimeType::Vllm)
+                    .label("pd_group_id", "group-a")
+                    .build(),
+            ) as Arc<dyn Worker>,
+        ];
+        for worker in workers {
+            worker.set_healthy(true);
+            router.worker_registry.register(worker);
+        }
+
+        let (prefill, decode) = router.select_health_pd_pair().unwrap();
+        assert_eq!(
+            prefill.metadata().runtime_type,
+            decode.metadata().runtime_type
+        );
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_dispatches_sequentially_with_nixl_relay() {
+        let (prefill_url, prefill_requests) = spawn_recording_worker(json!({
+            "kv_transfer_params": {"remote_engine_id": "engine-0"}
+        }))
+        .await;
+        let (decode_url, decode_requests) =
+            spawn_recording_worker(json!({"object": "chat.completion"})).await;
+
+        let router = create_test_pd_router();
+        let prefill = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                })
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("NixlConnector")
+                .build(),
+        );
+        let decode = Arc::new(
+            BasicWorkerBuilder::new(decode_url)
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .build(),
+        );
+
+        let request = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 50,
+            "stream": false,
+        });
+        let response = router
+            .execute_vllm_sequential_dispatch(None, request, vllm_context(), prefill, decode)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let prefill_requests = prefill_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let decode_requests = decode_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(prefill_requests.len(), 1);
+        assert_eq!(decode_requests.len(), 1);
+        assert_eq!(prefill_requests[0]["max_tokens"], 1);
+        assert_eq!(prefill_requests[0]["stream"], false);
+        assert_eq!(
+            prefill_requests[0]["kv_transfer_params"]["do_remote_decode"],
+            true
+        );
+        assert_eq!(decode_requests[0]["max_tokens"], 50);
+        assert_eq!(
+            decode_requests[0]["kv_transfer_params"]["remote_engine_id"],
+            "engine-0"
+        );
+        assert!(decode_requests[0].get("bootstrap_host").is_none());
+    }
+
+    #[tokio::test]
+    async fn vllm_pd_fanout_skips_prefill() {
+        let (prefill_url, prefill_requests) = spawn_recording_worker(json!({})).await;
+        let (decode_url, decode_requests) =
+            spawn_recording_worker(json!({"object": "chat.completion"})).await;
+
+        let router = create_test_pd_router();
+        let prefill = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                })
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("NixlConnector")
+                .build(),
+        );
+        let decode = Arc::new(
+            BasicWorkerBuilder::new(decode_url)
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .build(),
+        );
+
+        let request = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "n": 2,
+            "max_tokens": 50,
+        });
+        let response = router
+            .execute_vllm_sequential_dispatch(None, request, vllm_context(), prefill, decode)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(prefill_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+        let decode_requests = decode_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(decode_requests.len(), 1);
+        assert_eq!(decode_requests[0]["n"], 2);
+        assert!(decode_requests[0].get("kv_transfer_params").is_none());
     }
 
     #[test]

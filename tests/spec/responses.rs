@@ -1,212 +1,23 @@
 use serde_json::json;
 use smg::protocols::{
-    common::{Function, StringOrArray, ToolChoice, ToolChoiceValue},
+    common::{Function, StringOrArray},
     responses::{
-        IncludeField, ResponseInput, ResponseInputOutputItem, ResponseTool, ResponseToolType,
-        ResponsesRequest, StringOrContentParts, TextConfig, TextFormat,
+        FunctionTool, IncludeField, ResponseInput, ResponseInputOutputItem, ResponseTool,
+        ResponsesRequest, ResponsesToolChoice, StringOrContentParts, TextConfig, TextFormat,
+        ToolChoiceOptions,
     },
 };
 use validator::Validate;
 
-/// Test that valid conversation IDs pass validation
-#[test]
-fn test_validate_conversation_id_valid() {
-    let valid_ids = vec![
-        "conv_123",
-        "conv_test-123_abc",
-        "conv_ABC_123",
-        "conv_my_conversation_123",
-        "conv_456",
-        "conv_test123",
-    ];
-
-    for id in valid_ids {
-        let request = ResponsesRequest {
-            conversation: Some(id.to_string()),
-            input: ResponseInput::Text("test".to_string()),
-            ..Default::default()
-        };
-        assert!(
-            request.validate().is_ok(),
-            "Expected '{}' to be valid, but got error: {:?}",
-            id,
-            request.validate().err()
-        );
-    }
-}
-
-/// Test that invalid conversation IDs fail validation
-#[test]
-fn test_validate_conversation_id_invalid() {
-    let invalid_ids = vec![
-        // Missing 'conv_' prefix
-        "test-conv-streaming",
-        "conversation-456",
-        "my_conversation_123",
-        "ABC123",
-        "test_123_conv",
-        "conv123", // missing underscore
-        // Invalid characters
-        "conv_.test",     // contains dot
-        "conv_ test",     // contains space
-        "conv_@test",     // contains @
-        "conv_/test",     // contains /
-        "conv_\\test",    // contains backslash
-        "conv_:test",     // contains colon
-        "conv_;test",     // contains semicolon
-        "conv_,test",     // contains comma
-        "conv_+test",     // contains plus
-        "conv_=test",     // contains equals
-        "conv_[test]",    // contains brackets
-        "conv_{test}",    // contains braces
-        "conv_(test)",    // contains parentheses
-        "conv_!test",     // contains exclamation
-        "conv_?test",     // contains question mark
-        "conv_#test",     // contains hash
-        "conv_$test",     // contains dollar sign
-        "conv_%test",     // contains percent
-        "conv_&test",     // contains ampersand
-        "conv_*test",     // contains asterisk
-        "conv_ test-123", // contains space
-    ];
-
-    for id in invalid_ids {
-        let request = ResponsesRequest {
-            conversation: Some(id.to_string()),
-            input: ResponseInput::Text("test".to_string()),
-            ..Default::default()
-        };
-        let result = request.validate();
-        assert!(
-            result.is_err(),
-            "Expected '{}' to be invalid, but validation passed",
-            id
-        );
-
-        // Verify error is for conversation field
-        if let Err(errors) = result {
-            let field_errors = errors.field_errors();
-            let conversation_errors = field_errors.get("conversation");
-            assert!(
-                conversation_errors.is_some(),
-                "Expected error for 'conversation' field, but got errors for: {:?}",
-                field_errors.keys()
-            );
-
-            let error_msg = conversation_errors
-                .and_then(|errs| errs.first())
-                .and_then(|err| err.message.as_ref())
-                .map(|msg| msg.to_string());
-
-            assert!(
-                error_msg.is_some(),
-                "Expected error message for conversation field"
-            );
-            let msg = error_msg.unwrap();
-            assert!(
-                msg.contains("Invalid 'conversation'"),
-                "Error message should mention 'conversation', got: {}",
-                msg
-            );
-            assert!(
-                msg.contains(id),
-                "Error message should include the invalid ID '{}', got: {}",
-                id,
-                msg
-            );
-        }
-    }
-}
-
-/// Test that None conversation ID is valid
-#[test]
-fn test_validate_conversation_id_none() {
-    let request = ResponsesRequest {
-        conversation: None,
-        input: ResponseInput::Text("test".to_string()),
-        ..Default::default()
-    };
-    assert!(
-        request.validate().is_ok(),
-        "Request with no conversation ID should be valid"
-    );
-}
-
-/// Test the exact error format matches OpenAI's error message for invalid characters
-#[test]
-fn test_validate_conversation_id_error_message_format() {
-    let invalid_id = "conv_.test-conv-streaming";
-    let request = ResponsesRequest {
-        conversation: Some(invalid_id.to_string()),
-        input: ResponseInput::Text("test".to_string()),
-        ..Default::default()
-    };
-
-    let result = request.validate();
-    assert!(result.is_err());
-
-    if let Err(errors) = result {
-        let error_msg = errors
-            .field_errors()
-            .get("conversation")
-            .and_then(|errs| errs.first())
-            .and_then(|err| err.message.as_ref())
-            .map(|msg| msg.to_string())
-            .unwrap();
-
-        // Verify the error message matches OpenAI's format
-        assert!(
-            error_msg.starts_with("Invalid 'conversation':"),
-            "Error should start with \"Invalid 'conversation':\""
-        );
-        assert!(
-            error_msg.contains("letters, numbers, underscores, or dashes"),
-            "Error should mention valid characters"
-        );
-        assert!(
-            error_msg.contains(invalid_id),
-            "Error should include the invalid conversation ID"
-        );
-    }
-}
-
-/// Test the exact error format for missing 'conv_' prefix
-#[test]
-fn test_validate_conversation_id_missing_prefix() {
-    let invalid_id = "test-conv-streaming";
-    let request = ResponsesRequest {
-        conversation: Some(invalid_id.to_string()),
-        input: ResponseInput::Text("test".to_string()),
-        ..Default::default()
-    };
-
-    let result = request.validate();
-    assert!(result.is_err());
-
-    if let Err(errors) = result {
-        let error_msg = errors
-            .field_errors()
-            .get("conversation")
-            .and_then(|errs| errs.first())
-            .and_then(|err| err.message.as_ref())
-            .map(|msg| msg.to_string())
-            .unwrap();
-
-        // Verify the error message matches OpenAI's format
-        assert!(
-            error_msg.starts_with("Invalid 'conversation':"),
-            "Error should start with \"Invalid 'conversation':\""
-        );
-        assert!(
-            error_msg.contains("begins with 'conv_'"),
-            "Error should mention the required prefix, got: {}",
-            error_msg
-        );
-        assert!(
-            error_msg.contains(invalid_id),
-            "Error should include the invalid conversation ID"
-        );
-    }
+fn function_tool(name: &str) -> ResponseTool {
+    ResponseTool::Function(FunctionTool {
+        function: Function {
+            name: name.to_string(),
+            description: None,
+            parameters: json!({}),
+            strict: None,
+        },
+    })
 }
 
 // ============================================================================
@@ -555,6 +366,7 @@ fn test_validate_input_items_empty_content() {
             content: StringOrContentParts::String("".to_string()),
             role: "user".to_string(),
             r#type: None,
+            phase: None,
         }]),
         ..Default::default()
     };
@@ -630,49 +442,15 @@ fn test_validate_stop_sequences_non_empty() {
 
 /// Test tools validation (function tool must have function)
 #[test]
-fn test_validate_tools_function_missing() {
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        tools: Some(vec![ResponseTool {
-            r#type: ResponseToolType::Function,
-            function: None, // Missing function definition
-            server_url: None,
-            authorization: None,
-            server_label: None,
-            server_description: None,
-            require_approval: None,
-            allowed_tools: None,
-        }]),
-        ..Default::default()
-    };
-    let result = request.validate();
+fn test_validate_tools_function_name_missing() {
+    let value = json!({
+        "input": "test",
+        "tools": [{ "type": "function" }]
+    });
+    let parsed: Result<ResponsesRequest, _> = serde_json::from_value(value);
     assert!(
-        result.is_err(),
-        "Function tool without function definition should be invalid"
-    );
-}
-
-/// Test tools validation (MCP tool must have server_url)
-#[test]
-fn test_validate_tools_mcp_missing_url() {
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        tools: Some(vec![ResponseTool {
-            r#type: ResponseToolType::Mcp,
-            function: None,
-            server_url: None, // Missing server_url
-            authorization: None,
-            server_label: None,
-            server_description: None,
-            require_approval: None,
-            allowed_tools: None,
-        }]),
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "MCP tool without server_url should be invalid"
+        parsed.is_err(),
+        "Function tool without a name should be invalid"
     );
 }
 
@@ -708,22 +486,8 @@ fn test_validate_tool_choice_requires_tools() {
     // Valid: tool_choice with tools
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
-        tools: Some(vec![ResponseTool {
-            r#type: ResponseToolType::Function,
-            function: Some(Function {
-                name: "test_func".to_string(),
-                description: None,
-                parameters: json!({}),
-                strict: None,
-            }),
-            server_url: None,
-            authorization: None,
-            server_label: None,
-            server_description: None,
-            require_approval: None,
-            allowed_tools: None,
-        }]),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![function_tool("test_func")]),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
         ..Default::default()
     };
     assert!(
@@ -735,7 +499,7 @@ fn test_validate_tool_choice_requires_tools() {
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
         tools: None,
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::None)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::None)),
         ..Default::default()
     };
     assert!(
@@ -747,7 +511,7 @@ fn test_validate_tool_choice_requires_tools() {
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
         tools: None,
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
         ..Default::default()
     };
     let result = request.validate();
@@ -807,31 +571,6 @@ fn test_validate_top_logprobs_requires_include() {
     );
 }
 
-/// Test background/stream conflict
-#[test]
-fn test_validate_background_stream_conflict() {
-    // Invalid: both background and stream enabled
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        background: Some(true),
-        stream: Some(true),
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "background=true with stream=true should be invalid"
-    );
-
-    if let Err(errors) = result {
-        let error_msg = errors.to_string();
-        assert!(
-            error_msg.contains("background") || error_msg.contains("stream"),
-            "Error should mention background/stream conflict"
-        );
-    }
-}
-
 /// Test previous_response_id format validation
 /// NOTE: Format validation removed - previous_response_id format is not validated
 /// response_id generated by the grpc router is not necessarily start with 'resp_'
@@ -870,58 +609,6 @@ fn test_validate_previous_response_id_format() {
     }
 }
 
-/// Test conversation and previous_response_id mutual exclusion
-#[test]
-fn test_validate_conversation_previous_response_mutual_exclusion() {
-    // Valid: only conversation
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        conversation: Some("conv_123".to_string()),
-        previous_response_id: None,
-        ..Default::default()
-    };
-    assert!(
-        request.validate().is_ok(),
-        "Only conversation should be valid"
-    );
-
-    // Valid: only previous_response_id
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        conversation: None,
-        previous_response_id: Some("resp_123".to_string()),
-        ..Default::default()
-    };
-    assert!(
-        request.validate().is_ok(),
-        "Only previous_response_id should be valid"
-    );
-
-    // Invalid: both conversation and previous_response_id
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        conversation: Some("conv_123".to_string()),
-        previous_response_id: Some("resp_123".to_string()),
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "Both conversation and previous_response_id should be invalid"
-    );
-
-    if let Err(errors) = result {
-        let error_msg = errors.to_string();
-        assert!(
-            error_msg.contains("mutually exclusive")
-                || (error_msg.contains("conversation")
-                    && error_msg.contains("previous_response_id")),
-            "Error should mention mutual exclusion, got: {}",
-            error_msg
-        );
-    }
-}
-
 /// Test input items structure validation
 #[test]
 fn test_validate_input_items_structure() {
@@ -931,6 +618,7 @@ fn test_validate_input_items_structure() {
             content: StringOrContentParts::String("Hello".to_string()),
             role: "user".to_string(),
             r#type: None,
+            phase: None,
         }]),
         ..Default::default()
     };
@@ -967,21 +655,7 @@ fn test_normalize_tool_choice_auto() {
 
     let mut request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
-        tools: Some(vec![ResponseTool {
-            r#type: ResponseToolType::Function,
-            function: Some(Function {
-                name: "test_func".to_string(),
-                description: None,
-                parameters: json!({}),
-                strict: None,
-            }),
-            server_url: None,
-            authorization: None,
-            server_label: None,
-            server_description: None,
-            require_approval: None,
-            allowed_tools: None,
-        }]),
+        tools: Some(vec![function_tool("test_func")]),
         tool_choice: None,
         ..Default::default()
     };
@@ -995,7 +669,7 @@ fn test_normalize_tool_choice_auto() {
     assert!(
         matches!(
             request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::Auto))
+            Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto))
         ),
         "tool_choice should default to auto when tools are present"
     );
@@ -1022,7 +696,7 @@ fn test_normalize_tool_choice_none() {
     assert!(
         matches!(
             request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
+            Some(ResponsesToolChoice::Options(ToolChoiceOptions::None))
         ),
         "tool_choice should default to none when tools array is empty"
     );
@@ -1035,22 +709,8 @@ fn test_normalize_tool_choice_no_override() {
 
     let mut request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
-        tools: Some(vec![ResponseTool {
-            r#type: ResponseToolType::Function,
-            function: Some(Function {
-                name: "test_func".to_string(),
-                description: None,
-                parameters: json!({}),
-                strict: None,
-            }),
-            server_url: None,
-            authorization: None,
-            server_label: None,
-            server_description: None,
-            require_approval: None,
-            allowed_tools: None,
-        }]),
-        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
+        tools: Some(vec![function_tool("test_func")]),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required)),
         ..Default::default()
     };
 
@@ -1059,7 +719,7 @@ fn test_normalize_tool_choice_no_override() {
     assert!(
         matches!(
             request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::Required))
+            Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required))
         ),
         "tool_choice should not be overridden if already set"
     );
@@ -1072,21 +732,7 @@ fn test_normalize_parallel_tool_calls() {
 
     let mut request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
-        tools: Some(vec![ResponseTool {
-            r#type: ResponseToolType::Function,
-            function: Some(Function {
-                name: "test_func".to_string(),
-                description: None,
-                parameters: json!({}),
-                strict: None,
-            }),
-            server_url: None,
-            authorization: None,
-            server_label: None,
-            server_description: None,
-            require_approval: None,
-            allowed_tools: None,
-        }]),
+        tools: Some(vec![function_tool("test_func")]),
         parallel_tool_calls: None,
         ..Default::default()
     };
@@ -1131,21 +777,7 @@ fn test_normalize_parallel_tool_calls_no_override() {
 
     let mut request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
-        tools: Some(vec![ResponseTool {
-            r#type: ResponseToolType::Function,
-            function: Some(Function {
-                name: "test_func".to_string(),
-                description: None,
-                parameters: json!({}),
-                strict: None,
-            }),
-            server_url: None,
-            authorization: None,
-            server_label: None,
-            server_description: None,
-            require_approval: None,
-            allowed_tools: None,
-        }]),
+        tools: Some(vec![function_tool("test_func")]),
         parallel_tool_calls: Some(false),
         ..Default::default()
     };

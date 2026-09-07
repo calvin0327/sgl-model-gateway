@@ -1,5 +1,4 @@
 mod create_worker;
-mod detect_connection;
 mod discover_dp;
 mod discover_metadata;
 mod find_worker_to_update;
@@ -13,16 +12,7 @@ mod update_worker_properties;
 
 use std::{sync::Arc, time::Duration};
 
-/// Strip protocol prefix (http://, https://, grpc://) from URL.
-pub(crate) fn strip_protocol(url: &str) -> String {
-    url.trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_start_matches("grpc://")
-        .to_string()
-}
-
 pub use create_worker::CreateLocalWorkerStep;
-pub use detect_connection::DetectConnectionModeStep;
 pub use discover_dp::{get_dp_info, DiscoverDPInfoStep, DpInfo};
 pub use discover_metadata::DiscoverMetadataStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
@@ -45,7 +35,7 @@ use crate::{
         },
         Worker, WorkerRegistry,
     },
-    protocols::worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
+    protocol_compat::{WorkerConfigRequest, WorkerUpdateRequest},
 };
 
 /// Find workers by URL, supporting both DP-aware (prefix match) and regular (exact match) modes.
@@ -74,38 +64,10 @@ pub(crate) fn find_workers_by_url(
 }
 
 pub fn create_local_worker_workflow(
-    worker_pool_config: &WorkerConfig,
+    _worker_pool_config: &WorkerConfig,
 ) -> WorkflowDefinition<LocalWorkerWorkflowData> {
-    let detect_timeout = Duration::from_secs(worker_pool_config.startup_timeout_secs);
-
-    // Calculate max_attempts based on timeout
-    let timeout_secs = detect_timeout.as_secs() as f64;
-    let effective_timeout = timeout_secs * 0.9;
-    let max_attempts = if effective_timeout > 10.0 {
-        (5 + ((effective_timeout - 10.0) / 5.0).ceil() as u32).max(3)
-    } else {
-        3
-    };
-
     WorkflowDefinition::new("local_worker_registration", "Local Worker Registration")
-        // Step 1: Detect connection mode (HTTP vs gRPC)
-        .add_step(
-            StepDefinition::new(
-                "detect_connection_mode",
-                "Detect Connection Mode",
-                Arc::new(DetectConnectionModeStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts,
-                backoff: BackoffStrategy::Linear {
-                    increment: Duration::from_secs(1),
-                    max: Duration::from_secs(5),
-                },
-            })
-            .with_timeout(detect_timeout)
-            .with_failure_action(FailureAction::FailWorkflow),
-        )
-        // Step 2a: Discover metadata (parallel with DP discovery)
+        // Step 1: Discover metadata
         .add_step(
             StepDefinition::new(
                 "discover_metadata",
@@ -117,8 +79,7 @@ pub fn create_local_worker_workflow(
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep)
-            .depends_on(&["detect_connection_mode"]),
+            .with_failure_action(FailureAction::ContinueNextStep),
         )
         // Step 2b: Discover DP info (after metadata to avoid concurrent /server_info calls)
         .add_step(
@@ -318,7 +279,7 @@ pub fn create_local_worker_workflow_data(
 ) -> LocalWorkerWorkflowData {
     LocalWorkerWorkflowData {
         config,
-        connection_mode: None,
+        connection_mode: Some(crate::core::ConnectionMode::Http),
         discovered_labels: std::collections::HashMap::new(),
         dp_info: None,
         workers: None,

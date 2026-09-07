@@ -10,7 +10,7 @@ use super::{
         PREFERRED_CONTEXT_TOKENS_LABEL,
     },
 };
-use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
+use crate::observability::metrics::Metrics;
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
@@ -20,12 +20,13 @@ pub struct BasicWorkerBuilder {
     default_model_type: ModelType,
     connection_mode: ConnectionMode,
     runtime_type: RuntimeType,
+    kv_connector: Option<String>,
+    kv_engine_id: Option<String>,
     labels: HashMap<String, String>,
     models: Vec<ModelCard>,
     preferred_context_tokens: Option<usize>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
-    grpc_client: Option<GrpcClient>,
 }
 
 impl BasicWorkerBuilder {
@@ -37,12 +38,13 @@ impl BasicWorkerBuilder {
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),
+            kv_connector: None,
+            kv_engine_id: None,
             labels: HashMap::new(),
             models: Vec::new(),
             preferred_context_tokens: None,
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
             default_model_type: ModelType::SGLANG_LLM,
         }
     }
@@ -55,12 +57,13 @@ impl BasicWorkerBuilder {
             worker_type,
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),
+            kv_connector: None,
+            kv_engine_id: None,
             labels: HashMap::new(),
             models: Vec::new(),
             preferred_context_tokens: None,
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
             default_model_type: ModelType::SGLANG_LLM,
         }
     }
@@ -94,6 +97,18 @@ impl BasicWorkerBuilder {
         self
     }
 
+    /// Set the vLLM KV transfer connector
+    pub fn kv_connector(mut self, kv_connector: impl Into<String>) -> Self {
+        self.kv_connector = Some(kv_connector.into());
+        self
+    }
+
+    /// Set the vLLM Mooncake engine ID
+    pub fn kv_engine_id(mut self, kv_engine_id: impl Into<String>) -> Self {
+        self.kv_engine_id = Some(kv_engine_id.into());
+        self
+    }
+
     /// Set labels for worker identification
     pub fn labels(mut self, labels: HashMap<String, String>) -> Self {
         self.labels = labels;
@@ -115,12 +130,6 @@ impl BasicWorkerBuilder {
     /// Set circuit breaker configuration
     pub fn circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
         self.circuit_breaker_config = config;
-        self
-    }
-
-    /// Set gRPC client for gRPC workers
-    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
-        self.grpc_client = Some(client);
         self
     }
 
@@ -149,8 +158,6 @@ impl BasicWorkerBuilder {
             Arc, RwLock as StdRwLock,
         };
 
-        use tokio::sync::OnceCell;
-
         let bootstrap_host = parse_bootstrap_host_from_url(&self.url);
 
         let bootstrap_port = match self.worker_type {
@@ -170,6 +177,8 @@ impl BasicWorkerBuilder {
             worker_type: self.worker_type,
             connection_mode: self.connection_mode,
             runtime_type: self.runtime_type,
+            kv_connector: self.kv_connector,
+            kv_engine_id: self.kv_engine_id,
             labels: self.labels,
             health_config: self.health_config,
             bootstrap_host,
@@ -179,17 +188,6 @@ impl BasicWorkerBuilder {
             default_provider: None, // Native/passthrough
             default_model_type: self.default_model_type,
         };
-
-        // Use OnceCell for lock-free gRPC client access after initialization
-        let grpc_client = Arc::new(match self.grpc_client {
-            Some(client) => {
-                let cell = OnceCell::new();
-                // Pre-set the client if provided (blocking set is fine during construction)
-                cell.set(Arc::new(client)).ok();
-                cell
-            }
-            None => OnceCell::new(),
-        });
 
         let healthy = true;
         Metrics::set_worker_health(&self.url, healthy);
@@ -206,7 +204,6 @@ impl BasicWorkerBuilder {
                 self.circuit_breaker_config,
                 self.url.clone(),
             ),
-            grpc_client,
             models_override: Arc::new(StdRwLock::new(None)),
         }
     }
@@ -222,12 +219,13 @@ pub struct DPAwareWorkerBuilder {
     connection_mode: ConnectionMode,
     runtime_type: RuntimeType,
     default_model_type: ModelType,
+    kv_connector: Option<String>,
+    kv_engine_id: Option<String>,
     labels: HashMap<String, String>,
     models: Vec<ModelCard>,
     preferred_context_tokens: Option<usize>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
-    grpc_client: Option<GrpcClient>,
 }
 
 impl DPAwareWorkerBuilder {
@@ -241,12 +239,13 @@ impl DPAwareWorkerBuilder {
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),
+            kv_connector: None,
+            kv_engine_id: None,
             labels: HashMap::new(),
             models: Vec::new(),
             preferred_context_tokens: None,
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
             default_model_type: ModelType::SGLANG_LLM,
         }
     }
@@ -266,12 +265,13 @@ impl DPAwareWorkerBuilder {
             worker_type,
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),
+            kv_connector: None,
+            kv_engine_id: None,
             labels: HashMap::new(),
             models: Vec::new(),
             preferred_context_tokens: None,
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
             default_model_type: ModelType::SGLANG_LLM,
         }
     }
@@ -297,6 +297,18 @@ impl DPAwareWorkerBuilder {
     /// Set the runtime type (SGLang or vLLM)
     pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
         self.runtime_type = runtime_type;
+        self
+    }
+
+    /// Set the vLLM KV transfer connector
+    pub fn kv_connector(mut self, kv_connector: impl Into<String>) -> Self {
+        self.kv_connector = Some(kv_connector.into());
+        self
+    }
+
+    /// Set the vLLM Mooncake engine ID
+    pub fn kv_engine_id(mut self, kv_engine_id: impl Into<String>) -> Self {
+        self.kv_engine_id = Some(kv_engine_id.into());
         self
     }
 
@@ -327,12 +339,6 @@ impl DPAwareWorkerBuilder {
     /// Set circuit breaker configuration
     pub fn circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
         self.circuit_breaker_config = config;
-        self
-    }
-
-    /// Set gRPC client for gRPC workers
-    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
-        self.grpc_client = Some(client);
         self
     }
 
@@ -367,13 +373,17 @@ impl DPAwareWorkerBuilder {
             .health_config(self.health_config)
             .circuit_breaker_config(self.circuit_breaker_config);
 
+        if let Some(kv_connector) = self.kv_connector {
+            builder = builder.kv_connector(kv_connector);
+        }
+        if let Some(kv_engine_id) = self.kv_engine_id {
+            builder = builder.kv_engine_id(kv_engine_id);
+        }
+
         if let Some(tokens) = self.preferred_context_tokens {
             builder = builder.preferred_context_tokens(tokens);
         }
 
-        if let Some(client) = self.grpc_client {
-            builder = builder.grpc_client(client);
-        }
         if let Some(api_key) = self.api_key {
             builder = builder.api_key(api_key);
         }
@@ -438,7 +448,7 @@ mod tests {
             .worker_type(WorkerType::Prefill {
                 bootstrap_port: None,
             })
-            .connection_mode(ConnectionMode::Grpc { port: Some(50051) })
+            .connection_mode(ConnectionMode::Http)
             .labels(labels.clone())
             .health_config(health_config.clone())
             .circuit_breaker_config(cb_config)
@@ -451,10 +461,7 @@ mod tests {
                 bootstrap_port: None
             }
         );
-        assert_eq!(
-            worker.connection_mode(),
-            &ConnectionMode::Grpc { port: Some(50051) }
-        );
+        assert_eq!(worker.connection_mode(), &ConnectionMode::Http);
         assert_eq!(worker.metadata().labels, labels);
         assert_eq!(
             worker.metadata().health_config.endpoint,
@@ -557,24 +564,21 @@ mod tests {
     }
 
     #[test]
-    fn test_dp_aware_worker_with_grpc() {
-        let worker = DPAwareWorkerBuilder::new("grpc://cluster.local", 1, 4)
+    fn test_dp_aware_worker_with_http() {
+        let worker = DPAwareWorkerBuilder::new("http://cluster.local", 1, 4)
             .worker_type(WorkerType::Decode)
-            .connection_mode(ConnectionMode::Grpc { port: Some(50051) })
-            .label("transport", "grpc")
+            .connection_mode(ConnectionMode::Http)
+            .label("transport", "http")
             .build();
 
-        assert_eq!(worker.url(), "grpc://cluster.local@1");
+        assert_eq!(worker.url(), "http://cluster.local@1");
         assert_eq!(worker.dp_rank(), Some(1));
         assert_eq!(worker.dp_size(), Some(4));
         assert_eq!(worker.worker_type(), &WorkerType::Decode);
-        assert_eq!(
-            worker.connection_mode(),
-            &ConnectionMode::Grpc { port: Some(50051) }
-        );
+        assert_eq!(worker.connection_mode(), &ConnectionMode::Http);
         assert_eq!(
             worker.metadata().labels.get("transport"),
-            Some(&"grpc".to_string())
+            Some(&"http".to_string())
         );
     }
 }

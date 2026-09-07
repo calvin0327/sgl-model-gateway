@@ -12,29 +12,21 @@ use axum::{
 
 use crate::{
     core::scheduler::SchedulerOutput,
+    protocol_compat::ResponsesGetParams,
     protocols::{
-        chat::ChatCompletionRequest,
-        classify::ClassifyRequest,
-        completion::CompletionRequest,
-        embedding::EmbeddingRequest,
-        generate::GenerateRequest,
-        rerank::RerankRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
+        chat::ChatCompletionRequest, classify::ClassifyRequest, completion::CompletionRequest,
+        embedding::EmbeddingRequest, generate::GenerateRequest, rerank::RerankRequest,
+        responses::ResponsesRequest,
     },
 };
 
 pub mod app;
-pub mod conversations;
+pub mod common;
 pub mod error;
 pub mod factory;
-pub mod grpc;
 pub mod header_utils;
 pub mod http;
-pub mod mcp_utils;
-pub mod mesh;
-pub mod openai;
 pub mod parse;
-pub mod persistence_utils;
 pub mod router_manager;
 pub mod streaming_utils;
 pub mod tokenize;
@@ -216,6 +208,6 @@ pub trait RouterTrait: Send + Sync + Debug {
 
     /// Check if this is a PD router
     fn is_pd_mode(&self) -> bool {
-        matches!(self.router_type(), "pd" | "grpc_pd")
+        self.router_type() == "pd"
     }
 }

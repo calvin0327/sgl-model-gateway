@@ -117,7 +117,7 @@ class TestStructuredOutputCloud:
 @pytest.mark.e2e
 @pytest.mark.model("gpt-oss")
 @pytest.mark.gateway(
-    extra_args=["--reasoning-parser=gpt-oss", "--history-backend", "memory"]
+    extra_args=["--reasoning-parser=gpt-oss"]
 )
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestStructuredOutputHarmony:
@@ -216,7 +216,7 @@ class TestStructuredOutputHarmony:
 @pytest.mark.e2e
 @pytest.mark.model("qwen-14b")
 @pytest.mark.gateway(
-    extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"]
+    extra_args=["--tool-call-parser", "qwen"]
 )
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestSimpleSchemaStructuredOutput:

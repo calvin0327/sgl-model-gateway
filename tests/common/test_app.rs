@@ -1,9 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
 use axum::Router;
-use data_connector::{
-    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-};
 use reqwest::Client;
 use smg::{
     app_context::AppContext,
@@ -17,7 +14,6 @@ use smg::{
     routers::{app::build_app, RouterTrait},
     tokenizer::registry::TokenizerRegistry,
 };
-use smg_mcp::{McpConfig, McpManager};
 
 /// Create a test Axum application using the actual server's build_app function
 #[allow(dead_code)]
@@ -46,11 +42,6 @@ pub fn create_test_app(
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(config.routing.policy.clone()));
 
-    // Initialize storage backends
-    let response_storage = Arc::new(MemoryResponseStorage::new());
-    let conversation_storage = Arc::new(MemoryConversationStorage::new());
-    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
-
     // Initialize load monitor
     let load_monitor = Some(Arc::new(LoadMonitor::new(
         worker_registry.clone(),
@@ -74,9 +65,6 @@ pub fn create_test_app(
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
-            .response_storage(response_storage)
-            .conversation_storage(conversation_storage)
-            .conversation_item_storage(conversation_item_storage)
             .load_monitor(load_monitor)
             .worker_job_queue(worker_job_queue)
             .workflow_engines(workflow_engines)
@@ -90,8 +78,6 @@ pub fn create_test_app(
         context: app_context,
         concurrency_queue_tx: None,
         router_manager: None,
-        mesh_handler: None,
-        mesh_sync_manager: None,
     });
 
     // Configure request ID headers (use defaults if not specified)
@@ -132,8 +118,6 @@ pub fn create_test_app_with_context(
         context: app_context.clone(),
         concurrency_queue_tx: None,
         router_manager: None,
-        mesh_handler: None,
-        mesh_sync_manager: None,
     });
 
     // Get config from the context
@@ -175,28 +159,9 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engines = Arc::new(OnceLock::new());
 
-    // Initialize MCP manager with empty config
-    let mcp_manager_lock = Arc::new(OnceLock::new());
-    let empty_config = McpConfig {
-        servers: vec![],
-        pool: Default::default(),
-        proxy: None,
-        warmup: vec![],
-        inventory: Default::default(),
-    };
-    let mcp_manager = McpManager::with_defaults(empty_config)
-        .await
-        .expect("Failed to create MCP manager");
-    mcp_manager_lock.set(Arc::new(mcp_manager)).ok();
-
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(gateway_config.routing.policy.clone()));
-
-    // Initialize storage backends
-    let response_storage = Arc::new(MemoryResponseStorage::new());
-    let conversation_storage = Arc::new(MemoryConversationStorage::new());
-    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
 
     Arc::new(
         AppContext::builder()
@@ -208,13 +173,9 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
             .tool_parser_factory(None)
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
-            .response_storage(response_storage)
-            .conversation_storage(conversation_storage)
-            .conversation_item_storage(conversation_item_storage)
             .load_monitor(None)
             .worker_job_queue(worker_job_queue)
             .workflow_engines(workflow_engines)
-            .mcp_manager(mcp_manager_lock)
             .build()
             .unwrap(),
     )
@@ -249,11 +210,6 @@ pub fn register_external_worker(ctx: &Arc<AppContext>, url: &str, models: Option
 }
 
 /// Register an external worker with a custom model card that has aliases.
-///
-/// # Arguments
-/// * `ctx` - The AppContext to register the worker in
-/// * `url` - The base URL of the external API endpoint
-/// * `model_card` - A fully configured ModelCard with aliases, provider, etc.
 #[allow(dead_code)]
 pub fn register_external_worker_with_card(ctx: &Arc<AppContext>, url: &str, model_card: ModelCard) {
     let worker: Arc<dyn Worker> = Arc::new(

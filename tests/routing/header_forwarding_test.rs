@@ -220,7 +220,7 @@ mod header_forwarding_tests {
     #[tokio::test]
     async fn test_chat_completions_request_id_format() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
-            port: 19404,
+            port: 0,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
@@ -231,7 +231,7 @@ mod header_forwarding_tests {
         let app = ctx.create_app().await;
 
         let payload = json!({
-            "model": "test-model",
+            "model": "mock-model-path",
             "messages": [{"role": "user", "content": "Hello"}],
             "stream": false
         });

@@ -268,7 +268,7 @@ mod generation_tests {
         let app = ctx.create_app().await;
 
         let payload = json!({
-            "model": "test-model",
+            "model": "mock-model-path",
             "messages": [
                 {"role": "user", "content": "Hello!"}
             ],
@@ -663,7 +663,7 @@ mod responses_endpoint_tests {
 
         let payload = json!({
             "input": "Hello Responses API",
-            "model": "mock-model",
+            "model": "mock-model-path",
             "stream": false
         });
 
@@ -702,7 +702,7 @@ mod responses_endpoint_tests {
 
         let payload = json!({
             "input": "Hello Responses API",
-            "model": "mock-model",
+            "model": "mock-model-path",
             "stream": true
         });
 
@@ -745,10 +745,9 @@ mod responses_endpoint_tests {
         let resp_id = "test-get-resp-id-123";
         let payload = json!({
             "input": "Hello Responses API",
-            "model": "mock-model",
+            "model": "mock-model-path",
             "stream": false,
             "store": true,
-            "background": true,
             "request_id": resp_id
         });
         let req = Request::builder()
@@ -794,10 +793,9 @@ mod responses_endpoint_tests {
         let resp_id = "test-cancel-resp-id-456";
         let payload = json!({
             "input": "Hello Responses API",
-            "model": "mock-model",
+            "model": "mock-model-path",
             "stream": false,
             "store": true,
-            "background": true,
             "request_id": resp_id
         });
         let req = Request::builder()
@@ -854,75 +852,6 @@ mod responses_endpoint_tests {
     }
 
     #[tokio::test]
-    async fn test_v1_responses_input_items() {
-        // This test uses OpenAI mode because the input_items endpoint
-        // is only implemented in OpenAIRouter and reads from storage (no workers needed)
-        let config = crate::common::TestGatewayConfigBuilder::new()
-            .openai_mode(vec!["http://dummy.local".to_string()]) // Dummy URL (won't be called)
-            .random_policy()
-            .host("127.0.0.1")
-            .port(3002)
-            .max_payload_size(256 * 1024 * 1024)
-            .request_timeout_secs(600)
-            .worker_startup_timeout_secs(1)
-            .worker_startup_check_interval_secs(1)
-            .max_concurrent_requests(64)
-            .queue_size(0)
-            .queue_timeout_secs(60)
-            .build_unchecked();
-
-        let ctx = AppTestContext::new_with_config(
-            config,
-            vec![], // No workers needed
-        )
-        .await;
-
-        let app = ctx.create_app().await;
-
-        // Directly store a response in the storage to test the retrieval endpoint
-        use data_connector::{ResponseId, StoredResponse};
-        let mut stored_response = StoredResponse::new(None);
-        stored_response.id = ResponseId::from("resp_test_input_items");
-        stored_response.input = json!([
-            {"id": "item_1", "content": "hello", "role": "user"},
-            {"id": "item_2", "content": "hi there", "role": "assistant"}
-        ]);
-        stored_response.output = json!([
-            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "test response"}]}
-        ]);
-
-        ctx.app_context
-            .response_storage
-            .store_response(stored_response)
-            .await
-            .expect("Failed to store response");
-
-        // Fetch input_items for the created response
-        let req = Request::builder()
-            .method("GET")
-            .uri("/v1/responses/resp_test_input_items/input_items")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let items_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        // Verify response structure
-        assert_eq!(items_json["object"], "list");
-        assert!(items_json["data"].is_array());
-
-        // Should have 2 input items
-        let items = items_json["data"].as_array().unwrap();
-        assert_eq!(items.len(), 2);
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn test_v1_responses_get_multi_worker_fanout() {
         // Start two mock workers
         let ctx = AppTestContext::new(vec![
@@ -949,8 +878,7 @@ mod responses_endpoint_tests {
         let rid = format!("resp_{}", 18960); // arbitrary unique id
         let payload = json!({
             "input": "Hello Responses API",
-            "model": "mock-model",
-            "background": true,
+            "model": "mock-model-path",
             "store": true,
             "request_id": rid,
         });
@@ -1149,7 +1077,7 @@ mod error_tests {
     #[tokio::test]
     async fn test_invalid_model() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
-            port: 18406,
+            port: 0,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
@@ -1173,8 +1101,7 @@ mod error_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        // Mock worker accepts any model, but real implementation might return 400
-        assert!(resp.status().is_success() || resp.status() == StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         ctx.shutdown().await;
     }
@@ -1471,7 +1398,7 @@ mod request_id_tests {
 
         let chat_payload = json!({
             "messages": [{"role": "user", "content": "Hello"}],
-            "model": "test-model"
+            "model": "mock-model-path"
         });
 
         let req = Request::builder()
@@ -1580,6 +1507,18 @@ mod rerank_tests {
             fail_rate: 0.0,
         }])
         .await;
+
+        let worker_url = ctx.config.workers.regular_urls[0].clone();
+        let rerank_worker: std::sync::Arc<dyn smg::core::Worker> = std::sync::Arc::new(
+            smg::core::BasicWorkerBuilder::new(worker_url)
+                .worker_type(smg::core::WorkerType::Regular)
+                .model(
+                    smg::core::ModelCard::new("mock-model-path")
+                        .with_model_type(smg::core::model_type::ModelType::RERANK),
+                )
+                .build(),
+        );
+        ctx.app_context.worker_registry.register(rerank_worker);
 
         let app = ctx.create_app().await;
 

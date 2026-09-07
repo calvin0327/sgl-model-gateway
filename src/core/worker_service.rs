@@ -4,8 +4,8 @@
 //! and business logic for worker management. The service orchestrates
 //! WorkerRegistry and JobQueue operations.
 
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::{
     http::StatusCode,
@@ -18,9 +18,8 @@ use tracing::warn;
 use crate::{
     config::GatewayConfig,
     core::{worker::worker_to_info, worker_registry::WorkerId, Job, JobQueue, WorkerRegistry},
-    protocols::worker_spec::{
-        WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerUpdateRequest,
-    },
+    protocol_compat::{WorkerConfigRequest, WorkerInfo, WorkerUpdateRequest},
+    protocols::worker::WorkerErrorResponse,
 };
 
 /// Error types for worker service operations
@@ -30,6 +29,8 @@ pub enum WorkerServiceError {
     NotFound { worker_id: String },
     /// Invalid worker ID format (expected UUID)
     InvalidId { raw: String, message: String },
+    /// Invalid worker registration payload
+    InvalidConfiguration { message: String },
     /// Job queue not initialized
     QueueNotInitialized,
     /// Failed to submit job to queue
@@ -41,6 +42,7 @@ impl WorkerServiceError {
         match self {
             Self::NotFound { .. } => "WORKER_NOT_FOUND",
             Self::InvalidId { .. } => "BAD_REQUEST",
+            Self::InvalidConfiguration { .. } => "BAD_REQUEST",
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
         }
@@ -50,6 +52,7 @@ impl WorkerServiceError {
         match self {
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::InvalidId { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidConfiguration { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -66,6 +69,9 @@ impl std::fmt::Display for WorkerServiceError {
                     "Invalid worker_id '{}' (expected UUID). Error: {}",
                     raw, message
                 )
+            }
+            Self::InvalidConfiguration { message } => {
+                write!(f, "Invalid worker configuration: {}", message)
             }
             Self::QueueNotInitialized => write!(f, "Job queue not initialized"),
             Self::QueueSubmitFailed { message } => write!(f, "{}", message),
@@ -250,6 +256,27 @@ impl WorkerService {
         &self,
         mut config: WorkerConfigRequest,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
+        if let Some(runtime) = config.runtime.as_deref() {
+            if !matches!(runtime, "sglang" | "vllm") {
+                return Err(WorkerServiceError::InvalidConfiguration {
+                    message: "runtime must be 'sglang' or 'vllm'".to_string(),
+                });
+            }
+        }
+        if let Some(connector) = config.kv_connector.as_deref() {
+            if !matches!(connector, "MooncakeConnector" | "NixlConnector") {
+                return Err(WorkerServiceError::InvalidConfiguration {
+                    message: "kv_connector must be 'MooncakeConnector' or 'NixlConnector'"
+                        .to_string(),
+                });
+            }
+        }
+        if config.kv_engine_id.as_ref().is_some_and(String::is_empty) {
+            return Err(WorkerServiceError::InvalidConfiguration {
+                message: "kv_engine_id cannot be empty when specified".to_string(),
+            });
+        }
+
         if self.config.server.api_key.is_some() && config.api_key.is_none() {
             warn!(
                 "Adding worker {} without API key while router has API key configured. \

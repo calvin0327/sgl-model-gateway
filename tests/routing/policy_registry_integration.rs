@@ -2,10 +2,9 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use data_connector::MemoryResponseStorage;
 use smg::{
     config::PolicyConfig, core::WorkerRegistry, policies::PolicyRegistry,
-    protocols::worker_spec::WorkerConfigRequest, routers::router_manager::RouterManager,
+    protocol_compat::WorkerConfigRequest, routers::router_manager::RouterManager,
 };
 
 #[tokio::test]
@@ -18,11 +17,7 @@ async fn test_policy_registry_with_router_manager() {
     let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
     // Create RouterManager with shared registries
-    let _router_manager = RouterManager::new(
-        worker_registry.clone(),
-        policy_registry.clone(),
-        Arc::new(MemoryResponseStorage::new()),
-    );
+    let _router_manager = RouterManager::new(worker_registry.clone(), policy_registry.clone());
 
     // Add first worker for llama-3 with cache_aware policy hint
     let mut labels1 = HashMap::new();
@@ -42,6 +37,8 @@ async fn test_policy_registry_with_router_manager() {
         tool_parser: None,
         chat_template: None,
         runtime: None,
+        kv_connector: None,
+        kv_engine_id: None,
         health_check_timeout_secs: 30,
         health_check_interval_secs: 60,
         health_success_threshold: 2,
@@ -75,6 +72,8 @@ async fn test_policy_registry_with_router_manager() {
         tool_parser: None,
         chat_template: None,
         runtime: None,
+        kv_connector: None,
+        kv_engine_id: None,
         health_check_timeout_secs: 30,
         health_check_interval_secs: 60,
         health_success_threshold: 2,
@@ -104,6 +103,8 @@ async fn test_policy_registry_with_router_manager() {
         tool_parser: None,
         runtime: None,
         chat_template: None,
+        kv_connector: None,
+        kv_engine_id: None,
         health_check_timeout_secs: 30,
         health_check_interval_secs: 60,
         health_success_threshold: 2,

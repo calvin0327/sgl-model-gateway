@@ -1,10 +1,7 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code)]
 
-pub mod mock_mcp_server;
-pub mod mock_openai_server;
 pub mod mock_worker;
-pub mod redis_test_server;
 pub mod streaming_helpers;
 pub mod test_app;
 pub mod test_certs;
@@ -18,9 +15,6 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use data_connector::{
-    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-};
 use mock_worker::{MockWorker, MockWorkerConfig};
 use serde_json::json;
 use smg::{
@@ -31,7 +25,7 @@ use smg::{
         WorkerType,
     },
     middleware::TokenBucket,
-    policies::PolicyRegistry,
+    policies::{PolicyFactory, PolicyRegistry},
     protocols::common::{Function, Tool},
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
@@ -296,11 +290,22 @@ pub async fn create_test_context(config: GatewayConfig) -> Arc<AppContext> {
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(config.routing.policy.clone()));
-
-    // Initialize storage backends (Memory for tests)
-    let response_storage = Arc::new(MemoryResponseStorage::new());
-    let conversation_storage = Arc::new(MemoryConversationStorage::new());
-    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+    let prefill_policy = PolicyFactory::create_from_config(
+        config
+            .routing
+            .prefill_policy
+            .as_ref()
+            .unwrap_or(&config.routing.policy),
+    );
+    let decode_policy = PolicyFactory::create_from_config(
+        config
+            .routing
+            .decode_policy
+            .as_ref()
+            .unwrap_or(&config.routing.policy),
+    );
+    policy_registry.set_prefill_policy(prefill_policy);
+    policy_registry.set_decode_policy(decode_policy);
 
     // Initialize load monitor
     let load_monitor = Some(Arc::new(LoadMonitor::new(
@@ -309,11 +314,9 @@ pub async fn create_test_context(config: GatewayConfig) -> Arc<AppContext> {
         client.clone(),
         config.workers.startup_check_interval_secs,
     )));
-
-    // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
+    // Create empty OnceLock for worker job queue and workflow engines
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engines = Arc::new(OnceLock::new());
-    let mcp_manager_lock = Arc::new(OnceLock::new());
 
     let app_context = Arc::new(
         AppContext::builder()
@@ -325,13 +328,9 @@ pub async fn create_test_context(config: GatewayConfig) -> Arc<AppContext> {
             .tool_parser_factory(Some(ToolParserFactory::new()))
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
-            .response_storage(response_storage)
-            .conversation_storage(conversation_storage)
-            .conversation_item_storage(conversation_item_storage)
             .load_monitor(load_monitor)
             .worker_job_queue(worker_job_queue)
             .workflow_engines(workflow_engines)
-            .mcp_manager(mcp_manager_lock)
             .build()
             .unwrap(),
     );
@@ -369,24 +368,6 @@ pub async fn create_test_context(config: GatewayConfig) -> Arc<AppContext> {
         );
         app_context.worker_registry.register(worker);
     }
-
-    // Initialize MCP manager with empty config
-    use smg_mcp::{McpConfig, McpManager};
-    let empty_config = McpConfig {
-        servers: vec![],
-        pool: Default::default(),
-        proxy: None,
-        warmup: vec![],
-        inventory: Default::default(),
-    };
-    let mcp_manager = McpManager::with_defaults(empty_config)
-        .await
-        .expect("Failed to create MCP manager");
-    app_context
-        .mcp_manager
-        .set(Arc::new(mcp_manager))
-        .ok()
-        .expect("McpManager should only be initialized once");
 
     app_context
 }
@@ -416,11 +397,6 @@ pub async fn create_test_context_with_parsers(config: GatewayConfig) -> Arc<AppC
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(config.routing.policy.clone()));
 
-    // Initialize storage backends (Memory for tests)
-    let response_storage = Arc::new(MemoryResponseStorage::new());
-    let conversation_storage = Arc::new(MemoryConversationStorage::new());
-    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
-
     // Initialize load monitor
     let load_monitor = Some(Arc::new(LoadMonitor::new(
         worker_registry.clone(),
@@ -428,11 +404,9 @@ pub async fn create_test_context_with_parsers(config: GatewayConfig) -> Arc<AppC
         client.clone(),
         config.workers.startup_check_interval_secs,
     )));
-
-    // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
+    // Create empty OnceLock for worker job queue and workflow engines
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engines = Arc::new(OnceLock::new());
-    let mcp_manager_lock = Arc::new(OnceLock::new());
 
     // Initialize parser factories
     let reasoning_parser_factory = Some(ReasoningParserFactory::new());
@@ -448,13 +422,9 @@ pub async fn create_test_context_with_parsers(config: GatewayConfig) -> Arc<AppC
             .tool_parser_factory(tool_parser_factory)
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
-            .response_storage(response_storage)
-            .conversation_storage(conversation_storage)
-            .conversation_item_storage(conversation_item_storage)
             .load_monitor(load_monitor)
             .worker_job_queue(worker_job_queue)
             .workflow_engines(workflow_engines)
-            .mcp_manager(mcp_manager_lock)
             .build()
             .unwrap(),
     );
@@ -492,142 +462,6 @@ pub async fn create_test_context_with_parsers(config: GatewayConfig) -> Arc<AppC
         );
         app_context.worker_registry.register(worker);
     }
-
-    // Initialize MCP manager with empty config
-    use smg_mcp::{McpConfig, McpManager};
-    let empty_config = McpConfig {
-        servers: vec![],
-        pool: Default::default(),
-        proxy: None,
-        warmup: vec![],
-        inventory: Default::default(),
-    };
-    let mcp_manager = McpManager::with_defaults(empty_config)
-        .await
-        .expect("Failed to create MCP manager");
-    app_context
-        .mcp_manager
-        .set(Arc::new(mcp_manager))
-        .ok()
-        .expect("McpManager should only be initialized once");
-
-    app_context
-}
-
-/// Helper function to create AppContext for tests with MCP config from file
-pub async fn create_test_context_with_mcp_config(
-    config: GatewayConfig,
-    mcp_config_path: &str,
-) -> Arc<AppContext> {
-    use smg_mcp::{McpConfig, McpManager};
-
-    let client = reqwest::Client::new();
-
-    // Initialize rate limiter
-    let rate_limiter = match config.server.max_concurrent_requests {
-        n if n <= 0 => None,
-        n => {
-            let rate_limit_tokens = config
-                .server
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
-            Some(Arc::new(TokenBucket::new(
-                n as usize,
-                rate_limit_tokens as usize,
-            )))
-        }
-    };
-
-    // Initialize registries
-    let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(config.routing.policy.clone()));
-
-    // Initialize storage backends (Memory for tests)
-    let response_storage = Arc::new(MemoryResponseStorage::new());
-    let conversation_storage = Arc::new(MemoryConversationStorage::new());
-    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
-
-    // Initialize load monitor
-    let load_monitor = Some(Arc::new(LoadMonitor::new(
-        worker_registry.clone(),
-        policy_registry.clone(),
-        client.clone(),
-        config.workers.startup_check_interval_secs,
-    )));
-
-    // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
-    let worker_job_queue = Arc::new(OnceLock::new());
-    let workflow_engines = Arc::new(OnceLock::new());
-    let mcp_manager_lock = Arc::new(OnceLock::new());
-
-    let app_context = Arc::new(
-        AppContext::builder()
-            .gateway_config(config.clone())
-            .client(client)
-            .rate_limiter(rate_limiter)
-            .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
-            .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
-            .tool_parser_factory(Some(ToolParserFactory::new()))
-            .worker_registry(worker_registry)
-            .policy_registry(policy_registry)
-            .response_storage(response_storage)
-            .conversation_storage(conversation_storage)
-            .conversation_item_storage(conversation_item_storage)
-            .load_monitor(load_monitor)
-            .worker_job_queue(worker_job_queue)
-            .workflow_engines(workflow_engines)
-            .mcp_manager(mcp_manager_lock)
-            .build()
-            .unwrap(),
-    );
-
-    // Initialize JobQueue after AppContext is created
-    let weak_context = Arc::downgrade(&app_context);
-    let job_queue = smg::core::JobQueue::new(smg::core::JobQueueConfig::default(), weak_context);
-    app_context
-        .worker_job_queue
-        .set(job_queue)
-        .expect("JobQueue should only be initialized once");
-
-    // Initialize typed workflow engines
-    use smg::core::steps::WorkflowEngines;
-    let engines = WorkflowEngines::new(&config);
-    app_context
-        .workflow_engines
-        .set(engines)
-        .expect("WorkflowEngines should only be initialized once");
-
-    // Register external workers for OpenAI mode
-    for url in &config.workers.openai_urls {
-        // Create a worker that supports common test models
-        let models = vec![
-            ModelCard::new("mock-model"),
-            ModelCard::new("gpt-4"),
-            ModelCard::new("gpt-3.5-turbo"),
-        ];
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Regular)
-                .runtime_type(RuntimeType::External)
-                .models(models)
-                .build(),
-        );
-        app_context.worker_registry.register(worker);
-    }
-
-    // Initialize MCP manager from config file
-    let mcp_config = McpConfig::from_file(mcp_config_path)
-        .await
-        .expect("Failed to load MCP config from file");
-    let mcp_manager = McpManager::with_defaults(mcp_config)
-        .await
-        .expect("Failed to create MCP manager");
-    app_context
-        .mcp_manager
-        .set(Arc::new(mcp_manager))
-        .ok()
-        .expect("McpManager should only be initialized once");
 
     app_context
 }
@@ -752,255 +586,6 @@ pub fn create_test_tools() -> Vec<Tool> {
                     "type": "object",
                     "properties": {
                         "x": {"type": "number"},
-                        "y": {"type": "number"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "translate".to_string(),
-                description: Some("Translate text".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "to": {"type": "string"},
-                        "target_lang": {"type": "string"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_time".to_string(),
-                description: Some("Get current time".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "timezone": {"type": "string"},
-                        "format": {"type": "string"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_current_time".to_string(),
-                description: Some("Get current time".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "timezone": {"type": "string"},
-                        "format": {"type": "string"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "update_settings".to_string(),
-                description: Some("Update settings".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "preferences": {"type": "object"},
-                        "notifications": {"type": "boolean"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "ping".to_string(),
-                description: Some("Ping service".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "test".to_string(),
-                description: Some("Test function".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "process".to_string(),
-                description: Some("Process data".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "count": {"type": "number"},
-                        "rate": {"type": "number"},
-                        "enabled": {"type": "boolean"},
-                        "data": {"type": "object"},
-                        "text": {"type": "string"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "web_search".to_string(),
-                description: Some("Search the web".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "num_results": {"type": "number"},
-                        "search_type": {"type": "string"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_tourist_attractions".to_string(),
-                description: Some("Get tourist attractions".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "city": {"type": "string"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "config".to_string(),
-                description: Some("Configuration function".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "debug": {"type": "boolean"},
-                        "verbose": {"type": "boolean"},
-                        "optional": {"type": "null"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "test_func".to_string(),
-                description: Some("Test function".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "bool_true": {"type": "boolean"},
-                        "bool_false": {"type": "boolean"},
-                        "none_val": {"type": "null"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "create".to_string(),
-                description: Some("Create resource".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "email": {"type": "string"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "add".to_string(),
-                description: Some("Add operation".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "x": {"type": "number"},
-                        "y": {"type": "number"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "calc".to_string(),
-                description: Some("Calculate".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "x": {"type": "number"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "func1".to_string(),
-                description: Some("Function 1".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "func2".to_string(),
-                description: Some("Function 2".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "y": {"type": "number"}
-                    }
-                }),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "tool1".to_string(),
-                description: Some("Tool 1".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
-                strict: None,
-            },
-        },
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "tool2".to_string(),
-                description: Some("Tool 2".to_string()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
                         "y": {"type": "number"}
                     }
                 }),

@@ -16,7 +16,7 @@ use crate::{
         worker::{HealthConfig, RuntimeType, WorkerType},
         BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
     },
-    protocols::worker_spec::WorkerConfigRequest,
+    protocol_compat::WorkerConfigRequest,
 };
 
 /// Step 3: Create worker object(s) with merged configuration + metadata.
@@ -100,8 +100,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
         // Parse worker type
         let worker_type = parse_worker_type(config);
 
-        // Get runtime type (for gRPC workers)
-        let runtime_type = determine_runtime_type(connection_mode, &context.data, config);
+        let runtime_type = determine_runtime_type(config);
 
         // Build circuit breaker config
         let circuit_breaker_config = build_circuit_breaker_config(app_context);
@@ -110,12 +109,12 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
         let health_config = build_health_config(app_context, config);
 
         // Normalize URL
-        let normalized_url = normalize_url(&config.url, connection_mode);
+        let normalized_url = normalize_url(&config.url);
 
         if normalized_url != config.url {
             debug!(
-                "Normalized worker URL: {} -> {} ({:?})",
-                config.url, normalized_url, connection_mode
+                "Normalized worker URL: {} -> {}",
+                config.url, normalized_url
             );
         }
 
@@ -163,7 +162,11 @@ fn build_model_card(
     config: &WorkerConfigRequest,
     labels: &HashMap<String, String>,
 ) -> ModelCard {
-    let mut card = ModelCard::new(model_id).with_model_type(ModelType::SGLANG_LLM);
+    let model_type = match determine_runtime_type(config) {
+        RuntimeType::Vllm => ModelType::LLM,
+        _ => ModelType::SGLANG_LLM,
+    };
+    let mut card = ModelCard::new(model_id).with_model_type(model_type);
 
     if let Some(ref tokenizer_path) = config.tokenizer_path {
         card = card.with_tokenizer_path(tokenizer_path.clone());
@@ -237,27 +240,59 @@ fn parse_worker_type(config: &WorkerConfigRequest) -> WorkerType {
         .unwrap_or(WorkerType::Regular)
 }
 
-fn determine_runtime_type(
-    connection_mode: &ConnectionMode,
-    data: &LocalWorkerWorkflowData,
-    config: &WorkerConfigRequest,
-) -> RuntimeType {
-    if !matches!(connection_mode, ConnectionMode::Grpc { .. }) {
-        return RuntimeType::Sglang;
+fn determine_runtime_type(config: &WorkerConfigRequest) -> RuntimeType {
+    match config.runtime.as_deref() {
+        Some("vllm") => RuntimeType::Vllm,
+        _ => RuntimeType::Sglang,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::model_type::Endpoint;
+
+    fn config(runtime: Option<&str>) -> WorkerConfigRequest {
+        WorkerConfigRequest {
+            url: "http://worker:8000".to_string(),
+            api_key: None,
+            model_id: None,
+            priority: None,
+            cost: None,
+            worker_type: None,
+            bootstrap_port: None,
+            runtime: runtime.map(str::to_string),
+            kv_connector: None,
+            kv_engine_id: None,
+            tokenizer_path: None,
+            reasoning_parser: None,
+            tool_parser: None,
+            chat_template: None,
+            labels: HashMap::new(),
+            health_check_timeout_secs: 5,
+            health_check_interval_secs: 30,
+            health_success_threshold: 2,
+            health_failure_threshold: 3,
+            disable_health_check: false,
+            max_connection_attempts: 20,
+            dp_aware: false,
+        }
     }
 
-    if let Some(ref detected_runtime) = data.detected_runtime_type {
-        match detected_runtime.as_str() {
-            "vllm" => RuntimeType::Vllm,
-            _ => RuntimeType::Sglang,
-        }
-    } else if let Some(ref runtime) = config.runtime {
-        match runtime.as_str() {
-            "vllm" => RuntimeType::Vllm,
-            _ => RuntimeType::Sglang,
-        }
-    } else {
-        RuntimeType::Sglang
+    #[test]
+    fn vllm_model_card_does_not_advertise_sglang_generate() {
+        let card = build_model_card("test-model", &config(Some("vllm")), &HashMap::new());
+
+        assert!(card.supports_endpoint(Endpoint::Chat));
+        assert!(card.supports_endpoint(Endpoint::Completions));
+        assert!(!card.supports_endpoint(Endpoint::Generate));
+    }
+
+    #[test]
+    fn sglang_model_card_advertises_generate() {
+        let card = build_model_card("test-model", &config(None), &HashMap::new());
+
+        assert!(card.supports_endpoint(Endpoint::Generate));
     }
 }
 
@@ -286,14 +321,11 @@ fn build_health_config(app_context: &AppContext, config: &WorkerConfigRequest) -
     }
 }
 
-fn normalize_url(url: &str, connection_mode: &ConnectionMode) -> String {
-    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("grpc://") {
+fn normalize_url(url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
         url.to_string()
     } else {
-        match connection_mode {
-            ConnectionMode::Http => format!("http://{}", url),
-            ConnectionMode::Grpc { .. } => format!("grpc://{}", url),
-        }
+        format!("http://{}", url)
     }
 }
 
@@ -330,6 +362,13 @@ fn create_dp_aware_workers(
                 .runtime_type(runtime_type.clone())
                 .circuit_breaker_config(circuit_breaker_config.clone())
                 .health_config(health_config.clone());
+
+        if let Some(kv_connector) = config.kv_connector.as_deref() {
+            builder = builder.kv_connector(kv_connector);
+        }
+        if let Some(kv_engine_id) = config.kv_engine_id.as_deref() {
+            builder = builder.kv_engine_id(kv_engine_id);
+        }
 
         if let Some(ref api_key) = config.api_key {
             builder = builder.api_key(api_key.clone());
@@ -376,6 +415,13 @@ fn create_single_worker(
         .runtime_type(runtime_type)
         .circuit_breaker_config(circuit_breaker_config)
         .health_config(health_config);
+
+    if let Some(kv_connector) = config.kv_connector.as_deref() {
+        builder = builder.kv_connector(kv_connector);
+    }
+    if let Some(kv_engine_id) = config.kv_engine_id.as_deref() {
+        builder = builder.kv_engine_id(kv_engine_id);
+    }
 
     if let Some(ref api_key) = config.api_key {
         builder = builder.api_key(api_key.clone());

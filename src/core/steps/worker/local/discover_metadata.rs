@@ -10,11 +10,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::strip_protocol;
-use crate::{
-    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
-    routers::grpc::client::GrpcClient,
-};
+use crate::core::steps::workflow_data::LocalWorkerWorkflowData;
 
 // HTTP client for metadata fetching
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
@@ -208,51 +204,6 @@ async fn get_model_name_from_v1_models(url: &str, api_key: Option<&str>) -> Resu
         .ok_or_else(|| format!("No model found in response from {}", models_url))
 }
 
-/// Fetch gRPC metadata (returns labels and detected runtime type).
-async fn fetch_grpc_metadata(
-    url: &str,
-    runtime_type: Option<&str>,
-) -> Result<(HashMap<String, String>, String), String> {
-    let grpc_url = if url.starts_with("grpc://") {
-        url.to_string()
-    } else {
-        format!("grpc://{}", strip_protocol(url))
-    };
-
-    async fn do_fetch(
-        grpc_url: &str,
-        runtime_type: &str,
-    ) -> Result<HashMap<String, String>, String> {
-        let client = GrpcClient::connect(grpc_url, runtime_type)
-            .await
-            .map_err(|e| format!("Failed to connect to gRPC: {}", e))?;
-
-        let model_info = client
-            .get_model_info()
-            .await
-            .map_err(|e| format!("Failed to fetch gRPC metadata: {}", e))?;
-
-        Ok(model_info.to_labels())
-    }
-
-    match runtime_type {
-        Some(runtime) => {
-            let labels = do_fetch(&grpc_url, runtime).await?;
-            Ok((labels, runtime.to_string()))
-        }
-        None => {
-            // Try SGLang first, then vLLM as fallback
-            if let Ok(labels) = do_fetch(&grpc_url, "sglang").await {
-                return Ok((labels, "sglang".to_string()));
-            }
-            let labels = do_fetch(&grpc_url, "vllm")
-                .await
-                .map_err(|e| format!("gRPC metadata failed (tried SGLang and vLLM): {}", e))?;
-            Ok((labels, "vllm".to_string()))
-        }
-    }
-}
-
 /// Step 2a: Discover metadata from worker.
 pub struct DiscoverMetadataStep;
 
@@ -263,87 +214,61 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
         context: &mut WorkflowContext<LocalWorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let config = &context.data.config;
-        let connection_mode =
-            context.data.connection_mode.as_ref().ok_or_else(|| {
-                WorkflowError::ContextValueNotFound("connection_mode".to_string())
-            })?;
+        debug!("Discovering HTTP metadata for {}", config.url);
 
-        debug!(
-            "Discovering metadata for {} ({:?})",
-            config.url, connection_mode
-        );
+        let discovered_labels = {
+            let mut labels = HashMap::new();
 
-        let (discovered_labels, detected_runtime) = match connection_mode {
-            ConnectionMode::Http => {
-                let mut labels = HashMap::new();
-
-                // Fetch from /server_info for server-related metadata
-                if let Ok(server_info) =
-                    get_server_info(&config.url, config.api_key.as_deref()).await
+            // Fetch from /server_info for server-related metadata
+            if let Ok(server_info) = get_server_info(&config.url, config.api_key.as_deref()).await {
+                if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
+                    labels.insert("model_path".to_string(), model_path);
+                }
+                if let Some(served_model_name) =
+                    server_info.served_model_name.filter(|s| !s.is_empty())
                 {
-                    if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
-                        labels.insert("model_path".to_string(), model_path);
-                    }
-                    if let Some(served_model_name) =
-                        server_info.served_model_name.filter(|s| !s.is_empty())
-                    {
-                        labels.insert("served_model_name".to_string(), served_model_name);
-                    }
-                    if let Some(tp_size) = server_info.tp_size {
-                        labels.insert("tp_size".to_string(), tp_size.to_string());
-                    }
-                    if let Some(dp_size) = server_info.dp_size {
-                        labels.insert("dp_size".to_string(), dp_size.to_string());
-                    }
-                    if let Some(load_balance_method) = server_info.load_balance_method {
-                        labels.insert("load_balance_method".to_string(), load_balance_method);
-                    }
-                    if let Some(disaggregation_mode) = server_info.disaggregation_mode {
-                        labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
+                    labels.insert("served_model_name".to_string(), served_model_name);
+                }
+                if let Some(tp_size) = server_info.tp_size {
+                    labels.insert("tp_size".to_string(), tp_size.to_string());
+                }
+                if let Some(dp_size) = server_info.dp_size {
+                    labels.insert("dp_size".to_string(), dp_size.to_string());
+                }
+                if let Some(load_balance_method) = server_info.load_balance_method {
+                    labels.insert("load_balance_method".to_string(), load_balance_method);
+                }
+                if let Some(disaggregation_mode) = server_info.disaggregation_mode {
+                    labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
+                }
+            }
+
+            // Fetch from /model_info for model-related metadata
+            if let Ok(model_info) = get_model_info(&config.url, config.api_key.as_deref()).await {
+                if let Some(tokenizer_path) = model_info.tokenizer_path.filter(|s| !s.is_empty()) {
+                    labels.insert("tokenizer_path".to_string(), tokenizer_path);
+                }
+                if let Some(model_type) = model_info.model_type.filter(|s| !s.is_empty()) {
+                    labels.insert("model_type".to_string(), model_type);
+                }
+                if let Some(architectures) = model_info.architectures.filter(|a| !a.is_empty()) {
+                    if let Ok(json_str) = serde_json::to_string(&architectures) {
+                        labels.insert("architectures".to_string(), json_str);
                     }
                 }
+            }
 
-                // Fetch from /model_info for model-related metadata
-                if let Ok(model_info) = get_model_info(&config.url, config.api_key.as_deref()).await
+            // If no model name discovered yet, try /v1/models as fallback
+            if !labels.contains_key("model_path") && !labels.contains_key("served_model_name") {
+                if let Ok(model_name) =
+                    get_model_name_from_v1_models(&config.url, config.api_key.as_deref()).await
                 {
-                    if let Some(tokenizer_path) =
-                        model_info.tokenizer_path.filter(|s| !s.is_empty())
-                    {
-                        labels.insert("tokenizer_path".to_string(), tokenizer_path);
-                    }
-                    if let Some(model_type) = model_info.model_type.filter(|s| !s.is_empty()) {
-                        labels.insert("model_type".to_string(), model_type);
-                    }
-                    if let Some(architectures) = model_info.architectures.filter(|a| !a.is_empty())
-                    {
-                        if let Ok(json_str) = serde_json::to_string(&architectures) {
-                            labels.insert("architectures".to_string(), json_str);
-                        }
-                    }
+                    labels.insert("served_model_name".to_string(), model_name);
                 }
-
-                // If no model name discovered yet, try /v1/models as fallback
-                if !labels.contains_key("model_path") && !labels.contains_key("served_model_name") {
-                    if let Ok(model_name) =
-                        get_model_name_from_v1_models(&config.url, config.api_key.as_deref()).await
-                    {
-                        labels.insert("served_model_name".to_string(), model_name);
-                    }
-                }
-
-                Ok((labels, None))
             }
-            ConnectionMode::Grpc { .. } => {
-                let runtime_type = config.runtime.as_deref();
-                fetch_grpc_metadata(&config.url, runtime_type)
-                    .await
-                    .map(|(labels, runtime)| (labels, Some(runtime)))
-            }
-        }
-        .unwrap_or_else(|e| {
-            warn!("Failed to fetch metadata for {}: {}", config.url, e);
-            (HashMap::new(), None)
-        });
+
+            labels
+        };
 
         let url = config.url.clone();
         debug!(
@@ -354,10 +279,6 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
         // Update workflow data
         context.data.discovered_labels = discovered_labels;
-        if let Some(runtime) = detected_runtime {
-            debug!("Detected runtime type: {}", runtime);
-            context.data.detected_runtime_type = Some(runtime);
-        }
 
         Ok(StepResult::Success)
     }

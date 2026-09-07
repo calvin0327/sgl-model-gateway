@@ -3,12 +3,10 @@ pub mod gateway;
 pub(crate) mod validation;
 
 pub use gateway::{
-    CircuitBreakerConfig, DiscoveryConfig, ExtensionConfig, GatewayConfig, HealthCheckConfig,
-    HistoryBackend, ManualAssignmentMode, MeshConfig, ModelConfig, ObservabilityConfig,
-    OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RoutingConfig,
-    ServerConfig, ServerTlsConfig, StorageConfig, TokenizerCacheConfig, WorkerConfig,
-    DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST,
-    DEFAULT_TCP_KEEPALIVE_SECS,
+    CircuitBreakerConfig, DiscoveryConfig, GatewayConfig, HealthCheckConfig, ManualAssignmentMode,
+    ModelConfig, ObservabilityConfig, PolicyConfig, RetryConfig, RoutingConfig, ServerConfig,
+    ServerTlsConfig, TokenizerCacheConfig, WorkerConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
+    DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
 };
 
 #[derive(Debug, thiserror::Error)]

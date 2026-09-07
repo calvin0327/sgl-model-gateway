@@ -2,19 +2,16 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use rand::{distr::Alphanumeric, Rng};
 
 use crate::{
     auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
         gateway::{
-            CircuitBreakerConfig, DiscoveryConfig, ExtensionConfig, GatewayConfig,
-            HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MeshConfig, ModelConfig,
-            ObservabilityConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-            RetryConfig, RoutingConfig, ServerConfig, ServerTlsConfig, StorageConfig,
-            TokenizerCacheConfig, WorkerConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
-            DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST,
-            DEFAULT_TCP_KEEPALIVE_SECS,
+            CircuitBreakerConfig, DiscoveryConfig, GatewayConfig, HealthCheckConfig,
+            ManualAssignmentMode, ModelConfig, ObservabilityConfig, PolicyConfig, RetryConfig,
+            RoutingConfig, ServerConfig, ServerTlsConfig, TokenizerCacheConfig, WorkerConfig,
+            DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+            DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
         },
         ConfigError, ConfigResult,
     },
@@ -123,6 +120,10 @@ pub struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     worker_urls: Vec<String>,
 
+    /// Backend runtime for configured workers (sglang or vllm)
+    #[arg(long, help_heading = "Worker Configuration")]
+    backend: Option<String>,
+
     /// Preferred input context length for regular workers (tokens; not a hard limit)
     #[arg(long, help_heading = "Worker Configuration")]
     regular_preferred_context_tokens: Option<usize>,
@@ -205,6 +206,14 @@ pub struct CliArgs {
     /// Preferred input context length for PD prefill workers (tokens; omit for no length limit)
     #[arg(long, help_heading = "PD Disaggregation")]
     pd_preferred_context_tokens: Option<usize>,
+
+    /// vLLM KV transfer connector (MooncakeConnector or NixlConnector)
+    #[arg(long, help_heading = "PD Disaggregation")]
+    kv_connector: Option<String>,
+
+    /// vLLM Mooncake engine ID used to mint KV-transfer parameters
+    #[arg(long, help_heading = "PD Disaggregation")]
+    kv_engine_id: Option<String>,
 
     /// Decode server URLs; may be specified multiple times
     #[arg(long, action = ArgAction::Append, help_heading = "PD Disaggregation")]
@@ -384,75 +393,6 @@ pub struct CliArgs {
     #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
 
-    // Extensions
-    /// Path to MCP server configuration file
-    #[arg(long, help_heading = "Extensions")]
-    mcp_config_path: Option<String>,
-
-    /// Enable WebAssembly support
-    #[arg(long, default_value_t = false, help_heading = "Extensions")]
-    enable_wasm: bool,
-
-    // Storage
-    /// History storage backend
-    #[arg(long,value_enum, default_value_t = HistoryBackendKind::Memory, help_heading = "Storage")]
-    history_backend: HistoryBackendKind,
-
-    // Oracle storage
-    /// Path to Oracle ATP wallet directory
-    #[arg(long, env = "ATP_WALLET_PATH", help_heading = "Oracle Database")]
-    oracle_wallet_path: Option<String>,
-
-    /// Oracle TNS alias from tnsnames.ora
-    #[arg(long, env = "ATP_TNS_ALIAS", help_heading = "Oracle Database")]
-    oracle_tns_alias: Option<String>,
-
-    /// Oracle connection descriptor/DSN
-    #[arg(long, env = "ATP_DSN", help_heading = "Oracle Database")]
-    oracle_dsn: Option<String>,
-
-    /// Oracle database username
-    #[arg(long, env = "ATP_USER", help_heading = "Oracle Database")]
-    oracle_user: Option<String>,
-
-    /// Oracle database password
-    #[arg(long, env = "ATP_PASSWORD", help_heading = "Oracle Database")]
-    oracle_password: Option<String>,
-
-    /// Minimum Oracle connection pool size
-    #[arg(long, env = "ATP_POOL_MIN", help_heading = "Oracle Database")]
-    oracle_pool_min: Option<usize>,
-
-    /// Maximum Oracle connection pool size
-    #[arg(long, env = "ATP_POOL_MAX", help_heading = "Oracle Database")]
-    oracle_pool_max: Option<usize>,
-
-    /// Oracle connection pool timeout in seconds
-    #[arg(long, env = "ATP_POOL_TIMEOUT_SECS", help_heading = "Oracle Database")]
-    oracle_pool_timeout_secs: Option<u64>,
-
-    // PostgreSQL storage
-    /// PostgreSQL database connection URL
-    #[arg(long, help_heading = "PostgreSQL Database")]
-    postgres_db_url: Option<String>,
-
-    /// Maximum PostgreSQL connection pool size
-    #[arg(long, help_heading = "PostgreSQL Database")]
-    postgres_pool_max_size: Option<usize>,
-
-    // Redis storage
-    /// Redis connection URL
-    #[arg(long, help_heading = "Redis Database")]
-    redis_url: Option<String>,
-
-    /// Maximum Redis connection pool size
-    #[arg(long, help_heading = "Redis Database")]
-    redis_pool_max_size: Option<usize>,
-
-    /// Redis data retention in days (-1 for persistent, default 30)
-    #[arg(long, help_heading = "Redis Database")]
-    redis_retention_days: Option<i64>,
-
     // Security
     /// Path to server TLS certificate (PEM format)
     #[arg(long, help_heading = "TLS/mTLS Security")]
@@ -543,22 +483,6 @@ pub struct CliArgs {
     /// Label selector for decode server pods in PD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
     decode_selector: Vec<String>,
-
-    // Mesh
-    #[arg(long, default_value_t = false, help_heading = "Mesh")]
-    enable_mesh: bool,
-
-    #[arg(long, help_heading = "Mesh")]
-    mesh_server_name: Option<String>,
-
-    #[arg(long, default_value = "0.0.0.0", help_heading = "Mesh")]
-    mesh_host: String,
-
-    #[arg(long, default_value_t = 39527, help_heading = "Mesh")]
-    mesh_port: u16,
-
-    #[arg(long, num_args = 0.., help_heading = "Mesh")]
-    mesh_peer_urls: Vec<String>,
 
     // Observability
     /// Directory to store log files
@@ -695,114 +619,6 @@ impl CliArgs {
         }
     }
 
-    /// Builds Oracle settings from either a DSN or wallet/TNS inputs.
-    fn build_oracle_config(&self) -> ConfigResult<OracleConfig> {
-        let (wallet_path, connect_descriptor) = match &self.oracle_dsn {
-            Some(dsn) => (None, dsn.clone()),
-            None => {
-                let wallet_path =
-                    self.oracle_wallet_path
-                        .clone()
-                        .ok_or(ConfigError::MissingRequired {
-                            field: "oracle_wallet_path or ATP_WALLET_PATH".to_string(),
-                        })?;
-                let tns_alias =
-                    self.oracle_tns_alias
-                        .clone()
-                        .ok_or(ConfigError::MissingRequired {
-                            field: "oracle_tns_alias or ATP_TNS_ALIAS".to_string(),
-                        })?;
-                (Some(wallet_path), tns_alias)
-            }
-        };
-        let username = self
-            .oracle_user
-            .clone()
-            .ok_or(ConfigError::MissingRequired {
-                field: "oracle_user or ATP_USER".to_string(),
-            })?;
-        let password = self
-            .oracle_password
-            .clone()
-            .ok_or(ConfigError::MissingRequired {
-                field: "oracle_password or ATP_PASSWORD".to_string(),
-            })?;
-
-        let pool_min = self
-            .oracle_pool_min
-            .unwrap_or_else(OracleConfig::default_pool_min);
-        let pool_max = self
-            .oracle_pool_max
-            .unwrap_or_else(OracleConfig::default_pool_max);
-
-        if pool_min == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle_pool_min".to_string(),
-                value: pool_min.to_string(),
-                reason: "pool minimum must be at least 1".to_string(),
-            });
-        }
-
-        if pool_max < pool_min {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle_pool_max".to_string(),
-                value: pool_max.to_string(),
-                reason: "pool maximum must be greater than or equal to minimum".to_string(),
-            });
-        }
-
-        let pool_timeout_secs = self
-            .oracle_pool_timeout_secs
-            .unwrap_or_else(OracleConfig::default_pool_timeout_secs);
-
-        Ok(OracleConfig {
-            wallet_path,
-            connect_descriptor,
-            username,
-            password,
-            pool_min,
-            pool_max,
-            pool_timeout_secs,
-        })
-    }
-
-    /// Builds and validates PostgreSQL storage settings.
-    fn build_postgres_config(&self) -> ConfigResult<PostgresConfig> {
-        let db_url = self.postgres_db_url.clone().unwrap_or_default();
-        let pool_max = self
-            .postgres_pool_max_size
-            .unwrap_or_else(PostgresConfig::default_pool_max);
-
-        let pcf = PostgresConfig { db_url, pool_max };
-        pcf.validate().map_err(|e| ConfigError::ValidationFailed {
-            reason: e.to_string(),
-        })?;
-
-        Ok(pcf)
-    }
-
-    /// Builds and validates Redis storage settings.
-    fn build_redis_config(&self) -> ConfigResult<RedisConfig> {
-        let url = self.redis_url.clone().unwrap_or_default();
-        let pool_max = self.redis_pool_max_size.unwrap_or(16);
-
-        let retention_days = match self.redis_retention_days {
-            Some(d) if d < 0 => None, // Persistent
-            Some(d) => Some(d as u64),
-            None => Some(30), // Default 30 days
-        };
-
-        let rcf = RedisConfig {
-            url,
-            pool_max,
-            retention_days,
-        };
-        rcf.validate().map_err(|e| ConfigError::ValidationFailed {
-            reason: e.to_string(),
-        })?;
-        Ok(rcf)
-    }
-
     /// Loads TLS material when both certificate and key paths are supplied.
     fn load_server_tls_config(&self) -> ConfigResult<Option<ServerTlsConfig>> {
         match (&self.tls_cert_path, &self.tls_key_path) {
@@ -830,84 +646,12 @@ impl CliArgs {
         }
     }
 
-    /// Loads and parses the optional MCP YAML configuration.
-    fn load_mcp_config(&self) -> ConfigResult<Option<smg_mcp::McpConfig>> {
-        let Some(path) = &self.mcp_config_path else {
-            return Ok(None);
-        };
-
-        let contents =
-            std::fs::read_to_string(path).map_err(|error| ConfigError::ValidationFailed {
-                reason: format!("Failed to read MCP config from {path}: {error}"),
-            })?;
-        let config =
-            serde_yaml::from_str(&contents).map_err(|error| ConfigError::ValidationFailed {
-                reason: format!("Failed to parse MCP config from {path}: {error}"),
-            })?;
-        Ok(Some(config))
-    }
-
-    /// Builds mesh node settings, returning None when mesh is disabled or invalid.
-    fn build_mesh_config(&self) -> ConfigResult<Option<MeshConfig>> {
-        if !self.enable_mesh {
-            return Ok(None);
-        }
-
-        let self_name = self.mesh_server_name.clone().unwrap_or_else(|| {
-            let mut rng = rand::rng();
-            let suffix: String = (0..4).map(|_| rng.sample(Alphanumeric) as char).collect();
-            format!("Mesh_{suffix}")
-        });
-
-        let address = format!("{}:{}", self.mesh_host, self.mesh_port);
-        let self_addr = match address.parse() {
-            Ok(addr) => addr,
-            Err(_) => {
-                eprintln!(
-                    "WARNING: Invalid mesh server address '{}'; mesh server will not be started",
-                    address
-                );
-                return Ok(None);
-            }
-        };
-
-        let init_peer = self
-            .mesh_peer_urls
-            .first()
-            .and_then(|peer| match peer.parse() {
-                Ok(addr) => Some(addr),
-                Err(_) => {
-                    eprintln!(
-                        "WARNING: Invalid mesh peer address '{}'; peer will be ignored",
-                        peer
-                    );
-                    None
-                }
-            });
-
-        Ok(Some(MeshConfig {
-            self_name,
-            self_addr,
-            init_peer,
-        }))
-    }
-
     /// Resolves CLI arguments into the canonical gateway configuration.
     ///
     /// File-backed settings are loaded here so the resulting configuration is
     /// self-contained and does not retain CLI paths.
     fn resolve_config(&self) -> Result<GatewayConfig> {
         let prefill_urls = self.parse_prefill_args()?;
-
-        let oracle = (self.history_backend == HistoryBackendKind::Oracle)
-            .then(|| self.build_oracle_config())
-            .transpose()?;
-        let postgres = (self.history_backend == HistoryBackendKind::Postgres)
-            .then(|| self.build_postgres_config())
-            .transpose()?;
-        let redis = (self.history_backend == HistoryBackendKind::Redis)
-            .then(|| self.build_redis_config())
-            .transpose()?;
 
         let discovery = self.service_discovery.then(|| DiscoveryConfig {
             selector: parse_label_selectors(&self.selector),
@@ -917,8 +661,6 @@ impl CliArgs {
             prefill_selector: parse_label_selectors(&self.prefill_selector),
             decode_selector: parse_label_selectors(&self.decode_selector),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-            router_selector: HashMap::new(),
-            router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
         });
 
         let control_plane_auth = self.build_control_plane_auth_config();
@@ -953,12 +695,15 @@ impl CliArgs {
             },
             workers: WorkerConfig {
                 regular_urls: self.worker_urls.clone(),
+                runtime: self.backend.clone(),
                 regular_preferred_context_tokens: self.regular_preferred_context_tokens,
                 openai_urls: self.openai_urls.clone(),
                 prefill_urls: prefill_urls.clone(),
                 pd_preferred_context_tokens: self.pd_preferred_context_tokens,
                 decode_urls: self.decode.clone(),
                 pd_group_id: None,
+                kv_connector: self.kv_connector.clone(),
+                kv_engine_id: self.kv_engine_id.clone(),
                 request_timeout_secs: self.request_timeout_secs,
                 startup_timeout_secs: self.worker_startup_timeout_secs,
                 startup_check_interval_secs: self.worker_startup_check_interval,
@@ -1003,16 +748,6 @@ impl CliArgs {
                 reasoning_parser: self.reasoning_parser.clone(),
                 tool_call_parser: self.tool_call_parser.clone(),
             },
-            storage: StorageConfig {
-                history_backend: self.history_backend.into(),
-                oracle,
-                postgres,
-                redis,
-            },
-            extensions: ExtensionConfig {
-                mcp_config: self.load_mcp_config()?,
-                enable_wasm: self.enable_wasm,
-            },
             observability: ObservabilityConfig {
                 log_dir: self.log_dir.clone(),
                 log_level: Some(self.log_level.clone()),
@@ -1025,7 +760,6 @@ impl CliArgs {
                 otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
             },
             discovery,
-            mesh: self.build_mesh_config()?,
         };
 
         config.validate()?;
@@ -1044,28 +778,6 @@ enum PolicyKind {
     PowerOfTwo,
     PrefixHash,
     Manual,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "lowercase")]
-enum HistoryBackendKind {
-    Memory,
-    None,
-    Oracle,
-    Postgres,
-    Redis,
-}
-
-impl From<HistoryBackendKind> for HistoryBackend {
-    fn from(value: HistoryBackendKind) -> Self {
-        match value {
-            HistoryBackendKind::Memory => Self::Memory,
-            HistoryBackendKind::Oracle => Self::Oracle,
-            HistoryBackendKind::Postgres => Self::Postgres,
-            HistoryBackendKind::Redis => Self::Redis,
-            HistoryBackendKind::None => Self::None,
-        }
-    }
 }
 
 /// Parse role mapping from CLI format "idp_role=gateway_role"

@@ -1,4 +1,4 @@
-//! Shared streaming helpers used by the HTTP / OpenAI / PD routers.
+//! Shared streaming helpers used by the HTTP and PD routers.
 //!
 //! The main type here is [`BreakerTrackedStream`], a `Stream` adapter that
 //! records circuit-breaker outcomes based on how the upstream stream

@@ -105,6 +105,13 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                         .health_config(updated_health_config.clone())
                         .models(worker.metadata().models.clone());
 
+                if let Some(kv_connector) = worker.metadata().kv_connector.as_deref() {
+                    builder = builder.kv_connector(kv_connector);
+                }
+                if let Some(kv_engine_id) = worker.metadata().kv_engine_id.as_deref() {
+                    builder = builder.kv_engine_id(kv_engine_id);
+                }
+
                 if let Some(ref api_key) = updated_api_key {
                     builder = builder.api_key(api_key.clone());
                 }
@@ -119,6 +126,13 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     .labels(updated_labels)
                     .health_config(updated_health_config.clone())
                     .models(worker.metadata().models.clone());
+
+                if let Some(kv_connector) = worker.metadata().kv_connector.as_deref() {
+                    builder = builder.kv_connector(kv_connector);
+                }
+                if let Some(kv_engine_id) = worker.metadata().kv_engine_id.as_deref() {
+                    builder = builder.kv_engine_id(kv_engine_id);
+                }
 
                 if let Some(ref api_key) = updated_api_key {
                     builder = builder.api_key(api_key.clone());

@@ -1,4 +1,10 @@
-use std::sync::Arc;
+use std::{
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -8,7 +14,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
-use data_connector::{ResponseId, ResponseStorage};
 use futures_util::future::BoxFuture;
 use tracing::info;
 
@@ -20,17 +25,14 @@ use crate::{
         model_type::Endpoint,
         scheduler::{Scheduler, SchedulerError, SchedulerInput, SchedulerOutput, WorkerSelection},
         worker::Worker,
-        ConnectionMode, RetryExecutor, WorkerRegistry,
+        RetryExecutor, WorkerRegistry,
     },
+    observability::metrics::{metrics_labels, Metrics},
+    protocol_compat::ResponsesGetParams,
     protocols::{
-        chat::ChatCompletionRequest,
-        classify::ClassifyRequest,
-        common::GenerationRequest,
-        completion::CompletionRequest,
-        embedding::EmbeddingRequest,
-        generate::GenerateRequest,
-        rerank::RerankRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
+        chat::ChatCompletionRequest, classify::ClassifyRequest, common::GenerationRequest,
+        completion::CompletionRequest, embedding::EmbeddingRequest, generate::GenerateRequest,
+        rerank::RerankRequest, responses::ResponsesRequest,
     },
     routers::{RouterFactory, RouterTrait},
     tokenizer::registry::TokenizerRegistry,
@@ -55,17 +57,17 @@ pub mod router_ids {
 
     pub const HTTP_REGULAR: RouterId = RouterId::new("http-regular");
     pub const HTTP_PD: RouterId = RouterId::new("http-pd");
-    pub const HTTP_OPENAI: RouterId = RouterId::new("http-openai");
-    pub const GRPC_REGULAR: RouterId = RouterId::new("grpc-regular");
-    pub const GRPC_PD: RouterId = RouterId::new("grpc-pd");
 }
 
 type ScheduledExecution =
     Arc<dyn Fn(Arc<dyn RouterTrait>) -> BoxFuture<'static, Response> + Send + Sync>;
 
+const SCHEDULED_MODE_UNKNOWN: u8 = 0;
+const SCHEDULED_MODE_REGULAR: u8 = 1;
+const SCHEDULED_MODE_PD: u8 = 2;
+
 pub struct RouterManager {
     worker_registry: Arc<WorkerRegistry>,
-    response_storage: Arc<dyn ResponseStorage>,
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
     scheduler: Arc<Scheduler>,
     retry_config: RetryConfig,
@@ -75,12 +77,10 @@ impl RouterManager {
     pub fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<crate::policies::PolicyRegistry>,
-        response_storage: Arc<dyn ResponseStorage>,
     ) -> Self {
         Self::new_with_retry_config(
             worker_registry,
             policy_registry,
-            response_storage,
             RetryConfig::default(),
             None,
         )
@@ -89,7 +89,6 @@ impl RouterManager {
     fn new_with_retry_config(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<crate::policies::PolicyRegistry>,
-        response_storage: Arc<dyn ResponseStorage>,
         retry_config: RetryConfig,
         tokenizer_registry: Option<Arc<TokenizerRegistry>>,
     ) -> Self {
@@ -100,7 +99,6 @@ impl RouterManager {
                 tokenizer_registry,
             )),
             worker_registry,
-            response_storage,
             routers: Arc::new(DashMap::new()),
             retry_config,
         }
@@ -113,7 +111,6 @@ impl RouterManager {
         let manager = Arc::new(Self::new_with_retry_config(
             app_context.worker_registry.clone(),
             app_context.policy_registry.clone(),
-            app_context.response_storage.clone(),
             config.workers.effective_retry_config(),
             Some(app_context.tokenizer_registry.clone()),
         ));
@@ -131,18 +128,6 @@ impl RouterManager {
             (
                 router_ids::HTTP_PD,
                 RouterFactory::create_pd_router(app_context)?,
-            ),
-            (
-                router_ids::GRPC_REGULAR,
-                RouterFactory::create_grpc_router(app_context)?,
-            ),
-            (
-                router_ids::GRPC_PD,
-                RouterFactory::create_grpc_pd_router(app_context)?,
-            ),
-            (
-                router_ids::HTTP_OPENAI,
-                RouterFactory::create_openai_router(app_context)?,
             ),
         ];
 
@@ -186,60 +171,20 @@ impl RouterManager {
     /// Select the backend used by APIs that do not carry a model ID.
     /// These endpoints retain their historical direct-backend behavior.
     fn default_router(&self) -> Option<Arc<dyn RouterTrait>> {
-        [
-            router_ids::HTTP_REGULAR,
-            router_ids::HTTP_OPENAI,
-            router_ids::GRPC_REGULAR,
-            router_ids::HTTP_PD,
-            router_ids::GRPC_PD,
-        ]
-        .iter()
-        .find_map(|router_id| self.get_router(router_id))
+        [router_ids::HTTP_REGULAR, router_ids::HTTP_PD]
+            .iter()
+            .find_map(|router_id| self.get_router(router_id))
     }
 
-    async fn response_is_local(&self, response_id: &str) -> Result<bool, Response> {
-        match self
-            .response_storage
-            .get_response(&ResponseId::from(response_id))
-            .await
-        {
-            Ok(response) => Ok(response.is_some()),
-            Err(error) => Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to locate response '{}': {}", response_id, error),
-            )
-                .into_response()),
-        }
-    }
-
-    async fn select_response_router(
-        &self,
-        response_id: &str,
-        local_router_id: RouterId,
-    ) -> Result<Option<Arc<dyn RouterTrait>>, Response> {
-        let router_id = if self.response_is_local(response_id).await? {
-            local_router_id
-        } else {
-            router_ids::HTTP_REGULAR
-        };
-
-        Ok(self.get_router(&router_id))
+    fn response_router(&self) -> Option<Arc<dyn RouterTrait>> {
+        self.get_router(&router_ids::HTTP_REGULAR)
+            .or_else(|| self.get_router(&router_ids::HTTP_PD))
     }
 
     fn select_router(&self, selection: &SchedulerOutput) -> Option<Arc<dyn RouterTrait>> {
         let route_id = match &selection.worker_selection {
-            WorkerSelection::Regular { worker } => match worker.connection_mode() {
-                ConnectionMode::Http => Some(router_ids::HTTP_REGULAR),
-                ConnectionMode::Grpc { .. } => Some(router_ids::GRPC_REGULAR),
-            },
-            WorkerSelection::PrefillDecode { prefill, .. } => match prefill.connection_mode() {
-                ConnectionMode::Http => Some(router_ids::HTTP_PD),
-                ConnectionMode::Grpc { .. } => Some(router_ids::GRPC_PD),
-            },
-            WorkerSelection::External { worker } => match worker.connection_mode() {
-                ConnectionMode::Http => Some(router_ids::HTTP_OPENAI),
-                ConnectionMode::Grpc { .. } => None,
-            },
+            WorkerSelection::Regular { .. } => Some(router_ids::HTTP_REGULAR),
+            WorkerSelection::PrefillDecode { .. } => Some(router_ids::HTTP_PD),
         };
 
         route_id.and_then(|route_id| {
@@ -268,6 +213,7 @@ impl RouterManager {
             .map_err(|error| {
                 let status = match error {
                     SchedulerError::ModelRequired { .. } => StatusCode::BAD_REQUEST,
+                    SchedulerError::ModelNotFound { .. } => StatusCode::BAD_REQUEST,
                     SchedulerError::NoModelsAvailable
                     | SchedulerError::NoAvailableWorker { .. }
                     | SchedulerError::NoAvailablePdPair { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -289,11 +235,16 @@ impl RouterManager {
         headers: Option<&HeaderMap>,
         execute: ScheduledExecution,
     ) -> Response {
+        let scheduled_mode = Arc::new(AtomicU8::new(SCHEDULED_MODE_UNKNOWN));
+
         RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             |_attempt| {
                 let execute = Arc::clone(&execute);
+                let scheduled_mode = Arc::clone(&scheduled_mode);
                 async move {
+                    scheduled_mode.store(SCHEDULED_MODE_UNKNOWN, Ordering::Relaxed);
+
                     let selection = match self
                         .schedule_request(model_id, endpoint, request_text, headers)
                         .await
@@ -301,6 +252,12 @@ impl RouterManager {
                         Ok(selection) => selection,
                         Err(response) => return response,
                     };
+
+                    let mode = match selection.worker_selection {
+                        WorkerSelection::Regular { .. } => SCHEDULED_MODE_REGULAR,
+                        WorkerSelection::PrefillDecode { .. } => SCHEDULED_MODE_PD,
+                    };
+                    scheduled_mode.store(mode, Ordering::Relaxed);
 
                     let Some(router) = self.select_router(&selection) else {
                         return (
@@ -316,8 +273,50 @@ impl RouterManager {
                 }
             },
             |response, _attempt| is_retryable_status(response.status()),
-            |_delay, _next_attempt| {},
-            || {},
+            {
+                let scheduled_mode = Arc::clone(&scheduled_mode);
+                move |delay: Duration, next_attempt: u32| {
+                    Metrics::record_worker_retry_backoff(next_attempt, delay);
+
+                    match scheduled_mode.load(Ordering::Relaxed) {
+                        SCHEDULED_MODE_REGULAR => Metrics::record_worker_retry(
+                            metrics_labels::WORKER_REGULAR,
+                            endpoint.path(),
+                        ),
+                        SCHEDULED_MODE_PD => {
+                            Metrics::record_worker_retry(
+                                metrics_labels::WORKER_PREFILL,
+                                endpoint.path(),
+                            );
+                            Metrics::record_worker_retry(
+                                metrics_labels::WORKER_DECODE,
+                                endpoint.path(),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            },
+            {
+                let scheduled_mode = Arc::clone(&scheduled_mode);
+                move || match scheduled_mode.load(Ordering::Relaxed) {
+                    SCHEDULED_MODE_REGULAR => Metrics::record_worker_retries_exhausted(
+                        metrics_labels::WORKER_REGULAR,
+                        endpoint.path(),
+                    ),
+                    SCHEDULED_MODE_PD => {
+                        Metrics::record_worker_retries_exhausted(
+                            metrics_labels::WORKER_PREFILL,
+                            endpoint.path(),
+                        );
+                        Metrics::record_worker_retries_exhausted(
+                            metrics_labels::WORKER_DECODE,
+                            endpoint.path(),
+                        );
+                    }
+                    _ => {}
+                }
+            },
         )
         .await
     }
@@ -480,15 +479,7 @@ impl RouterTrait for RouterManager {
         response_id: &str,
         params: &ResponsesGetParams,
     ) -> Response {
-        let router = match self
-            .select_response_router(response_id, router_ids::HTTP_OPENAI)
-            .await
-        {
-            Ok(router) => router,
-            Err(response) => return response,
-        };
-
-        if let Some(router) = router {
+        if let Some(router) = self.response_router() {
             router.get_response(headers, response_id, params).await
         } else {
             (
@@ -500,15 +491,7 @@ impl RouterTrait for RouterManager {
     }
 
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        let router = match self
-            .select_response_router(response_id, router_ids::GRPC_REGULAR)
-            .await
-        {
-            Ok(router) => router,
-            Err(response) => return response,
-        };
-
-        if let Some(router) = router {
+        if let Some(router) = self.response_router() {
             router.cancel_response(headers, response_id).await
         } else {
             (
@@ -532,15 +515,7 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         response_id: &str,
     ) -> Response {
-        let router = match self
-            .select_response_router(response_id, router_ids::HTTP_OPENAI)
-            .await
-        {
-            Ok(router) => router,
-            Err(response) => return response,
-        };
-
-        if let Some(router) = router {
+        if let Some(router) = self.response_router() {
             router.list_response_input_items(headers, response_id).await
         } else {
             (

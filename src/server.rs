@@ -3,7 +3,6 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{anyhow, Context, Error, Result};
 use axum::Router;
 use rustls::crypto::ring;
-use smg_mesh::{rate_limit_window::RateLimitWindow, MeshServerHandler, MeshSyncManager};
 use tokio::{signal, spawn, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 use wfaas::LoggingSubscriber;
@@ -47,11 +46,7 @@ pub async fn startup(config: GatewayConfig) -> Result<()> {
         duration_buckets: config.observability.prometheus_duration_buckets.clone(),
     });
 
-    // start mesh synchronization server
-    let (mesh_handler, mesh_sync_manager) = start_mesh(config.mesh.as_ref());
-    let mesh_shutdown_handler = mesh_handler.clone();
-
-    let app_context = initialize_app_context(&config, mesh_sync_manager.as_ref()).await?;
+    let app_context = initialize_app_context(&config).await?;
 
     // Create the empty router manager before worker jobs start. Routers are
     // created lazily by the worker registration workflow.
@@ -66,12 +61,6 @@ pub async fn startup(config: GatewayConfig) -> Result<()> {
 
     submit_startup_jobs(&app_context, &config).await?;
 
-    // start mcp manager
-    if let Some(mcp_manager) = app_context.mcp_manager.get() {
-        Arc::clone(mcp_manager).spawn_background_refresh_all(Duration::from_secs(600));
-        debug!("Started background refresh for all MCP servers (every 10 minutes)");
-    }
-
     let health_checker = start_health_checker(&app_context, &config);
 
     // start load monitor
@@ -83,26 +72,14 @@ pub async fn startup(config: GatewayConfig) -> Result<()> {
     let (concurrency_queue_tx, concurrency_processor) =
         start_concurrency_queue(&app_context, &config);
 
-    let app_state = build_app_state(
-        app_context.clone(),
-        router_manager,
-        concurrency_queue_tx,
-        mesh_handler,
-        mesh_sync_manager,
-    );
+    let app_state = build_app_state(app_context.clone(), router_manager, concurrency_queue_tx);
 
     start_service_discovery_if_enabled(&config, &app_state).await;
 
     let app = build_http_app(&config, app_state).await;
     let server_result = serve_http(app, &config).await;
 
-    shutdown_background_services(
-        &app_context,
-        health_checker,
-        concurrency_processor,
-        mesh_shutdown_handler,
-    )
-    .await;
+    shutdown_background_services(&app_context, health_checker, concurrency_processor).await;
 
     server_result
 }
@@ -112,7 +89,6 @@ async fn shutdown_background_services(
     app_context: &Arc<AppContext>,
     health_checker: Option<crate::core::worker::HealthChecker>,
     concurrency_processor: Option<JoinHandle<()>>,
-    mesh_handler: Option<Arc<MeshServerHandler>>,
 ) {
     const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -133,84 +109,16 @@ async fn shutdown_background_services(
             warn!("Worker health checker did not stop before timeout");
         }
     }
-
-    if let Some(mesh_handler) = mesh_handler {
-        match tokio::time::timeout(
-            BACKGROUND_SHUTDOWN_TIMEOUT,
-            mesh_handler.graceful_shutdown(),
-        )
-        .await
-        {
-            Ok(Ok(())) => info!("Mesh shut down gracefully"),
-            Ok(Err(error)) => warn!(%error, "Mesh graceful shutdown failed"),
-            Err(_) => warn!("Mesh graceful shutdown timed out"),
-        }
-    }
-}
-
-/// Starts the optional mesh server and returns its request and synchronization handles.
-fn start_mesh(
-    mesh_config: Option<&crate::config::MeshConfig>,
-) -> (Option<Arc<MeshServerHandler>>, Option<Arc<MeshSyncManager>>) {
-    let Some(mesh_config) = mesh_config else {
-        return (None, None);
-    };
-
-    use smg_mesh::{partition::PartitionDetector, stores::StateStores, sync::MeshSyncManager};
-
-    let stores = Arc::new(StateStores::with_self_name(mesh_config.self_name.clone()));
-    let sync_manager = Arc::new(MeshSyncManager::new(
-        stores.clone(),
-        mesh_config.self_name.clone(),
-    ));
-    let partition_detector = Arc::new(PartitionDetector::default());
-    sync_manager.update_rate_limit_membership();
-
-    let window_manager = RateLimitWindow::new(sync_manager.clone(), 1);
-    spawn(async move {
-        window_manager.start_reset_task().await;
-    });
-
-    use smg_mesh::service::MeshServerBuilder;
-    let builder = MeshServerBuilder::new(
-        mesh_config.self_name.clone(),
-        mesh_config.self_addr,
-        mesh_config.init_peer,
-    );
-    let (mesh_server, handler) = builder.build_with_stores(Some(stores.clone()));
-
-    let stores_for_server = stores.clone();
-    let sync_manager_for_server = sync_manager.clone();
-    spawn(async move {
-        if let Err(error) = mesh_server
-            .start_serve_with_stores(
-                Some(stores_for_server),
-                Some(sync_manager_for_server),
-                Some(partition_detector),
-            )
-            .await
-        {
-            error!("Mesh server failed: {error}");
-        }
-    });
-
-    (Some(Arc::new(handler)), Some(sync_manager))
 }
 
 /// Creates shared application state and the job-processing infrastructure.
-async fn initialize_app_context(
-    config: &GatewayConfig,
-    mesh_sync_manager: Option<&Arc<MeshSyncManager>>,
-) -> Result<Arc<AppContext>> {
+async fn initialize_app_context(config: &GatewayConfig) -> Result<Arc<AppContext>> {
     let app_context = Arc::new(
         AppContext::from_config(config.clone())
             .await
             .map_err(Error::msg)
             .context("create app context")?,
     );
-
-    // Configure shared mesh state before creating PD policies and registering workers.
-    configure_mesh_sync(&app_context, mesh_sync_manager);
 
     // Initialize PD policies before startup worker-registration jobs can run.
     // The registry uses OnceLock for these policies, so they must be configured
@@ -257,7 +165,7 @@ async fn initialize_app_context(
     Ok(app_context)
 }
 
-/// Queues startup work for configured tokenizers, workers, and MCP servers.
+/// Queues startup work for configured tokenizers and workers.
 async fn submit_startup_jobs(app_context: &Arc<AppContext>, config: &GatewayConfig) -> Result<()> {
     let job_queue = app_context
         .worker_job_queue
@@ -299,19 +207,6 @@ async fn submit_startup_jobs(app_context: &Arc<AppContext>, config: &GatewayConf
 
     info!("Worker initialization job submitted (will complete in background)");
 
-    // MCP initialization job
-    if let Some(mcp_config) = &config.extensions.mcp_config {
-        info!("Found {} MCP server(s) in config", mcp_config.servers.len());
-        job_queue
-            .submit(Job::InitializeMcpServers {
-                mcp_config: Box::new(mcp_config.clone()),
-            })
-            .await
-            .map_err(|error| anyhow!("Failed to submit MCP initialization job: {error}"))?;
-    } else {
-        info!("No MCP config provided, skipping MCP server initialization");
-    }
-
     Ok(())
 }
 
@@ -324,11 +219,6 @@ fn create_router_manager(
         .map_err(Error::msg)
         .context("create router manager")?;
 
-    let worker_stats = app_context.worker_registry.stats();
-    info!(
-        "Workers initialized: {} total, {} healthy",
-        worker_stats.total_workers, worker_stats.healthy_workers
-    );
     Ok(router_manager)
 }
 
@@ -387,28 +277,11 @@ fn start_concurrency_queue(
     }
 }
 
-/// Shares mesh synchronization with registries that replicate worker and policy state.
-fn configure_mesh_sync(app_context: &Arc<AppContext>, sync_manager: Option<&Arc<MeshSyncManager>>) {
-    let Some(sync_manager) = sync_manager else {
-        return;
-    };
-
-    app_context
-        .worker_registry
-        .set_mesh_sync(Some(sync_manager.clone()));
-    app_context
-        .policy_registry
-        .set_mesh_sync(Some(sync_manager.clone()));
-    info!("Mesh sync manager set on worker and policy registries");
-}
-
 /// Combines routing and component handles into the state injected into HTTP handlers.
 fn build_app_state(
     app_context: Arc<AppContext>,
     router_manager: Arc<RouterManager>,
     concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
-    mesh_handler: Option<Arc<MeshServerHandler>>,
-    mesh_sync_manager: Option<Arc<MeshSyncManager>>,
 ) -> Arc<AppState> {
     let router: Arc<dyn RouterTrait> = router_manager.clone();
     Arc::new(AppState {
@@ -416,8 +289,6 @@ fn build_app_state(
         context: app_context,
         concurrency_queue_tx,
         router_manager: Some(router_manager),
-        mesh_handler,
-        mesh_sync_manager,
     })
 }
 
@@ -436,23 +307,9 @@ async fn start_service_discovery_if_enabled(config: &GatewayConfig, app_state: &
         prefill_selector: discovery.prefill_selector,
         decode_selector: discovery.decode_selector,
         bootstrap_port_annotation: discovery.bootstrap_port_annotation,
-        router_selector: discovery.router_selector,
-        router_mesh_port_annotation: discovery.router_mesh_port_annotation,
     };
-    let mesh_cluster_state = app_state
-        .mesh_handler
-        .as_ref()
-        .map(|handler| handler.state.clone());
-    let mesh_port = config.mesh.as_ref().map(|mesh| mesh.self_addr.port());
 
-    match start_service_discovery(
-        service_discovery_config,
-        Arc::clone(&app_state.context),
-        mesh_cluster_state,
-        mesh_port,
-    )
-    .await
-    {
+    match start_service_discovery(service_discovery_config, Arc::clone(&app_state.context)).await {
         Ok(handle) => {
             info!("Service discovery started");
             spawn(async move {
@@ -520,10 +377,10 @@ async fn serve_http(app: Router, config: &GatewayConfig) -> Result<()> {
 
     // https server
     if let Some(tls) = &config.server.server_tls {
-        info!("TLS enabled");
         ring::default_provider()
             .install_default()
             .map_err(|error| anyhow!("Failed to install rustls ring provider: {error:?}"))?;
+
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
             tls.certificate.clone(),
             tls.private_key.clone(),

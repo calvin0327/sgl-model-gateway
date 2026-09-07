@@ -126,11 +126,8 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         )
         return
 
-    # Get storage backend from marker (default: memory)
-    storage_backend = get_marker_value(request, "storage", default="memory")
-
     # Cloud backends: launch cloud router
-    yield from _setup_cloud_backend(backend_name, storage_backend, gateway_config)
+    yield from _setup_cloud_backend(backend_name, gateway_config)
 
 
 def _setup_pd_backend(
@@ -408,14 +405,12 @@ def _setup_local_backend(
 
 def _setup_cloud_backend(
     backend_name: str,
-    storage_backend: str = "memory",
     gateway_config: dict | None = None,
 ):
     """Setup cloud backend (openai, xai, etc.).
 
     Args:
         backend_name: Cloud backend name (openai, xai).
-        storage_backend: History storage backend (memory, oracle).
         gateway_config: Gateway configuration from marker.
     """
     import openai
@@ -432,12 +427,9 @@ def _setup_cloud_backend(
 
     extra_args = gateway_config.get("extra_args") if gateway_config else None
 
-    logger.info(
-        "Launching cloud backend: %s with storage=%s", backend_name, storage_backend
-    )
+    logger.info("Launching cloud backend: %s", backend_name)
     gateway = launch_cloud_gateway(
         backend_name,
-        history_backend=storage_backend,
         extra_args=extra_args,
     )
 

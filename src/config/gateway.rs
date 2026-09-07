@@ -1,7 +1,6 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::collections::HashMap;
 
 use clap::ValueEnum;
-pub use data_connector::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig};
 use serde::{Deserialize, Serialize};
 
 use super::validation::ConfigValidator;
@@ -20,9 +19,6 @@ pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 pub struct GatewayConfig {
     pub server: ServerConfig,
 
-    /// Mesh node settings; absent when mesh is disabled.
-    pub mesh: Option<MeshConfig>,
-
     // RoutingConfig is not clear
     pub routing: RoutingConfig,
 
@@ -31,9 +27,6 @@ pub struct GatewayConfig {
     pub workers: WorkerConfig,
 
     pub model: ModelConfig,
-
-    pub storage: StorageConfig,
-    pub extensions: ExtensionConfig,
 
     pub observability: ObservabilityConfig,
 }
@@ -283,6 +276,13 @@ impl PolicyConfig {
 pub struct WorkerConfig {
     pub regular_urls: Vec<String>,
 
+    /// Backend runtime for workers configured by URL.
+    ///
+    /// This applies to regular, prefill, and decode workers. It is `None` for
+    /// the historical default, SGLang.
+    #[serde(default)]
+    pub runtime: Option<String>,
+
     /// Preferred input context length for regular workers. This is a routing
     /// preference, not a hard limit.
     #[serde(default)]
@@ -302,6 +302,14 @@ pub struct WorkerConfig {
     /// Workers in the same group may be paired with each other.
     #[serde(default)]
     pub pd_group_id: Option<String>,
+
+    /// KV transfer connector used by vLLM prefill/decode deployments.
+    #[serde(default)]
+    pub kv_connector: Option<String>,
+
+    /// vLLM Mooncake engine ID used to mint KV-transfer parameters.
+    #[serde(default)]
+    pub kv_engine_id: Option<String>,
 
     pub openai_urls: Vec<String>,
 
@@ -353,11 +361,14 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             regular_urls: Vec::new(),
+            runtime: None,
             regular_preferred_context_tokens: None,
             prefill_urls: Vec::new(),
             pd_preferred_context_tokens: None,
             decode_urls: Vec::new(),
             pd_group_id: None,
+            kv_connector: None,
+            kv_engine_id: None,
             openai_urls: Vec::new(),
 
             request_timeout_secs: 1800,
@@ -548,35 +559,6 @@ impl Default for TokenizerCacheConfig {
     }
 }
 
-/// Configuration for conversation and request history storage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StorageConfig {
-    pub history_backend: HistoryBackend,
-    pub oracle: Option<OracleConfig>,
-    pub postgres: Option<PostgresConfig>,
-    pub redis: Option<RedisConfig>,
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            history_backend: HistoryBackend::Memory,
-            oracle: None,
-            postgres: None,
-            redis: None,
-        }
-    }
-}
-
-/// Configuration for optional gateway extensions.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ExtensionConfig {
-    #[serde(skip)]
-    pub mcp_config: Option<smg_mcp::McpConfig>,
-    #[serde(default)]
-    pub enable_wasm: bool,
-}
-
 /// Logging, metrics, and tracing settings for the gateway process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservabilityConfig {
@@ -627,10 +609,6 @@ pub struct DiscoveryConfig {
 
     /// Pod annotation containing a Prefill Worker bootstrap port.
     pub bootstrap_port_annotation: String,
-    /// Labels used to discover gateway Pods for mesh membership.
-    pub router_selector: HashMap<String, String>,
-    /// Pod annotation containing a gateway mesh port.
-    pub router_mesh_port_annotation: String,
 }
 
 impl Default for DiscoveryConfig {
@@ -643,16 +621,6 @@ impl Default for DiscoveryConfig {
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-            router_selector: HashMap::new(),
-            router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
         }
     }
-}
-
-/// Configuration for this gateway's mesh node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MeshConfig {
-    pub self_name: String,
-    pub self_addr: SocketAddr,
-    pub init_peer: Option<SocketAddr>,
 }

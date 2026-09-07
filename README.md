@@ -1,13 +1,15 @@
 # SGLang Model Gateway
 
-High-performance model routing control and data plane for large-scale LLM deployments. The gateway orchestrates fleets of workers, balances traffic across HTTP and gRPC backends, and exposes OpenAI-compatible APIs with pluggable history storage and tool integrations—while remaining deeply optimized for the SGLang serving runtime.
+
+## Reliability & Flow Control
+- **HTTP Client**: Upstream HTTP client connection settings default to pool idle timeout 50s, connect timeout 10s, max idle connections per host 500, and TCP keepalive 30s. Configure via `--pool-idle-timeout-secs`, `--connect-timeout-secs`, `--pool-max-idle-per-host`, `--tcp-keepalive-secs`, or the corresponding `SMG_*` env vars.
+High-performance model routing control and data plane for large-scale LLM deployments. The gateway orchestrates fleets of workers, balances traffic across HTTP and gRPC backends, and exposes OpenAI-compatible APIs with tool integrations—while remaining deeply optimized for the SGLang serving runtime.
 
 ## Overview
 - Unified control plane for registering, monitoring, and orchestrating prefill, decode, and regular workers across heterogeneous model fleets.
 - Data plane that routes requests across HTTP, PD (prefill/decode), gRPC, and OpenAI-compatible backends with shared reliability features.
 - Industry-first gRPC pipeline with native Rust tokenization, reasoning, and tool-call execution for high-throughput OpenAI-compatible serving.
 - Multi-model inference gateway mode (`--enable-igw`) that runs several routers at once and applies per-model policies.
-- Conversation, response, and chat-history connectors that centralize state at the router, enabling compliant sharing across models/MCP loops with in-memory, no-op, or Oracle ATP storage options.
 - Built-in reliability primitives: retries with exponential backoff, circuit breakers, token-bucket rate limiting, and queuing.
 - First-class observability with structured logging, OpenTelemetry trace and Prometheus metrics.
 
@@ -21,7 +23,6 @@ High-performance model routing control and data plane for large-scale LLM deploy
 **Data Plane**
 - SGLang HTTP routers for regular and PD (prefill/decode) traffic with policy-aware selection.
 - SGLang gRPC router and pipeline that stream tokenized requests through SRT gRPC workers with fully Rust tokenizer, reasoning parser, and tool parser implementations for maximal OpenAI API performance, supporting both single-stage and PD serving topologies.
-- OpenAI router that proxies OpenAI-style requests, responses, and conversations to remote vendors (OpenAI, xAI, Gemini, and other OpenAI-compatible providers) while preserving streaming/SSE semantics.
 - Router Manager coordinates multiple router implementations when IGW is enabled.
 - Resilience layer delivers token-bucket rate limiting, request queuing, retry executor, and per-worker circuit breakers to keep traffic flowing through failures.
 - Advanced load balancing with cache-aware request reuse, load-aware (power-of-two) selection, and per-model policy overrides.
@@ -31,14 +32,12 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Multi-model HTTP serving and inference gateway routing with model-specific policies.
 - Prefill/decode disaggregation, including bootstrap port handling and cache-aware merging.
 - gRPC routing with fully Rust tokenizer loading, reasoning parser selection, and tool parser integration for OpenAI-compatible endpoints—supporting streaming and non-streaming modes across DeepSeek, Llama, Kimi K2, Qwen, GPT-OSS, Mistral, Step-3, GLM4, GLM4.7 and other reasoning-capable models.
-- OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/conversations`, `/v1/embeddings`, `/v1/rerank`, `/v1/classify` endpoints.
+- OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, and `/v1/classify` endpoints.
 - **Tokenization APIs**: HTTP endpoints for tokenize (`/v1/tokenize`) and detokenize (`/v1/detokenize`) with batch support; tokenizer management APIs for dynamic registration.
 - **Parser endpoints**: Reasoning parser (`/parse/reasoning`) and function call parser (`/parse/function_call`) for separating reasoning content and extracting tool calls.
-- Native MCP client integration supporting all MCP transport protocols (STDIO, HTTP, SSE, and Streamable) for tool execution loops.
-- Pluggable history connectors: in-memory, disabled, Oracle ATP, or PostgreSQL (with pooling and credential support).
 - Reliability controls: retry with jitter, worker-scoped circuit breakers, token bucket limiter with optional queue, and cache flush APIs.
 - Service discovery for regular and PD workloads with independent selectors.
-- **Comprehensive observability**: 40+ Prometheus metrics across HTTP, router, worker, circuit breaker, retry, discovery, MCP, and database layers; OpenTelemetry tracing with OTLP export; structured logging with request ID propagation.
+- **Comprehensive observability**: Prometheus metrics across HTTP, router, worker, circuit breaker, retry, and discovery layers; OpenTelemetry tracing with OTLP export; structured logging with request ID propagation.
 
 ## Documentation
 - **User Guide**: [docs.sglang.io/advanced_features/sgl_model_gateway.html](https://docs.sglang.io/advanced_features/sgl_model_gateway.html)
@@ -134,6 +133,26 @@ The `--version` (or `-V`) flag displays the version string. Use `--version-verbo
     --worker-urls http://worker1:8000 http://worker2:8000 \
     --policy cache_aware
   ```
+
+### vLLM HTTP Routing
+Add `--backend vllm` to mark URL-configured workers as vLLM workers:
+```bash
+./target/release/sgl-model-gateway \
+  --backend vllm \
+  --worker-urls http://vllm1:8000 http://vllm2:8000
+```
+vLLM workers advertise OpenAI-compatible chat, completions, responses, and tool capabilities, but not the SGLang-native `/generate` endpoint. Load-aware routing reads `vllm:num_requests_running` and `vllm:num_requests_waiting` from `/metrics`.
+
+For vLLM PD, configure the same backend and connector:
+```bash
+./target/release/sgl-model-gateway \
+  --backend vllm \
+  --pd-disaggregation \
+  --prefill http://prefill:30001 8998 \
+  --decode http://decode:30011 \
+  --kv-connector NixlConnector
+```
+Use `--kv-connector MooncakeConnector --kv-engine-id <id>` for Mooncake deployments with a reported engine ID. The vLLM PD path dispatches prefill first and then decode with `kv_transfer_params`; requests with `n > 1` skip KV relay because the handoff is single-consumer.
 
 ### Prefill/Decode Disaggregation (PD)
 - **Rust binary**
@@ -248,124 +267,6 @@ python3 -m sglang_router.launch_router \
 - Provide exactly one `--worker-urls` entry per router instance.
 - The Rust binary supports the same flags (`./target/release/sgl-model-gateway --backend openai ...`).
 
-### MCP Integration
-The SGL Model Gateway provides native Model Context Protocol (MCP) client integration, enabling tool calling across STDIO, SSE, and Streamable transports. MCP servers are configured via a YAML configuration file and registered at startup through the workflow engine.
-
-#### Basic Usage
-```bash
-# Rust binary
-./target/release/sgl-model-gateway \
-  --mcp-config-path /path/to/mcp-config.yaml \
-  --worker-urls http://worker1:8000
-
-# Python launcher
-python3 -m sglang_router.launch_router \
-  --mcp-config-path /path/to/mcp-config.yaml \
-  --worker-urls http://worker1:8000
-```
-
-#### MCP Configuration File
-Create an MCP configuration file to define servers, transports, and connection settings:
-
-```yaml
-servers:
-  - name: "filesystem"
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-    protocol: "stdio"
-    required: false
-
-  - name: "github"
-    url: "https://api.github.com/mcp"
-    token: "ghp_xxxxx"
-    protocol: "sse"
-    required: false
-
-  - name: "custom-tools"
-    url: "https://tools.example.com/mcp"
-    protocol: "streamable"
-    required: true
-
-pool:
-  max_connections: 100
-  idle_timeout: 300  # seconds
-
-proxy:
-  http: "http://proxy.internal:8080"
-  https: "https://proxy.internal:8443"
-  no_proxy: "localhost,127.0.0.1,*.internal"
-
-inventory:
-  enable_refresh: true
-  tool_ttl: 300  # seconds - how long tools are considered fresh
-  refresh_interval: 300  # seconds - background refresh interval
-```
-
-#### Configuration Options
-
-**Server Configuration** (`servers` array):
-- `name`: Unique identifier for the MCP server
-- `command` + `args`: For STDIO transport (local process execution)
-- `url`: For SSE or Streamable transports (HTTP/HTTPS endpoints)
-- `token`: Optional authentication token for HTTP-based transports
-- `protocol`: Protocol type (`"sse"`, `"streamable"`, or `"stdio"`)
-- `required`: If `true`, router fails to start if server is unreachable (default: `false`)
-- `envs`: Environment variables for STDIO processes (optional)
-- `proxy`: Per-server proxy override (set to `null` to bypass global proxy)
-
-**Connection Pool** (`pool`):
-- `max_connections`: Maximum pooled connections for dynamic servers (default: 100)
-- `idle_timeout`: Idle connection timeout in seconds before cleanup (default: 300)
-
-**Proxy Configuration** (`proxy`):
-- `http`/`https`: Proxy URLs for MCP server connections (not LLM traffic)
-- `no_proxy`: Comma-separated hosts to exclude from proxying (supports wildcards)
-- **Note**: Proxy settings are currently ignored for `streamable` transport. Use STDIO or SSE transports if proxy support is required.
-
-**Inventory Settings** (`inventory`):
-- `enable_refresh`: Enable automatic background refresh of tool inventory (default: true)
-- `tool_ttl`: Tool cache TTL in seconds - how long tools are considered fresh (default: 300)
-- `refresh_interval`: Background refresh interval in seconds - proactive inventory refresh (default: 300)
-
-#### Transport Types
-
-**STDIO** (Local Process):
-```yaml
-name: "local-tools"
-command: "python"
-args: ["-m", "my_mcp_server"]
-envs:
-  API_KEY: "secret"
-  DEBUG: "true"
-```
-
-**SSE** (Server-Sent Events):
-```yaml
-name: "remote-sse"
-url: "https://mcp.example.com/events"
-token: "bearer-token"
-protocol: "sse"
-```
-
-**Streamable** (Bidirectional Streaming):
-```yaml
-name: "streaming-tools"
-url: "https://mcp.example.com/stream"
-protocol: "streamable"
-required: true
-```
-
-#### Server Lifecycle
-- MCP servers are registered via the workflow engine with retry logic (100 attempts, 2-hour timeout for STDIO servers)
-- Discovery phase identifies tools, prompts, and resources
-- Tool inventory is cached with configurable TTL and periodic refresh
-- Failed optional servers log warnings; required servers halt startup
-- Static servers (from config) are permanent; dynamic servers (per-request) use connection pooling
-
-Check Prometheus metrics for MCP activity (`mcp_*` metrics) and workflow job status via the admin API.
-
-### Python Launcher (Router + Workers)
-Launch router and SGLang worker processes together; `launch_server` spins up workers (HTTP or gRPC) and the router in one shot.
 ```bash
 python3 -m sglang_router.launch_server --host 0.0.0.0
 ```
@@ -498,8 +399,6 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 ### OpenAI Router
 - Proxies OpenAI-compatible chat completions and responses APIs, preserving headers and SSE streams end-to-end.
 - Supports `/v1/responses` background jobs with cancellation, deletion, and listing input items—enabling agentic, multi-turn orchestration without persisting data at remote vendor endpoints.
-- Conversation APIs (`/v1/conversations` and `/v1/conversations/{id}/items`) interact with the configured conversation storage backend for compliant chat-history management. Conversation state lives at the router tier, so the same history can drive different models or MCP loops without leaking data to upstream vendors.
-- Chat history, agentic multi-turn `/v1/responses`, and the native MCP client (STDIO/HTTP/SSE/Streamable transports) are designed to satisfy enterprise data-privacy requirements by keeping sensitive state within the router.
 
 ### Request Endpoints
 | Endpoint                                                                         | Notes                                                      |
@@ -509,7 +408,6 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 | `POST /v1/completions`                                                           | OpenAI-compatible text completions.                        |
 | `POST /v1/responses`                                                             | Create background responses, returns response IDs.         |
 | `GET /v1/responses/{id}`                                                         | Retrieve stored responses.                                 |
-| Conversation endpoints (`/v1/conversations`, `/v1/conversations/{id}`, `/v1/conversations/{id}/items`) | Manage chat history.                                       |
 | `POST /v1/embeddings`                                                            | Forward embedding requests (HTTP and gRPC).                |
 | `POST /v1/rerank`, `POST /rerank`                                                | Ranking APIs.                                              |
 | `POST /v1/classify`                                                              | Text classification endpoint.                              |
@@ -665,100 +563,6 @@ The gateway provides admin endpoints for parsing reasoning content and function 
 ```
 
 Supported tool parsers: `json`, `python`, `xml`.
-
-## Conversations, Responses, and Data Connectors
-- `--history-backend memory` (default) stores responses and conversations in-process.
-- `--history-backend none` disables persistence while keeping APIs.
-- `--history-backend oracle` uses Oracle Autonomous Database; provide credentials via flags or environment variables.
-- `--history-backend postgres` uses PostgreSQL Database.
-- `--history-backend redis` uses Redis.
-- Conversation item storage mirrors the history backend (Oracle or memory). The same storage powers OpenAI `/responses` and conversation APIs.
-
-### History Backend (OpenAI Router Mode)
-Store conversation and response data for tracking, debugging, or analytics.
-
-> **Note:** History backends are currently supported only when running with `--backend openai`. gRPC mode support for the `/v1/responses` API is planned.
-
-#### Available storage options
-- **Memory** (default): In-memory storage, fast but ephemeral.
-- **None**: No storage, minimal overhead.
-- **Oracle**: Persistent storage backed by Oracle Autonomous Database.
-- **Postgres**: Persistent storage backed by PostgreSQL Database.
-- **Redis**: Persistent storage backed by Redis.
-
-```bash
-# Memory backend (default)
-python3 -m sglang_router.launch_router \
-  --backend openai \
-  --worker-urls https://api.openai.com \
-  --history-backend memory
-
-# No storage for maximum performance
-python3 -m sglang_router.launch_router \
-  --backend openai \
-  --worker-urls https://api.openai.com \
-  --history-backend none
-
-# Oracle ATP backend (see configuration below)
-python3 -m sglang_router.launch_router \
-  --backend openai \
-  --worker-urls https://api.openai.com \
-  --history-backend oracle
-
-# PostgreSQL backend
-python3 -m sglang_router.launch_router \
-  --backend openai \
-  --worker-urls https://api.openai.com \
-  --history-backend postgres
-
-# Redis backend
-python3 -m sglang_router.launch_router \
-  --backend openai \
-  --worker-urls https://api.openai.com \
-  --history-backend redis
-```
-
-#### Oracle configuration
-Install the Oracle Instant Client and set `LD_LIBRARY_PATH` accordingly. Choose **one** connection method:
-```bash
-# Option 1: Full connection descriptor
-export ATP_DSN="(description=(address=(protocol=tcps)(port=1522)(host=adb.region.oraclecloud.com))(connect_data=(service_name=service_name)))"
-
-# Option 2: TNS alias (requires wallet)
-export ATP_TNS_ALIAS="sglroutertestatp_high"
-export ATP_WALLET_PATH="/path/to/wallet"
-```
-Provide database credentials and optional pool sizing:
-```bash
-export ATP_USER="admin"
-export ATP_PASSWORD="YourPassword123"
-export ATP_POOL_MIN=4
-export ATP_POOL_MAX=32
-```
-
-Router flags map to these values:
-- `--oracle-dsn` (env: `ATP_DSN`) or `--oracle-tns-alias` with `--oracle-wallet-path`.
-- `--oracle-user` / `--oracle-password` (`ATP_USER` / `ATP_PASSWORD`).
-- `--oracle-wallet-path` (`ATP_WALLET_PATH`) when using TNS alias.
-- `--oracle-pool-min`, `--oracle-pool-max`, `--oracle-pool-timeout-secs`.
-
-Only one of `--oracle-dsn` or `--oracle-tns-alias` should be supplied.
-
-#### Redis configuration
-Provide Redis connection URL and optional pool sizing:
-```bash
-export REDIS_URL="redis://localhost:6379"
-export REDIS_POOL_MAX=16
-export REDIS_RETENTION_DAYS=30
-```
-
-Router flags map to these values:
-- `--redis-url` (env: `REDIS_URL`)
-- `--redis-pool-max` (env: `REDIS_POOL_MAX`)
-- `--redis-retention-days` (env: `REDIS_RETENTION_DAYS`). Set to `-1` for persistent storage (default: 30 days).
-
-## Reliability & Flow Control
-- **HTTP Client**: Upstream HTTP client connection settings default to pool idle timeout 50s, connect timeout 10s, max idle connections per host 500, and TCP keepalive 30s. Configure via `--pool-idle-timeout-secs`, `--connect-timeout-secs`, `--pool-max-idle-per-host`, `--tcp-keepalive-secs`, or the corresponding `SMG_*` env vars.
 - **Retries**: Default max retries = 5 with exponential backoff (`--retry-max-retries`, `--retry-initial-backoff-ms`, `--retry-max-backoff-ms`, `--retry-backoff-multiplier`, `--retry-jitter-factor`). Retries trigger on 408/429/500/502/503/504.
 - **Circuit Breakers**: Per worker thresholds (`--cb-failure-threshold`, `--cb-success-threshold`, `--cb-timeout-duration-secs`, `--cb-window-duration-secs`). Disable via `--disable-circuit-breaker`.
 - **Rate Limiting**: Token bucket driven by `--max-concurrent-requests`. Set `--rate-limit-tokens-per-second` to override refill rate. Configure request queue via `--queue-size` and `--queue-timeout-secs`; queued requests observe FIFO order and respect cancellation.
@@ -791,7 +595,6 @@ Enable with `--prometheus-host`/`--prometheus-port` (defaults to `0.0.0.0:29000`
 | Circuit Breaker | `smg_worker_cb_*` | State (closed/open/half-open), transitions, outcomes |
 | Retry | `smg_worker_retries_*` | Retry attempts, exhausted retries, backoff duration |
 | Discovery | `smg_discovery_*` | K8s registrations, sync duration, workers discovered |
-| MCP | `smg_mcp_*` | Tool calls, duration, active servers, iterations |
 | Database | `smg_db_*` | Operations, duration, connections, items stored |
 
 **Key Metrics:**

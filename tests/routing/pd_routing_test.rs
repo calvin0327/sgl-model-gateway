@@ -210,10 +210,15 @@ mod pd_routing_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
         assert_eq!(
-            resp.status(),
+            status,
             StatusCode::OK,
-            "Request should succeed via retry to healthy decode worker"
+            "Request should succeed via retry to healthy decode worker; body: {}",
+            String::from_utf8_lossy(&body)
         );
 
         ctx.shutdown().await;

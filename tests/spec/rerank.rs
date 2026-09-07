@@ -35,18 +35,22 @@ fn test_rerank_request_serialization() {
 fn test_rerank_request_deserialization_with_defaults() {
     let json = r#"{
         "query": "test query",
-        "documents": ["doc1", "doc2"]
+        "documents": ["doc1", "doc2"],
+        "model": "test-model"
     }"#;
 
     let request: RerankRequest = from_str(json).unwrap();
 
     assert_eq!(request.query, "test query");
     assert_eq!(request.documents, vec!["doc1", "doc2"]);
-    assert_eq!(request.model, "unknown");
+    assert_eq!(request.model, "test-model");
     assert_eq!(request.top_k, None);
     assert!(request.return_documents);
     assert_eq!(request.rid, None);
     assert_eq!(request.user, None);
+
+    let no_model = r#"{"query": "q", "documents": ["d"]}"#;
+    assert!(from_str::<RerankRequest>(no_model).is_err());
 }
 
 #[test]

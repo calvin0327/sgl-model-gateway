@@ -15,22 +15,13 @@ use std::{collections::HashMap, sync::Arc};
 use serde::{Deserialize, Serialize};
 use wfaas::{WorkflowData, WorkflowError};
 
-use super::{
-    mcp_registration::McpServerConfigRequest, tokenizer_registration::TokenizerConfigRequest,
-    wasm_module_registration::WasmModuleConfigRequest,
-    wasm_module_removal::WasmModuleRemovalRequest, worker::local::WorkerRemovalRequest,
-};
-/// Re-export the protocol types for convenience
-pub use crate::protocols::worker_spec::{
+use super::{tokenizer_registration::TokenizerConfigRequest, worker::local::WorkerRemovalRequest};
+pub use crate::protocol_compat::{
     WorkerConfigRequest, WorkerUpdateRequest as ProtocolUpdateRequest,
 };
 use crate::{
-    app_context::AppContext,
-    core::{model_card::ModelCard, Worker},
-    protocols::worker_spec::{
-        WorkerConfigRequest as ProtocolWorkerConfigRequest,
-        WorkerUpdateRequest as ProtocolWorkerUpdateRequest,
-    },
+    app_context::AppContext, core::Worker,
+    protocol_compat::WorkerUpdateRequest as ProtocolWorkerUpdateRequest,
     routers::router_manager::RouterManager,
 };
 
@@ -116,7 +107,7 @@ impl TokenizerWorkflowData {
 /// Data for local worker registration workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalWorkerWorkflowData {
-    pub config: ProtocolWorkerConfigRequest,
+    pub config: WorkerConfigRequest,
     pub connection_mode: Option<crate::core::ConnectionMode>,
     pub discovered_labels: HashMap<String, String>,
     pub dp_info: Option<super::worker::local::DpInfo>,
@@ -168,62 +159,6 @@ impl WorkerRegistrationData for LocalWorkerWorkflowData {
 
     fn get_labels(&self) -> Option<&HashMap<String, String>> {
         Some(&self.final_labels)
-    }
-}
-
-/// Data for external worker registration workflow
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExternalWorkerWorkflowData {
-    pub config: ProtocolWorkerConfigRequest,
-    /// Discovered model cards from /v1/models endpoint
-    pub model_cards: Vec<ModelCard>,
-    pub workers: Option<WorkerList>,
-    /// Labels for policies (derived from config)
-    pub labels: HashMap<String, String>,
-    /// Application context (transient, must be re-initialized after deserialization)
-    #[serde(skip, default)]
-    pub app_context: Option<Arc<AppContext>>,
-    /// Router manager (transient, must be re-initialized after deserialization)
-    #[serde(skip, default)]
-    pub router_manager: Option<Arc<RouterManager>>,
-    /// Actual worker objects (transient, not serialized)
-    #[serde(skip, default)]
-    pub actual_workers: Option<Vec<Arc<dyn Worker>>>,
-}
-
-impl WorkflowData for ExternalWorkerWorkflowData {
-    fn workflow_type() -> &'static str {
-        "external_worker_registration"
-    }
-}
-
-impl ExternalWorkerWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl WorkerRegistrationData for ExternalWorkerWorkflowData {
-    fn get_app_context(&self) -> Option<&Arc<AppContext>> {
-        self.app_context.as_ref()
-    }
-
-    fn get_router_manager(&self) -> Option<&Arc<RouterManager>> {
-        self.router_manager.as_ref()
-    }
-
-    fn get_actual_workers(&self) -> Option<&Vec<Arc<dyn Worker>>> {
-        self.actual_workers.as_ref()
-    }
-
-    fn get_labels(&self) -> Option<&HashMap<String, String>> {
-        Some(&self.labels)
     }
 }
 
@@ -288,99 +223,6 @@ impl WorkflowData for WorkerUpdateWorkflowData {
 }
 
 impl WorkerUpdateWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Data for MCP server registration workflow
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpWorkflowData {
-    pub config: McpServerConfigRequest,
-    pub validated: bool,
-    /// Application context (transient, must be re-initialized after deserialization)
-    #[serde(skip, default)]
-    pub app_context: Option<Arc<AppContext>>,
-    /// Connected MCP client (transient, not serialized)
-    #[serde(skip, default)]
-    pub mcp_client: Option<Arc<rmcp::service::RunningService<rmcp::RoleClient, ()>>>,
-}
-
-impl WorkflowData for McpWorkflowData {
-    fn workflow_type() -> &'static str {
-        "mcp_registration"
-    }
-}
-
-impl McpWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Data for WASM module registration workflow
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WasmRegistrationWorkflowData {
-    pub config: WasmModuleConfigRequest,
-    pub wasm_bytes: Option<Vec<u8>>,
-    /// SHA256 hash of the module file (32 bytes)
-    pub sha256_hash: Option<[u8; 32]>,
-    /// File size in bytes
-    pub file_size_bytes: Option<u64>,
-    /// UUID assigned to the registered module
-    pub module_uuid: Option<uuid::Uuid>,
-    /// Application context (transient, must be re-initialized after deserialization)
-    #[serde(skip, default)]
-    pub app_context: Option<Arc<AppContext>>,
-}
-
-impl WorkflowData for WasmRegistrationWorkflowData {
-    fn workflow_type() -> &'static str {
-        "wasm_module_registration"
-    }
-}
-
-impl WasmRegistrationWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Data for WASM module removal workflow
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WasmRemovalWorkflowData {
-    pub config: WasmModuleRemovalRequest,
-    pub module_id: Option<String>,
-    /// Application context (transient, must be re-initialized after deserialization)
-    #[serde(skip, default)]
-    pub app_context: Option<Arc<AppContext>>,
-}
-
-impl WorkflowData for WasmRemovalWorkflowData {
-    fn workflow_type() -> &'static str {
-        "wasm_module_removal"
-    }
-}
-
-impl WasmRemovalWorkflowData {
     /// Validate that all transient fields are properly initialized.
     pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
         if self.app_context.is_none() {

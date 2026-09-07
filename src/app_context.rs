@@ -3,12 +3,7 @@ use std::{
     time::Duration,
 };
 
-use data_connector::{
-    create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
-    StorageFactoryConfig,
-};
 use reqwest::Client;
-use smg_mcp::McpManager;
 use tracing::debug;
 
 use crate::{
@@ -20,7 +15,6 @@ use crate::{
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
-    wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
 };
 
 /// Error type for AppContext builder
@@ -45,16 +39,11 @@ pub struct AppContext {
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
-    pub response_storage: Arc<dyn ResponseStorage>,
-    pub conversation_storage: Arc<dyn ConversationStorage>,
-    pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
     pub load_monitor: Option<Arc<LoadMonitor>>,
     pub configured_reasoning_parser: Option<String>,
     pub configured_tool_parser: Option<String>,
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
-    pub mcp_manager: Arc<OnceLock<Arc<McpManager>>>,
-    pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
 }
@@ -76,14 +65,9 @@ pub struct AppContextBuilder {
     tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
     policy_registry: Option<Arc<PolicyRegistry>>,
-    response_storage: Option<Arc<dyn ResponseStorage>>,
-    conversation_storage: Option<Arc<dyn ConversationStorage>>,
-    conversation_item_storage: Option<Arc<dyn ConversationItemStorage>>,
     load_monitor: Option<Arc<LoadMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
-    mcp_manager: Option<Arc<OnceLock<Arc<McpManager>>>>,
-    wasm_manager: Option<Arc<WasmModuleManager>>,
 }
 
 impl AppContext {
@@ -112,14 +96,9 @@ impl AppContextBuilder {
             tool_parser_factory: None,
             worker_registry: None,
             policy_registry: None,
-            response_storage: None,
-            conversation_storage: None,
-            conversation_item_storage: None,
             load_monitor: None,
             worker_job_queue: None,
             workflow_engines: None,
-            mcp_manager: None,
-            wasm_manager: None,
         }
     }
 
@@ -166,27 +145,6 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn response_storage(mut self, response_storage: Arc<dyn ResponseStorage>) -> Self {
-        self.response_storage = Some(response_storage);
-        self
-    }
-
-    pub fn conversation_storage(
-        mut self,
-        conversation_storage: Arc<dyn ConversationStorage>,
-    ) -> Self {
-        self.conversation_storage = Some(conversation_storage);
-        self
-    }
-
-    pub fn conversation_item_storage(
-        mut self,
-        conversation_item_storage: Arc<dyn ConversationItemStorage>,
-    ) -> Self {
-        self.conversation_item_storage = Some(conversation_item_storage);
-        self
-    }
-
     pub fn load_monitor(mut self, load_monitor: Option<Arc<LoadMonitor>>) -> Self {
         self.load_monitor = load_monitor;
         self
@@ -199,16 +157,6 @@ impl AppContextBuilder {
 
     pub fn workflow_engines(mut self, workflow_engines: Arc<OnceLock<WorkflowEngines>>) -> Self {
         self.workflow_engines = Some(workflow_engines);
-        self
-    }
-
-    pub fn mcp_manager(mut self, mcp_manager: Arc<OnceLock<Arc<McpManager>>>) -> Self {
-        self.mcp_manager = Some(mcp_manager);
-        self
-    }
-
-    pub fn wasm_manager(mut self, wasm_manager: Option<Arc<WasmModuleManager>>) -> Self {
-        self.wasm_manager = wasm_manager;
         self
     }
 
@@ -246,15 +194,6 @@ impl AppContextBuilder {
             policy_registry: self
                 .policy_registry
                 .ok_or(AppContextBuildError("policy_registry"))?,
-            response_storage: self
-                .response_storage
-                .ok_or(AppContextBuildError("response_storage"))?,
-            conversation_storage: self
-                .conversation_storage
-                .ok_or(AppContextBuildError("conversation_storage"))?,
-            conversation_item_storage: self
-                .conversation_item_storage
-                .ok_or(AppContextBuildError("conversation_item_storage"))?,
             load_monitor: self.load_monitor,
             configured_reasoning_parser,
             configured_tool_parser,
@@ -262,10 +201,6 @@ impl AppContextBuilder {
             workflow_engines: self
                 .workflow_engines
                 .ok_or(AppContextBuildError("workflow_engines"))?,
-            mcp_manager: self
-                .mcp_manager
-                .ok_or(AppContextBuildError("mcp_manager"))?,
-            wasm_manager: self.wasm_manager,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
         })
@@ -282,13 +217,9 @@ impl AppContextBuilder {
             .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&gateway_config)
-            .with_storage(&gateway_config)?
             .with_load_monitor(&gateway_config)
             .with_worker_job_queue()
             .with_workflow_engines()
-            .with_mcp_manager(&gateway_config)
-            .await?
-            .with_wasm_manager(&gateway_config)?
             .gateway_config(gateway_config))
     }
 
@@ -416,24 +347,6 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create all storage backends using the factory function
-    fn with_storage(mut self, config: &GatewayConfig) -> Result<Self, String> {
-        let storage_config = StorageFactoryConfig {
-            backend: &config.storage.history_backend,
-            oracle: config.storage.oracle.as_ref(),
-            postgres: config.storage.postgres.as_ref(),
-            redis: config.storage.redis.as_ref(),
-        };
-        let (response_storage, conversation_storage, conversation_item_storage) =
-            create_storage(storage_config)?;
-
-        self.response_storage = Some(response_storage);
-        self.conversation_storage = Some(conversation_storage);
-        self.conversation_item_storage = Some(conversation_item_storage);
-
-        Ok(self)
-    }
-
     /// Create load monitor
     fn with_load_monitor(mut self, config: &GatewayConfig) -> Self {
         let client = self
@@ -465,51 +378,6 @@ impl AppContextBuilder {
     fn with_workflow_engines(mut self) -> Self {
         self.workflow_engines = Some(Arc::new(OnceLock::new()));
         self
-    }
-
-    /// Create and initialize MCP manager with empty config
-    ///
-    /// This initializes the MCP manager with an empty config and default settings.
-    /// MCP servers will be registered later via the InitializeMcpServers job.
-    async fn with_mcp_manager(mut self, _config: &GatewayConfig) -> Result<Self, String> {
-        // Create OnceLock container
-        let mcp_manager_lock = Arc::new(OnceLock::new());
-
-        // Always create with empty config and defaults
-        debug!("Initializing MCP manager with empty config and default settings (5 min TTL, 100 max connections)");
-
-        let empty_config = smg_mcp::McpConfig {
-            servers: Vec::new(),
-            pool: Default::default(),
-            proxy: None,
-            warmup: Vec::new(),
-            inventory: Default::default(),
-        };
-
-        let manager = McpManager::with_defaults(empty_config)
-            .await
-            .map_err(|e| format!("Failed to initialize MCP manager with defaults: {}", e))?;
-
-        // Store the initialized manager in the OnceLock
-        mcp_manager_lock
-            .set(Arc::new(manager))
-            .map_err(|_| "Failed to set MCP manager in OnceLock".to_string())?;
-
-        self.mcp_manager = Some(mcp_manager_lock);
-        Ok(self)
-    }
-
-    /// Create wasm manager if enabled in config
-    fn with_wasm_manager(mut self, config: &GatewayConfig) -> Result<Self, String> {
-        self.wasm_manager = if config.extensions.enable_wasm {
-            Some(Arc::new(
-                WasmModuleManager::new(WasmRuntimeConfig::default())
-                    .map_err(|e| format!("Failed to initialize WASM module manager: {}", e))?,
-            ))
-        } else {
-            None
-        };
-        Ok(self)
     }
 }
 

@@ -18,9 +18,12 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    core::{metrics_aggregator::MetricPack, ConnectionMode, Worker, WorkerRegistry, WorkerType},
+    core::{
+        metrics_aggregator::MetricPack, worker::RuntimeType, ConnectionMode, Worker,
+        WorkerRegistry, WorkerType,
+    },
     policies::PolicyRegistry,
-    protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
+    protocol_compat::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -175,11 +178,13 @@ impl WorkerManager {
                     WorkerType::Decode => Some("decode".to_string()),
                 };
                 let is_http = matches!(worker.connection_mode(), ConnectionMode::Http);
+                let runtime_type = worker.metadata().runtime_type.clone();
                 let client = client.clone();
 
                 async move {
                     let load = if is_http {
-                        Self::parse_load_response(&client, &url, api_key.as_deref()).await
+                        Self::parse_load_response(&client, &url, api_key.as_deref(), runtime_type)
+                            .await
                     } else {
                         -1
                     };
@@ -208,7 +213,12 @@ impl WorkerManager {
         client: &reqwest::Client,
         url: &str,
         api_key: Option<&str>,
+        runtime_type: RuntimeType,
     ) -> isize {
+        if runtime_type == RuntimeType::Vllm {
+            return Self::parse_vllm_load_response(client, url, api_key).await;
+        }
+
         let load_url = format!("{}/v1/loads?include=core", url);
         let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
         if let Some(key) = api_key {
@@ -226,6 +236,37 @@ impl WorkerManager {
                 _ => -1,
             },
             _ => -1,
+        }
+    }
+
+    async fn parse_vllm_load_response(
+        client: &reqwest::Client,
+        url: &str,
+        api_key: Option<&str>,
+    ) -> isize {
+        let load_url = format!("{}/metrics", url);
+        let mut request = client.get(&load_url).timeout(REQUEST_TIMEOUT);
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
+        }
+
+        let Ok(response) = request.send().await else {
+            return -1;
+        };
+        if !response.status().is_success() {
+            return -1;
+        }
+
+        let Ok(body) = response.text().await else {
+            return -1;
+        };
+        let running = sum_prometheus_metric(&body, "vllm:num_requests_running");
+        let waiting = sum_prometheus_metric(&body, "vllm:num_requests_waiting");
+        match (running, waiting) {
+            (Some(running), Some(waiting)) => running + waiting,
+            (Some(running), None) => running,
+            (None, Some(waiting)) => waiting,
+            (None, None) => -1,
         }
     }
 
@@ -264,6 +305,36 @@ impl WorkerManager {
             Err(e) => EngineMetricsResult::Err(format!("Failed to aggregate metrics: {}", e)),
         }
     }
+}
+
+fn sum_prometheus_metric(body: &str, metric_name: &str) -> Option<isize> {
+    let mut total = 0.0;
+    let mut found = false;
+
+    for line in body.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        let Some(sample) = parts.next() else {
+            continue;
+        };
+        let sample_name = sample.split('{').next()?;
+        if sample_name != metric_name {
+            continue;
+        }
+
+        let Some(value) = parts.next().and_then(|value| value.parse::<f64>().ok()) else {
+            continue;
+        };
+        if value.is_finite() {
+            total += value;
+            found = true;
+        }
+    }
+
+    found.then(|| total as isize)
 }
 
 /// Load monitoring service that periodically fetches worker loads
@@ -390,5 +461,32 @@ impl Drop for LoadMonitor {
                 handle.abort();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sum_prometheus_metric_sums_matching_samples() {
+        let body = "\
+# HELP vllm:num_requests_running Running requests
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model=\"a\"} 3
+vllm:num_requests_running{model=\"b\"} 4
+vllm:num_requests_waiting{model=\"a\"} 2
+vllm:gpu_cache_usage_perc 0.5
+";
+
+        assert_eq!(
+            sum_prometheus_metric(body, "vllm:num_requests_running"),
+            Some(7)
+        );
+        assert_eq!(
+            sum_prometheus_metric(body, "vllm:num_requests_waiting"),
+            Some(2)
+        );
+        assert_eq!(sum_prometheus_metric(body, "vllm:missing_metric"), None);
     }
 }

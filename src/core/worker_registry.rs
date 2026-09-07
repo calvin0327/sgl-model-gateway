@@ -11,10 +11,9 @@
 //! The ring is rebuilt only when workers are added/removed, not per-request.
 //! Uses virtual nodes (150 per worker) for even distribution and blake3 for stable hashing.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use dashmap::DashMap;
-use smg_mesh::OptionalMeshSyncManager;
 use uuid::Uuid;
 
 use crate::{
@@ -197,10 +196,6 @@ pub struct WorkerRegistry {
 
     /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
-    /// Optional mesh sync manager for state synchronization
-    /// When None, the registry works independently without mesh synchronization
-    /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
-    mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
 }
 
 impl WorkerRegistry {
@@ -213,7 +208,6 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
-            mesh_sync: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -231,11 +225,6 @@ impl WorkerRegistry {
     /// Get the hash ring for a model (O(1) lookup)
     pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
         self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
-    }
-
-    /// Set mesh sync manager (thread-safe, can be called after initialization)
-    pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
-        *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
     /// Register a new worker
@@ -281,17 +270,6 @@ impl WorkerRegistry {
             .entry(worker.connection_mode().clone())
             .or_default()
             .push(worker_id.clone());
-
-        // Sync to mesh if enabled (no-op if mesh is not enabled)
-        if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
-            mesh_sync.sync_worker_state(
-                worker_id.as_str().to_string(),
-                worker.model_id().to_string(),
-                worker.url().to_string(),
-                worker.is_healthy(),
-                0.0, // TODO: Get actual load
-            );
-        }
 
         worker_id
     }
@@ -349,11 +327,6 @@ impl WorkerRegistry {
             worker.set_healthy(false);
             Metrics::remove_worker_metrics(worker.url());
 
-            // Sync removal to mesh if enabled (no-op if mesh is not enabled)
-            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
-                mesh_sync.remove_worker_state(worker_id.as_str());
-            }
-
             Some(worker)
         } else {
             None
@@ -400,22 +373,10 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
-    /// Update worker health status and sync to mesh
+    /// Update worker health status.
     pub fn update_worker_health(&self, worker_id: &WorkerId, is_healthy: bool) {
         if let Some(worker) = self.workers.get(worker_id) {
-            // Update worker health (if Worker trait has a method for this)
-            // For now, we'll just sync to mesh
-
-            // Sync to mesh if enabled (no-op if mesh is not enabled)
-            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
-                mesh_sync.sync_worker_state(
-                    worker_id.as_str().to_string(),
-                    worker.model_id().to_string(),
-                    worker.url().to_string(),
-                    is_healthy,
-                    0.0, // TODO: Get actual load
-                );
-            }
+            worker.set_healthy(is_healthy);
         }
     }
 
@@ -576,7 +537,6 @@ impl WorkerRegistry {
         let mut prefill_count = 0;
         let mut decode_count = 0;
         let mut http_count = 0;
-        let mut grpc_count = 0;
         let mut cb_open_count = 0;
         let mut cb_half_open_count = 0;
 
@@ -594,9 +554,8 @@ impl WorkerRegistry {
                 WorkerType::Decode => decode_count += 1,
             }
 
-            match worker.connection_mode() {
-                ConnectionMode::Http => http_count += 1,
-                ConnectionMode::Grpc { .. } => grpc_count += 1,
+            if matches!(worker.connection_mode(), ConnectionMode::Http) {
+                http_count += 1;
             }
 
             match worker.circuit_breaker().state() {
@@ -616,7 +575,6 @@ impl WorkerRegistry {
             prefill_workers: prefill_count,
             decode_workers: decode_count,
             http_workers: http_count,
-            grpc_workers: grpc_count,
             circuit_breaker_open: cb_open_count,
             circuit_breaker_half_open: cb_half_open_count,
         }
@@ -745,8 +703,6 @@ pub struct WorkerRegistryStats {
     pub decode_workers: usize,
     /// Number of HTTP-connected workers
     pub http_workers: usize,
-    /// Number of gRPC-connected workers
-    pub grpc_workers: usize,
     /// Number of workers with circuit breaker in Open state (not accepting requests)
     pub circuit_breaker_open: usize,
     /// Number of workers with circuit breaker in HalfOpen state (testing recovery)

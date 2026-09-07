@@ -631,7 +631,7 @@ mod upstream_cancel_tests {
         ctx.shutdown().await;
     }
 
-    /// /v1/responses with no persistence (`store: false`, no conversation):
+    /// /v1/responses with no persistence (`store: false`):
     /// client disconnect must propagate to the upstream worker.
     #[tokio::test]
     async fn test_responses_streaming_cancel_no_persistence() {
@@ -748,9 +748,7 @@ mod upstream_cancel_tests {
         let mut body = resp.into_body();
         // Read enough frames to capture the response.created event so we
         // can later look up the stored response by its id.
-        let (_, captured) = read_n_chunks_with_bytes(&mut body, 3).await;
-        let response_id =
-            extract_response_id_from_sse(&captured).expect("response.created event with id");
+        let _ = read_n_chunks_with_bytes(&mut body, 3).await;
         drop(body);
 
         // With persistence the gateway keeps reading; worker should
@@ -765,32 +763,6 @@ mod upstream_cancel_tests {
             state.chunks_sent, state.total_chunks
         );
         assert_eq!(state.chunks_sent, state.total_chunks);
-
-        // Draining is necessary but not sufficient — also verify the
-        // gateway actually called persist_conversation_items and the
-        // response landed in storage. Poll briefly because persistence
-        // happens after the upstream loop exits.
-        let storage = ctx.app_context.response_storage.clone();
-        let stored = {
-            use data_connector::ResponseId;
-            let id = ResponseId::from(response_id.clone());
-            let mut found = None;
-            for _ in 0..20 {
-                if let Ok(Some(r)) = storage.get_response(&id).await {
-                    found = Some(r);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            found.unwrap_or_else(|| {
-                panic!(
-                    "Response {} should have been persisted after client \
-                     disconnect on store=true /responses stream",
-                    response_id
-                )
-            })
-        };
-        assert_eq!(stored.id.0, response_id);
 
         clear_slow_stream_chunks(worker_port);
         ctx.shutdown().await;
@@ -862,16 +834,13 @@ mod upstream_cancel_tests {
             }
         }
         drop(body);
-        let response_id =
+        let _response_id =
             extract_response_id_from_sse(&captured).expect("response.created event with id");
 
-        // Wait for the gateway-side producer task to exit so persistence
-        // (or its skip) and breaker tick have run.
+        // Wait for the gateway-side producer task to exit and the breaker tick to land.
         let _ = wait_for_stream_finish(worker_port, STREAM_FINISH_TIMEOUT).await;
 
-        // Co-assert that the breaker tick fired. Without this, a regression
-        // that silently swallowed the error (record nothing, persist nothing)
-        // would also produce an empty storage and pass the lookup below.
+        // Co-assert that the breaker tick fired so upstream errors are not swallowed.
         let (_, f_post) = breaker_counts(&worker);
         assert!(
             f_post > f_pre,
@@ -880,17 +849,6 @@ mod upstream_cancel_tests {
             f_pre,
             f_post
         );
-
-        let storage = ctx.app_context.response_storage.clone();
-        use data_connector::ResponseId;
-        let id = ResponseId::from(response_id.clone());
-        if let Ok(Some(_)) = storage.get_response(&id).await {
-            panic!(
-                "Response {} should NOT have been persisted after \
-                 mid-stream upstream error on store=true /responses",
-                response_id
-            );
-        }
 
         ctx.shutdown().await;
     }
@@ -960,412 +918,6 @@ mod upstream_cancel_tests {
         ctx.shutdown().await;
     }
 
-    /// Tool-interception streaming cancel: when the client disconnects mid
-    /// second-turn (after the gateway has executed an MCP tool call and
-    /// re-issued an upstream request), the gateway must drop that second
-    /// upstream connection promptly. This guards the explicit policy
-    /// documented at `streaming.rs:712-722` ("don't keep workers and
-    /// external MCP services busy on results no one will read") against
-    /// silent regression — the inner `select! { ... _ = tx.closed() }`
-    /// in `handle_streaming_with_tool_interception` is the load-bearing
-    /// piece.
-    #[tokio::test]
-    async fn test_tool_interception_streaming_cancel_on_client_disconnect() {
-        use smg::routers::RouterTrait;
-
-        use crate::common::{
-            mock_mcp_server::MockMCPServer,
-            mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
-        };
-
-        let worker_port = 20263;
-        let total_chunks: usize = 20;
-
-        reset_stream_tracker(worker_port);
-        set_slow_stream_chunks(worker_port, total_chunks);
-
-        let mut mcp = MockMCPServer::start().await.expect("start mcp");
-        let mcp_yaml = format!(
-            "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
-            mcp.url()
-        );
-        let dir = tempfile::tempdir().expect("tmpdir");
-        let cfg_path = dir.path().join("mcp.yaml");
-        std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
-
-        let mut worker = MockWorker::new(MockWorkerConfig {
-            port: worker_port,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 50,
-            fail_rate: 0.0,
-        });
-        let worker_url = worker.start().await.expect("start worker");
-        // Allow the mock worker's HTTP listener to bind before the router
-        // probes its health.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let router_cfg = crate::common::TestGatewayConfigBuilder::new()
-            .openai_mode(vec![worker_url])
-            .random_policy()
-            .host("127.0.0.1")
-            .port(4263)
-            .max_payload_size(8 * 1024 * 1024)
-            .request_timeout_secs(60)
-            .worker_startup_timeout_secs(5)
-            .worker_startup_check_interval_secs(1)
-            .max_concurrent_requests(32)
-            .queue_timeout_secs(5)
-            .build_unchecked();
-
-        let ctx = crate::common::create_test_context_with_mcp_config(
-            router_cfg,
-            cfg_path.to_str().unwrap(),
-        )
-        .await;
-        let router: Arc<dyn RouterTrait> = crate::common::create_router_manager(&ctx);
-        let app = crate::common::test_app::create_test_app_with_context(router, ctx);
-
-        let payload = json!({
-            "model": "mock-model",
-            "input": "search something",
-            "stream": true,
-            "store": false,
-            "tools": [{
-                "type": "mcp",
-                "server_label": "mock",
-                "server_url": mcp.url()
-            }]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/responses")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&payload).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let mut body = resp.into_body();
-        // Pull a few frames so the body keeps draining while the gateway
-        // works through turn 1 (tool call) and starts turn 2 (slow text).
-        let _ = read_n_chunks(&mut body, 8).await;
-
-        // Wait until the slow second-turn upstream request has actually
-        // started producing chunks — only the slow-stream branch in the
-        // mock initialises the tracker, so seeing chunks_sent>0 here
-        // means we're inside the second upstream request.
-        let mut waited_ms: u64 = 0;
-        loop {
-            if let Some(s) = get_stream_tracking_state(worker_port) {
-                if s.chunks_sent > 0 {
-                    break;
-                }
-            }
-            if waited_ms >= 5000 {
-                panic!(
-                    "Second-turn upstream stream never started producing chunks \
-                     within 5s — tool-interception path did not reach select!"
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            waited_ms += 50;
-        }
-
-        let snapshot = get_stream_tracking_state(worker_port)
-            .map(|s| s.chunks_sent)
-            .unwrap_or(0);
-        drop(body);
-
-        let final_state = assert_cancelled_before_completion(worker_port).await;
-        assert!(
-            final_state.chunks_sent <= snapshot + MOCK_STREAM_BUFFER,
-            "Tool-interception second-turn chunks_sent grew by more than \
-             the buffer ({} -> {}) — cancel did not propagate to upstream",
-            snapshot,
-            final_state.chunks_sent
-        );
-
-        clear_slow_stream_chunks(worker_port);
-        worker.stop().await;
-        mcp.stop().await;
-    }
-
-    /// Tool-interception path: client disconnects WHILE the gateway is
-    /// still waiting for the upstream's response headers (inside the
-    /// `request_builder.send().await` future, not yet streaming).
-    ///
-    /// The mock sleeps 1500ms before returning headers; the test drops
-    /// the response body ~50ms after the gateway has dispatched the
-    /// request. With the `tokio::select! { res = send() => …, _ = tx.closed() => return }`
-    /// guard in place, the gateway aborts the send before the mock ever
-    /// reaches its slow-stream init — so `get_stream_tracking_state`
-    /// stays at `None`. If the guard regresses to a plain
-    /// `request_builder.send().await`, the mock would complete its sleep,
-    /// initialise the tracker, and `get_stream_tracking_state` would
-    /// return `Some(...)`.
-    #[tokio::test]
-    async fn test_tool_interception_cancel_during_send() {
-        use smg::routers::RouterTrait;
-
-        use crate::common::{
-            mock_mcp_server::MockMCPServer,
-            mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
-        };
-
-        let worker_port = 20264;
-        // slow_stream is configured so that IF the mock ever gets past
-        // the pre-response delay, the tracker is populated and the test
-        // would observe the regression.
-        let total_chunks: usize = 5;
-        reset_stream_tracker(worker_port);
-        set_slow_stream_chunks(worker_port, total_chunks);
-
-        let mut mcp = MockMCPServer::start().await.expect("start mcp");
-        let mcp_yaml = format!(
-            "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
-            mcp.url()
-        );
-        let dir = tempfile::tempdir().expect("tmpdir");
-        let cfg_path = dir.path().join("mcp.yaml");
-        std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
-
-        let mut worker = MockWorker::new(MockWorkerConfig {
-            port: worker_port,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            // 1500ms pre-response delay: long enough that the test's
-            // ~50ms drop reliably races *inside* the send().await window.
-            response_delay_ms: 1500,
-            fail_rate: 0.0,
-        });
-        let worker_url = worker.start().await.expect("start worker");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let router_cfg = crate::common::TestGatewayConfigBuilder::new()
-            .openai_mode(vec![worker_url])
-            .random_policy()
-            .host("127.0.0.1")
-            .port(4264)
-            .max_payload_size(8 * 1024 * 1024)
-            .request_timeout_secs(60)
-            .worker_startup_timeout_secs(5)
-            .worker_startup_check_interval_secs(1)
-            .max_concurrent_requests(32)
-            .queue_timeout_secs(5)
-            .build_unchecked();
-
-        let ctx = crate::common::create_test_context_with_mcp_config(
-            router_cfg,
-            cfg_path.to_str().unwrap(),
-        )
-        .await;
-        let router: Arc<dyn RouterTrait> = crate::common::create_router_manager(&ctx);
-        let app = crate::common::test_app::create_test_app_with_context(router, ctx);
-
-        let payload = json!({
-            "model": "mock-model",
-            "input": "search something",
-            "stream": true,
-            "store": false,
-            "tools": [{
-                "type": "mcp",
-                "server_label": "mock",
-                "server_url": mcp.url()
-            }]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/responses")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&payload).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // Drop immediately, while the mock is still inside its 1500ms
-        // pre-response sleep. The gateway's spawned task is parked in
-        // `select! { res = send() => ..., _ = tx.closed() => return }`.
-        let body = resp.into_body();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        drop(body);
-
-        // Give the gateway and mock plenty of time to process the cancel
-        // and finish their respective sleeps. 2500ms > 1500ms ensures
-        // that even if the select! guard regressed, the mock would have
-        // long since reached `init_stream_tracking` by the time we check.
-        tokio::time::sleep(Duration::from_millis(2500)).await;
-
-        assert!(
-            get_stream_tracking_state(worker_port).is_none(),
-            "Mock worker initialised the slow-stream tracker, which means \
-             its handler completed the pre-response sleep — i.e. the gateway \
-             waited for upstream headers instead of cancelling send().await \
-             on client disconnect. Tracker state: {:?}",
-            get_stream_tracking_state(worker_port)
-        );
-
-        clear_slow_stream_chunks(worker_port);
-        worker.stop().await;
-        mcp.stop().await;
-    }
-
-    /// Tool-interception path with `store=true`: when the second-turn
-    /// upstream errors mid-stream, the gateway must NOT persist a torn
-    /// response. Mirrors `test_responses_simple_streaming_error_skips_persistence`
-    /// for the MCP-interception branch (streaming.rs:1023-1033).
-    #[tokio::test]
-    async fn test_tool_interception_streaming_error_skips_persistence() {
-        use data_connector::ResponseId;
-        use smg::routers::RouterTrait;
-
-        use crate::common::{
-            mock_mcp_server::MockMCPServer,
-            mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
-        };
-
-        let worker_port = 20267;
-        let total_chunks: usize = 10;
-        let error_after: usize = 2;
-
-        reset_stream_tracker(worker_port);
-        set_slow_stream_chunks(worker_port, total_chunks);
-        set_stream_error_after_chunks(worker_port, error_after);
-        let _guard = StreamInjectionGuard(worker_port);
-
-        let mut mcp = MockMCPServer::start().await.expect("start mcp");
-        let mcp_yaml = format!(
-            "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
-            mcp.url()
-        );
-        let dir = tempfile::tempdir().expect("tmpdir");
-        let cfg_path = dir.path().join("mcp.yaml");
-        std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
-
-        let mut worker = MockWorker::new(MockWorkerConfig {
-            port: worker_port,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 20,
-            fail_rate: 0.0,
-        });
-        let worker_url = worker.start().await.expect("start worker");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let router_cfg = crate::common::TestGatewayConfigBuilder::new()
-            .openai_mode(vec![worker_url.clone()])
-            .random_policy()
-            .host("127.0.0.1")
-            .port(4267)
-            .max_payload_size(8 * 1024 * 1024)
-            .request_timeout_secs(60)
-            .worker_startup_timeout_secs(5)
-            .worker_startup_check_interval_secs(1)
-            .max_concurrent_requests(32)
-            .queue_timeout_secs(5)
-            .build_unchecked();
-
-        let ctx = crate::common::create_test_context_with_mcp_config(
-            router_cfg,
-            cfg_path.to_str().unwrap(),
-        )
-        .await;
-        let storage = ctx.response_storage.clone();
-        let router: Arc<dyn RouterTrait> = crate::common::create_router_manager(&ctx);
-        let pinned_worker = ctx
-            .worker_registry
-            .get_by_url(&worker_url)
-            .expect("worker should be registered after router create");
-        let (_, f_pre) = breaker_counts(&pinned_worker);
-        let app = crate::common::test_app::create_test_app_with_context(router, ctx);
-
-        let payload = json!({
-            "model": "mock-model",
-            "input": "search something",
-            "stream": true,
-            "store": true,
-            "tools": [{
-                "type": "mcp",
-                "server_label": "mock",
-                "server_url": mcp.url()
-            }]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/responses")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&payload).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // Drain fully so the second-turn upstream error is observed (no
-        // client disconnect — the skip is driven by the error).
-        let mut body = resp.into_body();
-        let mut captured: Vec<u8> = Vec::new();
-        while let Some(Ok(frame)) = body.frame().await {
-            if frame.is_data() {
-                if let Ok(data) = frame.into_data() {
-                    captured.extend_from_slice(&data);
-                }
-            }
-        }
-        drop(body);
-        let response_id =
-            extract_response_id_from_sse(&captured).expect("response.created event with id");
-
-        // Wait for the second-turn producer to exit.
-        let state = wait_for_stream_finish(worker_port, STREAM_FINISH_TIMEOUT)
-            .await
-            .expect("second-turn producer to exit within timeout");
-
-        // Pin that the second-turn slow_stream branch actually fired with the
-        // error injection: if a future mock refactor sent turn 2 down the
-        // happy-path JSON branch, no chunks would have streamed and the
-        // persistence-skip assertion below would still pass for the wrong
-        // reason.
-        assert!(
-            state.chunks_sent >= error_after && !state.completed,
-            "Second-turn must have entered slow_stream and errored after \
-             {} chunks (got chunks_sent={}, completed={})",
-            error_after,
-            state.chunks_sent,
-            state.completed,
-        );
-
-        // Co-assert the breaker tick fired so a "skip-persistence + record
-        // nothing" regression can't silently pass this test.
-        let (_, f_post) = breaker_counts(&pinned_worker);
-        assert!(
-            f_post > f_pre,
-            "tool-interception: second-turn upstream error must record a \
-             breaker failure. failures {}→{}",
-            f_pre,
-            f_post
-        );
-
-        let id = ResponseId::from(response_id.clone());
-        if let Ok(Some(_)) = storage.get_response(&id).await {
-            panic!(
-                "Response {} should NOT have been persisted after \
-                 second-turn upstream error on store=true tool-interception path",
-                response_id
-            );
-        }
-
-        worker.stop().await;
-        mcp.stop().await;
-    }
-
-    /// After enough consecutive mid-stream upstream errors, the
-    /// `BreakerTrackedStream` drop should record failures often enough
-    /// that the worker's circuit breaker opens. This locks in the
-    /// contract that mid-stream errors are *not* silently swallowed —
-    /// regressing to "log only, no breaker tick" would leave a
-    /// 200-then-broken worker permanently selectable.
     #[tokio::test]
     async fn test_streaming_errors_trip_circuit_breaker() {
         use smg::config::CircuitBreakerConfig;
@@ -1448,9 +1000,8 @@ mod upstream_cancel_tests {
     // generate, /responses simple), the worker's circuit breaker is ticked
     // exactly once per request based on the upstream's actual termination:
     // success on clean end, failure on mid-stream error, neither on client
-    // disconnect. The tool-interception path (/responses with MCP) is the
-    // documented exception — it ticks once per upstream HTTP call inside
-    // the tool loop, so a 3-iteration loop can tick up to 3 times.
+    // disconnect. Tool interception is outside the single-upstream-call
+    // accounting covered by this section.
 
     /// Returns `(total_successes, total_failures)` for the given worker.
     ///

@@ -747,16 +747,15 @@ async fn responses_handler(
         .unwrap()
         .as_secs() as i64;
 
-    // Background storage simulation
-    let is_background = payload
-        .get("background")
+    let should_store = payload
+        .get("store")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let req_id = payload
         .get("request_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    if is_background {
+    if should_store {
         if let Some(id) = &req_id {
             store_response_for_port(config.port, id);
         }
@@ -765,7 +764,7 @@ async fn responses_handler(
     if is_stream {
         let request_id = format!("resp-{}", Uuid::new_v4());
 
-        // Check if this is an MCP tool call scenario
+        // Check if this is a function tool call scenario
         let has_tools = payload
             .get("tools")
             .and_then(|v| v.as_array())
@@ -875,7 +874,7 @@ async fn responses_handler(
                             "type": "response.function_call_arguments.delta",
                             "output_index": 0,
                             "item_id": call_id.clone(),
-                            "delta": " router MCP"
+                            "delta": " router integration"
                         })
                         .to_string(),
                     )),
@@ -910,7 +909,7 @@ async fn responses_handler(
                             "id": call_id.clone(),
                             "type": "function_tool_call",
                             "name": "brave_web_search",
-                            "arguments": "{\"query\":\"SGLang router MCP integration\"}",
+                            "arguments": "{\"query\":\"SGLang router integration\"}",
                             "status": "completed"
                         }
                     })
@@ -1237,7 +1236,7 @@ async fn responses_handler(
                 .keep_alive(KeepAlive::default())
                 .into_response()
         }
-    } else if is_background {
+    } else if should_store {
         let rid = req_id.unwrap_or_else(|| format!("resp-{}", Uuid::new_v4()));
         Json(json!({
             "id": rid,
@@ -1251,7 +1250,7 @@ async fn responses_handler(
         .into_response()
     } else {
         // If tools are provided and this is the first call (no previous_response_id),
-        // emit a single function_tool_call to trigger the router's MCP flow.
+        // Emit a single function_tool_call for the first tool call turn.
         let has_tools = payload
             .get("tools")
             .and_then(|v| v.as_array())
@@ -1288,7 +1287,7 @@ async fn responses_handler(
                     "type": "function_tool_call",
                     "id": "call_1",
                     "name": "brave_web_search",
-                    "arguments": "{\"query\":\"SGLang router MCP integration\"}",
+                    "arguments": "{\"query\":\"SGLang router integration\"}",
                     "status": "in_progress"
                 }],
                 "status": "in_progress",

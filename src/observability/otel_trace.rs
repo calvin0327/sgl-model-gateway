@@ -19,7 +19,6 @@ use opentelemetry_sdk::{
     Resource,
 };
 use tokio::task::spawn_blocking;
-use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing::{Metadata, Subscriber};
 use tracing_opentelemetry::{self, OpenTelemetrySpanExt};
 use tracing_subscriber::{
@@ -232,48 +231,4 @@ pub fn inject_trace_context_http(headers: &mut HeaderMap) {
     global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&context, &mut HeaderInjector(headers));
     });
-}
-
-/// Inject W3C trace context into gRPC metadata.
-#[inline]
-pub fn inject_trace_context_grpc(metadata: &mut MetadataMap) {
-    if !is_otel_enabled() {
-        return;
-    }
-
-    let context = tracing::Span::current().context();
-
-    struct MetadataInjector<'a>(&'a mut MetadataMap);
-
-    impl opentelemetry::propagation::Injector for MetadataInjector<'_> {
-        #[inline]
-        fn set(&mut self, key: &str, value: String) {
-            if let Ok(metadata_key) = MetadataKey::from_bytes(key.as_bytes()) {
-                if let Ok(metadata_value) = MetadataValue::try_from(&value) {
-                    self.0.insert(metadata_key, metadata_value);
-                }
-            }
-        }
-    }
-
-    global::get_text_map_propagator(|propagator| {
-        propagator.inject_context(&context, &mut MetadataInjector(metadata));
-    });
-}
-
-/// OpenTelemetry trace injector implementing the `smg_grpc_client::TraceInjector` trait.
-///
-/// This bridges sglang's OTel integration with the `smg-grpc-client` crate's
-/// trace injection interface, enabling distributed tracing across gRPC calls.
-#[derive(Clone, Default)]
-pub struct OtelTraceInjector;
-
-impl smg_grpc_client::TraceInjector for OtelTraceInjector {
-    fn inject(
-        &self,
-        metadata: &mut MetadataMap,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        inject_trace_context_grpc(metadata);
-        Ok(())
-    }
 }

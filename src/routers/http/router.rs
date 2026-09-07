@@ -9,20 +9,22 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error};
 
 use crate::{
     app_context::AppContext,
     core::{
-        scheduler::{SchedulerOutput, WorkerSelection as ScheduledWorkerSelection},
-        AttachedBody, ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
-        UNKNOWN_MODEL_ID,
+        scheduler::WorkerSelection as ScheduledWorkerSelection, AttachedBody, ConnectionMode,
+        Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
+    protocol_compat::ResponsesGetParams,
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -31,12 +33,11 @@ use crate::{
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::{RerankRequest, RerankResponse, RerankResult},
-        responses::{ResponsesGetParams, ResponsesRequest},
+        responses::ResponsesRequest,
     },
     routers::{
-        current_scheduled_selection, error,
-        grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils,
+        current_scheduled_selection, error, header_utils,
+        http::{error_type_from_status, route_to_endpoint},
         streaming_utils::BreakerTrackedStream,
         RouterTrait,
     },
@@ -59,12 +60,101 @@ impl std::fmt::Debug for Router {
     }
 }
 
-impl Router {
-    fn selected_regular_worker(selection: &SchedulerOutput) -> Option<Arc<dyn Worker>> {
-        match &selection.worker_selection {
-            ScheduledWorkerSelection::Regular { worker } => Some(worker.clone()),
-            _ => None,
+const SGLANG_DEFAULT_FIELDS: &[&str] = &[
+    "request_id",
+    "priority",
+    "top_k",
+    "min_p",
+    "min_tokens",
+    "regex",
+    "ebnf",
+    "json_schema",
+    "stop_token_ids",
+    "no_stop_trim",
+    "ignore_eos",
+    "continue_final_message",
+    "skip_special_tokens",
+    "lora_path",
+    "session_params",
+    "separate_reasoning",
+    "stream_reasoning",
+    "chat_template",
+    "chat_template_kwargs",
+    "return_hidden_states",
+    "repetition_penalty",
+    "sampling_seed",
+    "backend_url",
+];
+
+pub(crate) fn strip_default_sglang_fields(payload: &mut serde_json::Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+
+    for field in SGLANG_DEFAULT_FIELDS {
+        let remove = object.get(*field).is_some_and(|value| {
+            value.is_null()
+                || value == &serde_json::Value::Bool(false)
+                || (matches!(*field, "separate_reasoning" | "stream_reasoning")
+                    && value == &serde_json::Value::Bool(true))
+        });
+        if remove {
+            object.remove(*field);
         }
+    }
+}
+
+fn is_pre_response_transport_error(error: &reqwest::Error) -> bool {
+    error.status().is_none()
+        && !error.is_timeout()
+        && !error.is_body()
+        && !error.is_decode()
+        && !error.is_builder()
+        && !error.is_redirect()
+}
+
+pub(crate) async fn send_with_stale_conn_retry(
+    builder: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let retry = builder.try_clone();
+    match builder.send().await {
+        Err(error) if is_pre_response_transport_error(&error) => match retry {
+            Some(retry) => retry.send().await,
+            None => Err(error),
+        },
+        other => other,
+    }
+}
+
+impl Router {
+    fn scheduled_regular_worker() -> Result<Arc<dyn Worker>, Response> {
+        let Some(selection) = current_scheduled_selection() else {
+            return Err(error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP router",
+            ));
+        };
+
+        match selection.worker_selection {
+            ScheduledWorkerSelection::Regular { worker } => Ok(worker),
+            _ => Err(error::bad_request(
+                "invalid_worker_selection",
+                "Expected a Regular worker",
+            )),
+        }
+    }
+
+    fn serialize_vllm_request<T: serde::Serialize>(
+        typed_req: &T,
+    ) -> Result<serde_json::Value, Response> {
+        let mut json_value = serde_json::to_value(typed_req).map_err(|error| {
+            error::bad_request(
+                "serialization_failed",
+                format!("Convert into serde_json::Value failed: {}", error),
+            )
+        })?;
+        strip_default_sglang_fields(&mut json_value);
+        Ok(json_value)
     }
 
     /// Create a regular HTTP execution router.
@@ -76,7 +166,7 @@ impl Router {
         })
     }
 
-    fn select_first_worker(&self) -> Result<String, String> {
+    fn management_worker_url(&self) -> Result<String, String> {
         let workers = self.worker_registry.get_workers_filtered(
             None,
             Some(WorkerType::Regular),
@@ -96,7 +186,7 @@ impl Router {
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
         let headers = header_utils::copy_request_headers(&req);
 
-        match self.select_first_worker() {
+        match self.management_worker_url() {
             Ok(worker_url) => {
                 let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
                 for (name, value) in headers {
@@ -134,20 +224,6 @@ impl Router {
         }
     }
 
-    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
-        &self,
-        headers: Option<&HeaderMap>,
-        typed_req: &T,
-        route: &'static str,
-        model_id: Option<&str>,
-    ) -> Response {
-        let _ = (headers, typed_req, route, model_id);
-        error::service_unavailable(
-            "scheduler_selection_required",
-            "Request must be scheduled before entering the HTTP router",
-        )
-    }
-
     async fn route_typed_request_with_worker<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -160,6 +236,22 @@ impl Router {
             .await
     }
 
+    async fn route_detached_typed_request_with_worker<
+        T: GenerationRequest + serde::Serialize + Clone,
+    >(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &'static str,
+        model_id: Option<&str>,
+        worker: Arc<dyn Worker>,
+    ) -> Response {
+        self.route_typed_request_internal_with_detach(
+            headers, typed_req, route, model_id, worker, true,
+        )
+        .await
+    }
+
     async fn route_typed_request_internal<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -167,6 +259,28 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
         selected_worker: Arc<dyn Worker>,
+    ) -> Response {
+        self.route_typed_request_internal_with_detach(
+            headers,
+            typed_req,
+            route,
+            model_id,
+            selected_worker,
+            false,
+        )
+        .await
+    }
+
+    async fn route_typed_request_internal_with_detach<
+        T: GenerationRequest + serde::Serialize + Clone,
+    >(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &'static str,
+        model_id: Option<&str>,
+        selected_worker: Arc<dyn Worker>,
+        detach_stream: bool,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -193,6 +307,7 @@ impl Router {
                 model_id,
                 is_stream,
                 selected_worker,
+                detach_stream,
             )
             .await;
 
@@ -228,6 +343,7 @@ impl Router {
         _model_id: Option<&str>,
         is_stream: bool,
         worker: Arc<dyn Worker>,
+        detach_stream: bool,
     ) -> Response {
         // Load is execution state, not a routing decision. Keep it attached for
         // every scheduled worker so all Scheduler policies observe real load.
@@ -240,7 +356,15 @@ impl Router {
         let headers = Some(&headers_with_trace);
 
         let response = self
-            .send_typed_request(headers, typed_req, route, &worker, is_stream, load_guard)
+            .send_typed_request(
+                headers,
+                typed_req,
+                route,
+                &worker,
+                is_stream,
+                detach_stream,
+                load_guard,
+            )
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -419,6 +543,7 @@ impl Router {
         route: &'static str,
         worker: &Arc<dyn Worker>,
         is_stream: bool,
+        detach_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
     ) -> Response {
         let worker_url = worker.url();
@@ -426,6 +551,11 @@ impl Router {
 
         // Static key string to avoid per-request allocations
         const DP_RANK_KEY: &str = "data_parallel_rank";
+
+        let is_vllm = matches!(
+            worker.metadata().runtime_type,
+            crate::core::worker::RuntimeType::Vllm
+        );
 
         let mut request_builder = if self.dp_aware {
             let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
@@ -466,9 +596,21 @@ impl Router {
                 );
             }
 
+            if is_vllm {
+                strip_default_sglang_fields(&mut json_val);
+            }
+
             self.client
                 .post(format!("{}{}", worker_url_prefix, route))
                 .json(&json_val)
+        } else if is_vllm {
+            match Self::serialize_vllm_request(typed_req) {
+                Ok(json_value) => self
+                    .client
+                    .post(format!("{}{}", worker_url, route))
+                    .json(&json_value),
+                Err(response) => return response,
+            }
         } else {
             self.client
                 .post(format!("{}{}", worker_url, route))
@@ -491,7 +633,7 @@ impl Router {
             }
         }
 
-        let res = match request_builder.send().await {
+        let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
                 error!(
@@ -547,18 +689,34 @@ impl Router {
             if !status.is_success() {
                 tracked.mark_errored();
             }
-            let body = Body::from_stream(tracked);
 
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
+            if detach_stream {
+                let (tx, rx) = mpsc::channel(16);
+                tokio::spawn(async move {
+                    while let Some(chunk) = tracked.next().await {
+                        if tx.send(chunk).await.is_err() {
+                            while tracked.next().await.is_some() {}
+                            break;
+                        }
+                    }
+                    drop(load_guard);
+                });
 
-            // Attach load guard to response body for proper RAII lifecycle
-            // Guard is dropped when response body is consumed or client disconnects
-            if let Some(guard) = load_guard {
-                response = AttachedBody::wrap_response(response, guard);
+                let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+                *response.status_mut() = status;
+                *response.headers_mut() = response_headers;
+                response
+            } else {
+                let body = Body::from_stream(tracked);
+                let mut response = Response::new(body);
+                *response.status_mut() = status;
+                *response.headers_mut() = response_headers;
+
+                if let Some(guard) = load_guard {
+                    response = AttachedBody::wrap_response(response, guard);
+                }
+                response
             }
-            response
         }
     }
 
@@ -664,14 +822,9 @@ impl RouterTrait for Router {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
-            return error::service_unavailable(
-                "scheduler_selection_required",
-                "Request must be scheduled before entering the HTTP router",
-            );
-        };
-        let Some(worker) = Self::selected_regular_worker(&selection) else {
-            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        let worker = match Self::scheduled_regular_worker() {
+            Ok(worker) => worker,
+            Err(response) => return response,
         };
         self.route_typed_request_with_worker(headers, body, "/generate", model_id, worker.clone())
             .await
@@ -683,14 +836,9 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
-            return error::service_unavailable(
-                "scheduler_selection_required",
-                "Request must be scheduled before entering the HTTP router",
-            );
-        };
-        let Some(worker) = Self::selected_regular_worker(&selection) else {
-            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        let worker = match Self::scheduled_regular_worker() {
+            Ok(worker) => worker,
+            Err(response) => return response,
         };
         self.route_typed_request_with_worker(
             headers,
@@ -708,14 +856,9 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
-            return error::service_unavailable(
-                "scheduler_selection_required",
-                "Request must be scheduled before entering the HTTP router",
-            );
-        };
-        let Some(worker) = Self::selected_regular_worker(&selection) else {
-            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        let worker = match Self::scheduled_regular_worker() {
+            Ok(worker) => worker,
+            Err(response) => return response,
         };
         self.route_typed_request_with_worker(
             headers,
@@ -733,23 +876,29 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
-            return error::service_unavailable(
-                "scheduler_selection_required",
-                "Request must be scheduled before entering the HTTP router",
-            );
+        let worker = match Self::scheduled_regular_worker() {
+            Ok(worker) => worker,
+            Err(response) => return response,
         };
-        let Some(worker) = Self::selected_regular_worker(&selection) else {
-            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
-        };
-        self.route_typed_request_with_worker(
-            headers,
-            body,
-            "/v1/responses",
-            model_id,
-            worker.clone(),
-        )
-        .await
+        if body.store == Some(true) && body.is_stream() {
+            self.route_detached_typed_request_with_worker(
+                headers,
+                body,
+                "/v1/responses",
+                model_id,
+                worker.clone(),
+            )
+            .await
+        } else {
+            self.route_typed_request_with_worker(
+                headers,
+                body,
+                "/v1/responses",
+                model_id,
+                worker.clone(),
+            )
+            .await
+        }
     }
 
     async fn get_response(
@@ -773,14 +922,9 @@ impl RouterTrait for Router {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
-            return error::service_unavailable(
-                "scheduler_selection_required",
-                "Request must be scheduled before entering the HTTP router",
-            );
-        };
-        let Some(worker) = Self::selected_regular_worker(&selection) else {
-            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        let worker = match Self::scheduled_regular_worker() {
+            Ok(worker) => worker,
+            Err(response) => return response,
         };
         self.route_typed_request_with_worker(
             headers,
@@ -798,14 +942,9 @@ impl RouterTrait for Router {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
-            return error::service_unavailable(
-                "scheduler_selection_required",
-                "Request must be scheduled before entering the HTTP router",
-            );
-        };
-        let Some(worker) = Self::selected_regular_worker(&selection) else {
-            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        let worker = match Self::scheduled_regular_worker() {
+            Ok(worker) => worker,
+            Err(response) => return response,
         };
         self.route_typed_request_with_worker(
             headers,
@@ -823,14 +962,9 @@ impl RouterTrait for Router {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let Some(selection) = current_scheduled_selection().as_ref().cloned() else {
-            return error::service_unavailable(
-                "scheduler_selection_required",
-                "Request must be scheduled before entering the HTTP router",
-            );
-        };
-        let Some(worker) = Self::selected_regular_worker(&selection) else {
-            return error::bad_request("invalid_worker_selection", "Expected a Regular worker");
+        let worker = match Self::scheduled_regular_worker() {
+            Ok(worker) => worker,
+            Err(response) => return response,
         };
         let response = self
             .route_typed_request_with_worker(headers, body, "/v1/rerank", model_id, worker.clone())
@@ -856,7 +990,9 @@ impl RouterTrait for Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::BasicWorkerBuilder;
+    use crate::core::{
+        model_type::ModelType, worker::RuntimeType, BasicWorkerBuilder, ModelCard, WorkerType,
+    };
 
     fn create_test_regular_router() -> Router {
         // Create registries
@@ -885,15 +1021,151 @@ mod tests {
         router
     }
 
+    async fn spawn_recording_chat_worker() -> (String, Arc<std::sync::Mutex<Vec<serde_json::Value>>>)
+    {
+        use axum::{extract::State, routing::post, Json, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = requests.clone();
+        let app = AxumRouter::new()
+            .route(
+                "/v1/chat/completions",
+                post(
+                    |State(requests): State<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+                     Json(body): Json<serde_json::Value>| async move {
+                        requests
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(body);
+                        Json(serde_json::json!({"object": "chat.completion"}))
+                    },
+                ),
+            )
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{}", address), requests)
+    }
+
     #[test]
-    fn test_select_first_worker_with_unhealthy_worker() {
+    fn test_management_worker_selection_skips_unhealthy_worker() {
         let router = create_test_unhealthy_router();
-        let result = router.select_first_worker();
+        let result = router.management_worker_url();
 
         assert!(result.is_ok());
         let url = result.unwrap();
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn regular_router_requires_scheduler_selection() {
+        let router = create_test_regular_router();
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let response = router.route_chat(None, &request, None).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("scheduler_selection_required"));
+    }
+
+    #[test]
+    fn strip_default_sglang_fields_removes_vllm_defaults() {
+        let mut payload = serde_json::json!({
+            "model": "test-model",
+            "skip_special_tokens": false,
+            "separate_reasoning": false,
+            "stream_reasoning": false,
+            "request_id": null,
+            "top_p": 0.9,
+        });
+
+        strip_default_sglang_fields(&mut payload);
+
+        assert!(payload.get("skip_special_tokens").is_none());
+        assert!(payload.get("separate_reasoning").is_none());
+        assert!(payload.get("stream_reasoning").is_none());
+        assert!(payload.get("request_id").is_none());
+        assert_eq!(payload["top_p"], 0.9);
+    }
+
+    #[tokio::test]
+    async fn vllm_regular_requests_strip_sglang_defaults_while_sglang_preserves_them() {
+        let (sglang_url, sglang_requests) = spawn_recording_chat_worker().await;
+        let (vllm_url, vllm_requests) = spawn_recording_chat_worker().await;
+        let router = create_test_regular_router();
+
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "skip_special_tokens": false,
+            "separate_reasoning": false,
+            "stream_reasoning": false,
+        }))
+        .unwrap();
+        let sglang_worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(sglang_url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("test-model").with_model_type(ModelType::SGLANG_LLM))
+                .build(),
+        );
+        let vllm_worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(vllm_url)
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("test-model").with_model_type(ModelType::LLM))
+                .build(),
+        );
+
+        let sglang_response = router
+            .send_typed_request(
+                None,
+                &request,
+                "/v1/chat/completions",
+                &sglang_worker,
+                false,
+                false,
+                None,
+            )
+            .await;
+        let vllm_response = router
+            .send_typed_request(
+                None,
+                &request,
+                "/v1/chat/completions",
+                &vllm_worker,
+                false,
+                false,
+                None,
+            )
+            .await;
+
+        assert_eq!(sglang_response.status(), StatusCode::OK);
+        assert_eq!(vllm_response.status(), StatusCode::OK);
+
+        let sglang_requests = sglang_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let vllm_requests = vllm_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(sglang_requests.len(), 1);
+        assert_eq!(vllm_requests.len(), 1);
+        assert_eq!(sglang_requests[0]["skip_special_tokens"], false);
+        assert_eq!(sglang_requests[0]["separate_reasoning"], false);
+        assert_eq!(sglang_requests[0]["stream_reasoning"], false);
+        assert!(vllm_requests[0].get("skip_special_tokens").is_none());
+        assert!(vllm_requests[0].get("separate_reasoning").is_none());
+        assert!(vllm_requests[0].get("stream_reasoning").is_none());
     }
 }

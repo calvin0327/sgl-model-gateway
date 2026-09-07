@@ -126,7 +126,6 @@ class Gateway:
         igw_mode: bool = False,
         # Cloud mode arguments
         cloud_backend: str | None = None,
-        history_backend: str = "memory",
         # Common arguments
         policy: str = "round_robin",
         timeout: float = DEFAULT_ROUTER_TIMEOUT,
@@ -148,7 +147,6 @@ class Gateway:
             decode_workers: List of decode ModelInstance objects for PD mode.
             igw_mode: Start in IGW mode (no workers, add via API).
             cloud_backend: Cloud backend type ("openai" or "xai").
-            history_backend: History backend for cloud mode ("memory" or "oracle").
             policy: Routing policy (round_robin, random, etc.)
             timeout: Startup timeout in seconds.
             show_output: Show subprocess output (env var override).
@@ -248,8 +246,6 @@ class Gateway:
                 "openai",  # Both OpenAI and xAI use openai backend type
                 "--worker-urls",
                 worker_url,
-                "--history-backend",
-                history_backend,
             ]
 
             self._launch(
@@ -559,7 +555,6 @@ class Gateway:
 def launch_cloud_gateway(
     runtime: str,  # "openai" or "xai"
     *,
-    history_backend: str = "memory",
     extra_args: list[str] | None = None,
     timeout: float = 60,
     show_output: bool | None = None,
@@ -568,7 +563,6 @@ def launch_cloud_gateway(
 
     Args:
         runtime: Cloud runtime ("openai" or "xai")
-        history_backend: History storage backend ("memory" or "oracle")
         extra_args: Additional router arguments
         timeout: Startup timeout in seconds
         show_output: Show subprocess output
@@ -587,7 +581,6 @@ def launch_cloud_gateway(
     gateway = Gateway()
     gateway.start(
         cloud_backend=runtime,
-        history_backend=history_backend,
         timeout=timeout,
         show_output=show_output,
         extra_args=extra_args,

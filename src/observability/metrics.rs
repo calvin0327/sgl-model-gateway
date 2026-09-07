@@ -300,21 +300,6 @@ pub(crate) fn init_metrics() {
         "Workers known via discovery by source"
     );
 
-    // Layer 5: MCP metrics
-    describe_counter!(
-        "smg_mcp_tool_calls_total",
-        "Total MCP tool invocations by model, tool_name, result"
-    );
-    describe_histogram!(
-        "smg_mcp_tool_duration_seconds",
-        "MCP tool execution duration by model, tool_name"
-    );
-    describe_gauge!("smg_mcp_servers_active", "Active MCP server connections");
-    describe_counter!(
-        "smg_mcp_tool_iterations_total",
-        "Tool loop iterations in Responses API by model"
-    );
-
     // Layer 6: Database metrics
     describe_counter!(
         "smg_db_operations_total",
@@ -329,9 +314,6 @@ pub(crate) fn init_metrics() {
         "Active database connections by storage_type"
     );
     describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
-
-    // Initialize mesh metrics
-    smg_mesh::metrics::init_mesh_metrics();
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -399,8 +381,6 @@ pub mod metrics_labels {
 
     // Storage types
     pub const STORAGE_RESPONSE: &str = "response";
-    pub const STORAGE_CONVERSATION: &str = "conversation";
-    pub const STORAGE_CONVERSATION_ITEM: &str = "conversation_item";
 
     // Database operations
     pub const DB_OP_GET: &str = "get";
@@ -1077,50 +1057,6 @@ impl Metrics {
             "source" => source
         )
         .set(count as f64);
-    }
-
-    // ========================================================================
-    // Layer 5: MCP metrics
-    // ========================================================================
-
-    /// Record MCP tool call
-    pub fn record_mcp_tool_call(model_id: &str, tool_name: &str, result: &'static str) {
-        let model = intern_string(model_id);
-        let tool = intern_string(tool_name);
-        counter!(
-            "smg_mcp_tool_calls_total",
-            "model" => model,
-            "tool_name" => tool,
-            "result" => result
-        )
-        .increment(1);
-    }
-
-    /// Record MCP tool execution duration
-    pub fn record_mcp_tool_duration(model_id: &str, tool_name: &str, duration: Duration) {
-        let model = intern_string(model_id);
-        let tool = intern_string(tool_name);
-        histogram!(
-            "smg_mcp_tool_duration_seconds",
-            "model" => model,
-            "tool_name" => tool
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Set active MCP servers count
-    pub fn set_mcp_servers_active(count: usize) {
-        gauge!("smg_mcp_servers_active").set(count as f64);
-    }
-
-    /// Record MCP tool loop iteration
-    pub fn record_mcp_tool_iteration(model_id: &str) {
-        let model = intern_string(model_id);
-        counter!(
-            "smg_mcp_tool_iterations_total",
-            "model" => model
-        )
-        .increment(1);
     }
 
     // ========================================================================

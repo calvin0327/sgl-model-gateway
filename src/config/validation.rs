@@ -1,8 +1,7 @@
 use super::{
     gateway::{
-        CircuitBreakerConfig, DiscoveryConfig, GatewayConfig, HistoryBackend, MeshConfig,
-        ObservabilityConfig, OracleConfig, PolicyConfig, RetryConfig, RoutingConfig, ServerConfig,
-        StorageConfig, TokenizerCacheConfig, WorkerConfig,
+        CircuitBreakerConfig, DiscoveryConfig, GatewayConfig, ObservabilityConfig, PolicyConfig,
+        RetryConfig, RoutingConfig, ServerConfig, TokenizerCacheConfig, WorkerConfig,
     },
     ConfigError, ConfigResult,
 };
@@ -17,63 +16,12 @@ impl ConfigValidator {
         Self::validate_routing(&config.routing)?;
         Self::validate_worker(&config.workers)?;
         Self::validate_tokenizer_cache(&config.model.tokenizer_cache)?;
-        Self::validate_storage(&config.storage)?;
         Self::validate_observability(&config.observability)?;
 
         if let Some(discovery) = &config.discovery {
             Self::validate_gateway_discovery(discovery)?;
         }
-        if let Some(mesh) = &config.mesh {
-            Self::validate_mesh(mesh)?;
-        }
-
         Self::validate_gateway_compatibility(config)
-    }
-
-    fn validate_oracle(oracle: &OracleConfig) -> ConfigResult<()> {
-        if oracle.username.is_empty() {
-            return Err(ConfigError::MissingRequired {
-                field: "oracle.username".to_string(),
-            });
-        }
-
-        if oracle.password.is_empty() {
-            return Err(ConfigError::MissingRequired {
-                field: "oracle.password".to_string(),
-            });
-        }
-
-        if oracle.connect_descriptor.is_empty() {
-            return Err(ConfigError::MissingRequired {
-                field: "oracle_dsn or oracle_tns_alias".to_string(),
-            });
-        }
-
-        if oracle.pool_min < 1 {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle.pool_min".to_string(),
-                value: oracle.pool_min.to_string(),
-                reason: "Must be at least 1".to_string(),
-            });
-        }
-
-        if oracle.pool_max < oracle.pool_min {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle.pool_max".to_string(),
-                value: oracle.pool_max.to_string(),
-                reason: "Must be >= oracle.pool_min".to_string(),
-            });
-        }
-
-        if oracle.pool_timeout_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle.pool_timeout_secs".to_string(),
-                value: oracle.pool_timeout_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
-        }
-
-        Ok(())
     }
 
     fn validate_server(server: &ServerConfig) -> ConfigResult<()> {
@@ -141,6 +89,34 @@ impl ConfigValidator {
     }
 
     fn validate_worker(workers: &WorkerConfig) -> ConfigResult<()> {
+        if let Some(runtime) = &workers.runtime {
+            if !matches!(runtime.as_str(), "sglang" | "vllm") {
+                return Err(ConfigError::InvalidValue {
+                    field: "workers.runtime".to_string(),
+                    value: runtime.clone(),
+                    reason: "Must be 'sglang' or 'vllm'".to_string(),
+                });
+            }
+        }
+
+        if let Some(connector) = &workers.kv_connector {
+            if !matches!(connector.as_str(), "MooncakeConnector" | "NixlConnector") {
+                return Err(ConfigError::InvalidValue {
+                    field: "workers.kv_connector".to_string(),
+                    value: connector.clone(),
+                    reason: "Must be 'MooncakeConnector' or 'NixlConnector'".to_string(),
+                });
+            }
+        }
+
+        if workers.kv_engine_id.as_ref().is_some_and(String::is_empty) {
+            return Err(ConfigError::InvalidValue {
+                field: "workers.kv_engine_id".to_string(),
+                value: String::new(),
+                reason: "Cannot be empty when specified".to_string(),
+            });
+        }
+
         for (field, value) in [
             (
                 "workers.regular_preferred_context_tokens",
@@ -238,39 +214,6 @@ impl ConfigValidator {
         Self::validate_circuit_breaker(&circuit_breaker)
     }
 
-    fn validate_storage(storage: &StorageConfig) -> ConfigResult<()> {
-        match &storage.history_backend {
-            HistoryBackend::None | HistoryBackend::Memory => Ok(()),
-            HistoryBackend::Oracle => storage
-                .oracle
-                .as_ref()
-                .ok_or_else(|| ConfigError::MissingRequired {
-                    field: "storage.oracle".to_string(),
-                })
-                .and_then(Self::validate_oracle),
-            HistoryBackend::Postgres => storage
-                .postgres
-                .as_ref()
-                .ok_or_else(|| ConfigError::MissingRequired {
-                    field: "storage.postgres".to_string(),
-                })?
-                .validate()
-                .map_err(|error| ConfigError::ValidationFailed {
-                    reason: error.to_string(),
-                }),
-            HistoryBackend::Redis => storage
-                .redis
-                .as_ref()
-                .ok_or_else(|| ConfigError::MissingRequired {
-                    field: "storage.redis".to_string(),
-                })?
-                .validate()
-                .map_err(|error| ConfigError::ValidationFailed {
-                    reason: error.to_string(),
-                }),
-        }
-    }
-
     fn validate_observability(observability: &ObservabilityConfig) -> ConfigResult<()> {
         if observability.prometheus_port == 0 || observability.prometheus_host.is_empty() {
             return Err(ConfigError::ValidationFailed {
@@ -293,15 +236,6 @@ impl ConfigValidator {
             });
         }
 
-        Ok(())
-    }
-
-    fn validate_mesh(mesh: &MeshConfig) -> ConfigResult<()> {
-        if mesh.self_name.trim().is_empty() {
-            return Err(ConfigError::MissingRequired {
-                field: "mesh.self_name".to_string(),
-            });
-        }
         Ok(())
     }
 

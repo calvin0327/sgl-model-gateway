@@ -119,10 +119,8 @@ sequenceDiagram
 
     Main->>Startup: Read GatewayConfig
     Startup->>Startup: Start metrics
-    Startup->>Startup: Start optional mesh service
-
     Startup->>Context: Create AppContext
-    Context->>Context: Initialize registries and storage
+    Context->>Context: Initialize registries
     Context->>Jobs: Create JobQueue
     Context->>Workflow: Create workflow engines
 
@@ -131,7 +129,6 @@ sequenceDiagram
 
     Startup->>Jobs: Submit tokenizer job, if configured
     Startup->>Jobs: Submit worker initialization job
-    Startup->>Jobs: Submit MCP initialization job, if configured
 
     Jobs->>Workflow: Start worker workflow
     Workflow->>Registry: Register workers
