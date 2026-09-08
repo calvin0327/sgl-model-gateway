@@ -21,7 +21,7 @@ use smg::{
     app_context::AppContext,
     config::GatewayConfig,
     core::{
-        BasicWorkerBuilder, Job, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry,
+        BackendType, BasicWorkerBuilder, Job, LoadMonitor, ModelCard, Worker, WorkerRegistry,
         WorkerType,
     },
     middleware::TokenBucket,
@@ -360,9 +360,8 @@ pub async fn create_test_context(config: GatewayConfig) -> Arc<AppContext> {
             ModelCard::new("gpt-3.5-turbo"),
         ];
         let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(url)
+            BasicWorkerBuilder::new_with_backend(url, BackendType::External)
                 .worker_type(WorkerType::Regular)
-                .runtime_type(RuntimeType::External)
                 .models(models)
                 .build(),
         );
@@ -456,7 +455,7 @@ pub async fn create_test_context_with_parsers(config: GatewayConfig) -> Arc<AppC
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
-                .runtime_type(RuntimeType::External)
+                .runtime_type(BackendType::External)
                 .models(models)
                 .build(),
         );

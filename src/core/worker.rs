@@ -464,11 +464,10 @@ impl fmt::Display for ConnectionMode {
 }
 
 /// Runtime implementation type for workers
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum RuntimeType {
-    /// SGLang runtime (default)
-    #[default]
+pub enum BackendType {
+    /// SGLang runtime
     Sglang,
     /// vLLM runtime
     Vllm,
@@ -476,27 +475,27 @@ pub enum RuntimeType {
     External,
 }
 
-impl fmt::Display for RuntimeType {
+impl fmt::Display for BackendType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RuntimeType::Sglang => write!(f, "sglang"),
-            RuntimeType::Vllm => write!(f, "vllm"),
-            RuntimeType::External => write!(f, "external"),
+            BackendType::Sglang => write!(f, "sglang"),
+            BackendType::Vllm => write!(f, "vllm"),
+            BackendType::External => write!(f, "external"),
         }
     }
 }
 
-impl std::str::FromStr for RuntimeType {
+impl std::str::FromStr for BackendType {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Use eq_ignore_ascii_case to avoid to_lowercase() allocation
         if s.eq_ignore_ascii_case("sglang") {
-            Ok(RuntimeType::Sglang)
+            Ok(BackendType::Sglang)
         } else if s.eq_ignore_ascii_case("vllm") {
-            Ok(RuntimeType::Vllm)
+            Ok(BackendType::Vllm)
         } else if s.eq_ignore_ascii_case("external") {
-            Ok(RuntimeType::External)
+            Ok(BackendType::External)
         } else {
             Err(format!("Unknown runtime type: {}", s))
         }
@@ -581,7 +580,7 @@ pub struct WorkerMetadata {
     /// Connection mode
     pub connection_mode: ConnectionMode,
     /// Runtime type (for gRPC workers)
-    pub runtime_type: RuntimeType,
+    pub runtime_type: BackendType,
     /// vLLM KV transfer connector
     pub kv_connector: Option<String>,
     /// vLLM Mooncake engine ID
@@ -1921,7 +1920,7 @@ mod tests {
             url: "http://test:8080".to_string(),
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
+            runtime_type: BackendType::Sglang,
             kv_connector: None,
             kv_engine_id: None,
             labels: std::collections::HashMap::new(),
@@ -1954,7 +1953,7 @@ mod tests {
             url: "http://test:8080".to_string(),
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
+            runtime_type: BackendType::Sglang,
             kv_connector: None,
             kv_engine_id: None,
             labels: std::collections::HashMap::new(),

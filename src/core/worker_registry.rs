@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::{
     core::{
         circuit_breaker::CircuitState,
-        worker::{HealthChecker, RuntimeType, WorkerType},
+        worker::{BackendType, HealthChecker, WorkerType},
         ConnectionMode, Worker,
     },
     observability::metrics::Metrics,
@@ -475,7 +475,7 @@ impl WorkerRegistry {
         model_id: Option<&str>,
         worker_type: Option<WorkerType>,
         connection_mode: Option<ConnectionMode>,
-        runtime_type: Option<RuntimeType>,
+        runtime_type: Option<BackendType>,
         healthy_only: bool,
     ) -> Vec<Arc<dyn Worker>> {
         // Start with the most efficient collection based on filters

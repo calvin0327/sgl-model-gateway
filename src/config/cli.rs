@@ -121,8 +121,8 @@ pub struct CliArgs {
     worker_urls: Vec<String>,
 
     /// Backend runtime for configured workers (sglang or vllm)
-    #[arg(long, help_heading = "Worker Configuration")]
-    backend: Option<String>,
+    #[arg(long, required = true, help_heading = "Worker Configuration")]
+    backend: String,
 
     /// Preferred input context length for regular workers (tokens; not a hard limit)
     #[arg(long, help_heading = "Worker Configuration")]
@@ -207,7 +207,7 @@ pub struct CliArgs {
     #[arg(long, help_heading = "PD Disaggregation")]
     pd_preferred_context_tokens: Option<usize>,
 
-    /// vLLM KV transfer connector (MooncakeConnector or NixlConnector)
+    /// vLLM KV transfer connector (mooncake or nixl)
     #[arg(long, help_heading = "PD Disaggregation")]
     kv_connector: Option<String>,
 
@@ -695,7 +695,7 @@ impl CliArgs {
             },
             workers: WorkerConfig {
                 regular_urls: self.worker_urls.clone(),
-                runtime: self.backend.clone(),
+                backend: self.backend.clone(),
                 regular_preferred_context_tokens: self.regular_preferred_context_tokens,
                 openai_urls: self.openai_urls.clone(),
                 prefill_urls: prefill_urls.clone(),

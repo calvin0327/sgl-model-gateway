@@ -24,6 +24,7 @@ pub struct GatewayConfig {
 
     /// Kubernetes discovery settings; absent when discovery is disabled.
     pub discovery: Option<DiscoveryConfig>,
+
     pub workers: WorkerConfig,
 
     pub model: ModelConfig,
@@ -278,10 +279,10 @@ pub struct WorkerConfig {
 
     /// Backend runtime for workers configured by URL.
     ///
-    /// This applies to regular, prefill, and decode workers. It is `None` for
-    /// the historical default, SGLang.
-    #[serde(default)]
-    pub runtime: Option<String>,
+    /// This applies to regular, prefill, and decode workers. It must be either
+    /// `sglang` or `vllm`; OpenAI-compatible external workers are configured
+    /// separately through `openai_urls`.
+    pub backend: String,
 
     /// Preferred input context length for regular workers. This is a routing
     /// preference, not a hard limit.
@@ -361,7 +362,7 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             regular_urls: Vec::new(),
-            runtime: None,
+            backend: String::new(),
             regular_preferred_context_tokens: None,
             prefill_urls: Vec::new(),
             pd_preferred_context_tokens: None,

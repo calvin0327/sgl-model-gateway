@@ -12,7 +12,7 @@ use tracing::info;
 
 use crate::{
     core::{
-        model_type::Endpoint, pd_group_id, ConnectionMode, RuntimeType, Worker, WorkerRegistry,
+        model_type::Endpoint, pd_group_id, BackendType, ConnectionMode, Worker, WorkerRegistry,
         WorkerType,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
@@ -167,7 +167,7 @@ impl Scheduler {
 
         let worker_selection = worker_selection.ok_or_else(|| {
             let has_pd_worker = available_workers.iter().any(|worker| {
-                !matches!(worker.metadata().runtime_type, RuntimeType::External)
+                !matches!(worker.metadata().runtime_type, BackendType::External)
                     && matches!(
                         worker.worker_type(),
                         WorkerType::Prefill { .. } | WorkerType::Decode
@@ -190,29 +190,29 @@ impl Scheduler {
 
         match &worker_selection {
             WorkerSelection::Regular { worker } => {
+                let policy = self
+                    .policy_registry
+                    .get_policy_or_default(model_id.as_str());
                 info!(
                     model_id = %model_id,
-                    endpoint = ?req.endpoint,
-                    context_tokens = ?context_tokens,
+                    context_tokens = %context_tokens.unwrap_or_default(),
+                    policy = %policy.name(),
                     worker_url = %worker.url(),
-                    worker_type = ?worker.worker_type(),
-                    runtime_type = %worker.metadata().runtime_type,
                     "Request scheduled to worker"
                 );
             }
             WorkerSelection::PrefillDecode {
-                prefill,
-                decode,
-                pd_group_id,
+                prefill, decode, ..
             } => {
+                let prefill_policy = self.policy_registry.get_prefill_policy();
+                let decode_policy = self.policy_registry.get_decode_policy();
                 info!(
                     model_id = %model_id,
-                    endpoint = ?req.endpoint,
-                    context_tokens = ?context_tokens,
+                    context_tokens = %context_tokens.unwrap_or_default(),
+                    prefill_policy = %prefill_policy.name(),
+                    decode_policy = %decode_policy.name(),
                     prefill_url = %prefill.url(),
                     decode_url = %decode.url(),
-                    pd_group_id = %pd_group_id,
-                    runtime_type = %prefill.metadata().runtime_type,
                     "Request scheduled to PD workers"
                 );
             }
@@ -282,7 +282,7 @@ impl Scheduler {
             .iter()
             .filter(|worker| {
                 matches!(worker.worker_type(), WorkerType::Regular)
-                    && !matches!(worker.metadata().runtime_type, RuntimeType::External)
+                    && !matches!(worker.metadata().runtime_type, BackendType::External)
             })
             .filter_map(|worker| Self::matching_context_limit(worker.as_ref(), context_tokens))
             .min();
@@ -325,7 +325,7 @@ impl Scheduler {
         let prefill_workers: Vec<_> = workers
             .iter()
             .filter(|worker| {
-                !matches!(worker.metadata().runtime_type, RuntimeType::External)
+                !matches!(worker.metadata().runtime_type, BackendType::External)
                     && matches!(worker.worker_type(), WorkerType::Prefill { .. })
                     && Self::matches_pd_context_preference(worker.as_ref(), context_tokens)
             })
@@ -334,7 +334,7 @@ impl Scheduler {
         let decode_workers: Vec<_> = workers
             .iter()
             .filter(|worker| {
-                !matches!(worker.metadata().runtime_type, RuntimeType::External)
+                !matches!(worker.metadata().runtime_type, BackendType::External)
                     && matches!(worker.worker_type(), WorkerType::Decode)
             })
             .cloned()
@@ -478,7 +478,7 @@ impl Scheduler {
             .iter()
             .filter(|worker| {
                 matches!(worker.worker_type(), WorkerType::Regular)
-                    && !matches!(worker.metadata().runtime_type, RuntimeType::External)
+                    && !matches!(worker.metadata().runtime_type, BackendType::External)
             })
             .cloned()
             .collect();
@@ -504,7 +504,7 @@ impl Scheduler {
     ) -> Option<WorkerSelection> {
         let available: Vec<_> = available_workers
             .iter()
-            .filter(|worker| !matches!(worker.metadata().runtime_type, RuntimeType::External))
+            .filter(|worker| !matches!(worker.metadata().runtime_type, BackendType::External))
             .cloned()
             .collect();
 
@@ -590,9 +590,9 @@ impl Scheduler {
     fn select_pd_group(
         prefill_workers: &[Arc<dyn Worker>],
         decode_workers: &[Arc<dyn Worker>],
-    ) -> Option<(String, ConnectionMode, RuntimeType)> {
+    ) -> Option<(String, ConnectionMode, BackendType)> {
         let mut seen = HashSet::new();
-        let candidates: Vec<(String, ConnectionMode, RuntimeType, usize)> = prefill_workers
+        let candidates: Vec<(String, ConnectionMode, BackendType, usize)> = prefill_workers
             .iter()
             .filter_map(|prefill| {
                 let group = pd_group_id(prefill.as_ref()).to_string();
@@ -695,7 +695,7 @@ mod tests {
     fn external_worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
-                .runtime_type(RuntimeType::External)
+                .runtime_type(BackendType::External)
                 .build(),
         )
     }
@@ -713,7 +713,7 @@ mod tests {
         url: &str,
         worker_type: WorkerType,
         group: &str,
-        runtime_type: RuntimeType,
+        runtime_type: BackendType,
     ) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
@@ -879,7 +879,7 @@ mod tests {
                     bootstrap_port: None,
                 },
                 "group-a",
-                RuntimeType::Sglang,
+                BackendType::Sglang,
             ),
             pd_worker_with_runtime(
                 "http://vllm-prefill",
@@ -887,19 +887,19 @@ mod tests {
                     bootstrap_port: None,
                 },
                 "group-a",
-                RuntimeType::Vllm,
+                BackendType::Vllm,
             ),
             pd_worker_with_runtime(
                 "http://sglang-decode",
                 WorkerType::Decode,
                 "group-a",
-                RuntimeType::Sglang,
+                BackendType::Sglang,
             ),
             pd_worker_with_runtime(
                 "http://vllm-decode",
                 WorkerType::Decode,
                 "group-a",
-                RuntimeType::Vllm,
+                BackendType::Vllm,
             ),
         ]);
 

@@ -400,8 +400,7 @@ impl JobQueue {
             } => {
                 let api_key = config.server.api_key.clone();
 
-                let mut worker_specs: Vec<(String, &'static str, Option<u16>, Option<String>)> =
-                    Vec::new();
+                let mut worker_specs: Vec<(String, &'static str, Option<u16>, String)> = Vec::new();
 
                 // Regular workers
                 worker_specs.extend(
@@ -410,7 +409,7 @@ impl JobQueue {
                         .regular_urls
                         .iter()
                         .cloned()
-                        .map(|url| (url, "regular", None, config.workers.runtime.clone())),
+                        .map(|url| (url, "regular", None, config.workers.backend.clone())),
                 );
 
                 // Prefill workers
@@ -420,7 +419,7 @@ impl JobQueue {
                             url.clone(),
                             "prefill",
                             *bootstrap_port,
-                            config.workers.runtime.clone(),
+                            config.workers.backend.clone(),
                         )
                     },
                 ));
@@ -432,7 +431,7 @@ impl JobQueue {
                         .decode_urls
                         .iter()
                         .cloned()
-                        .map(|url| (url, "decode", None, config.workers.runtime.clone())),
+                        .map(|url| (url, "decode", None, config.workers.backend.clone())),
                 );
 
                 debug!(
@@ -453,9 +452,7 @@ impl JobQueue {
                     }
 
                     let preferred_context_tokens = match worker_type {
-                        "regular" if runtime.as_deref() != Some("external") => {
-                            config.workers.regular_preferred_context_tokens
-                        }
+                        "regular" => config.workers.regular_preferred_context_tokens,
                         "prefill" => config.workers.pd_preferred_context_tokens,
                         // Decode workers do not participate in context-length routing.
                         _ => None,
@@ -466,8 +463,6 @@ impl JobQueue {
                             tokens.to_string(),
                         );
                     }
-                    let is_external = runtime.as_deref() == Some("external");
-
                     let worker_config = WorkerConfigRequest {
                         url,
                         api_key: api_key.clone(),
@@ -497,11 +492,7 @@ impl JobQueue {
 
                         max_connection_attempts: health_check.success_threshold.saturating_mul(10),
 
-                        dp_aware: if is_external {
-                            false
-                        } else {
-                            config.routing.dp_aware
-                        },
+                        dp_aware: config.routing.dp_aware,
                     };
 
                     let job = Job::AddWorker {

@@ -27,8 +27,7 @@ pub struct WorkerConfigRequest {
     pub worker_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bootstrap_port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<String>,
+    pub runtime: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_connector: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -228,4 +227,17 @@ fn default_health_failure_threshold() -> u32 {
 
 fn default_max_connection_attempts() -> u32 {
     20
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_config_request_requires_runtime() {
+        let error = serde_json::from_str::<WorkerConfigRequest>(r#"{"url":"http://worker:8000"}"#)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("runtime"));
+    }
 }

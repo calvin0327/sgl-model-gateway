@@ -27,6 +27,7 @@ pub struct TestGatewayConfig;
 impl TestGatewayConfig {
     fn base(port: u16, policy: PolicyConfig) -> GatewayConfig {
         let mut config = GatewayConfig::default();
+        config.workers.backend = "sglang".to_string();
         config.server.host = defaults::HOST.to_string();
         config.server.port = port;
         config.server.max_payload_size = defaults::MAX_PAYLOAD_SIZE;
@@ -159,9 +160,10 @@ pub struct TestGatewayConfigBuilder {
 
 impl TestGatewayConfigBuilder {
     pub fn new() -> Self {
-        Self {
-            config: GatewayConfig::default(),
-        }
+        let mut config = GatewayConfig::default();
+        config.workers.backend = "sglang".to_string();
+
+        Self { config }
     }
 
     pub fn regular_mode(mut self, worker_urls: Vec<String>) -> Self {

@@ -20,7 +20,7 @@ use crate::{
     core::{
         is_retryable_status, pd_group_id,
         scheduler::{SchedulerOutput, WorkerSelection as ScheduledWorkerSelection},
-        worker::RuntimeType,
+        worker::BackendType,
         ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
@@ -35,6 +35,7 @@ use crate::{
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
+        messages::CreateMessageRequest,
         rerank::RerankRequest,
     },
     routers::{
@@ -692,7 +693,7 @@ impl PDRouter {
             Err(error) => return Self::handle_serialization_error(error),
         };
 
-        if prefill.metadata().runtime_type == RuntimeType::Vllm {
+        if prefill.metadata().runtime_type == BackendType::Vllm {
             return self
                 .execute_vllm_sequential_dispatch(headers, json_request, context, prefill, decode)
                 .await;
@@ -1687,9 +1688,7 @@ impl RouterTrait for PDRouter {
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        // Get info from the first decode server to match sglang's server info format
-        // Note: We use decode workers for server info to match expected format
-        self.proxy_to_first_prefill_worker("server_info", None)
+        self.proxy_to_first_prefill_worker("get_server_info", None)
             .await
     }
 
@@ -1707,7 +1706,7 @@ impl RouterTrait for PDRouter {
         let headers = header_utils::copy_request_headers(&req);
 
         // Proxy to first prefill worker
-        self.proxy_to_first_prefill_worker("model_info", Some(headers))
+        self.proxy_to_first_prefill_worker("get_model_info", Some(headers))
             .await
     }
 
@@ -1788,6 +1787,34 @@ impl RouterTrait for PDRouter {
                 batch_size: Self::get_completion_batch_size(body),
                 is_stream: body.stream,
                 return_logprob: body.logprobs.is_some(),
+                model_id,
+            },
+            &selection,
+        )
+        .await
+    }
+
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CreateMessageRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let Some(selection) = current_scheduled_selection() else {
+            let _ = (headers, body, model_id);
+            return error::service_unavailable(
+                "scheduler_selection_required",
+                "Request must be scheduled before entering the HTTP PD router",
+            );
+        };
+        self.execute_dual_dispatch_selected(
+            headers,
+            body,
+            PDRequestContext {
+                route: "/v1/messages",
+                batch_size: None,
+                is_stream: body.stream.unwrap_or(false),
+                return_logprob: false,
                 model_id,
             },
             &selection,
@@ -1962,7 +1989,7 @@ mod tests {
                     .worker_type(WorkerType::Prefill {
                         bootstrap_port: None,
                     })
-                    .runtime_type(RuntimeType::Vllm)
+                    .runtime_type(BackendType::Vllm)
                     .label("pd_group_id", "group-a")
                     .build(),
             ) as Arc<dyn Worker>,
@@ -1975,7 +2002,7 @@ mod tests {
             Arc::new(
                 BasicWorkerBuilder::new("http://vllm-decode")
                     .worker_type(WorkerType::Decode)
-                    .runtime_type(RuntimeType::Vllm)
+                    .runtime_type(BackendType::Vllm)
                     .label("pd_group_id", "group-a")
                     .build(),
             ) as Arc<dyn Worker>,
@@ -2007,14 +2034,14 @@ mod tests {
                 .worker_type(WorkerType::Prefill {
                     bootstrap_port: Some(8998),
                 })
-                .runtime_type(RuntimeType::Vllm)
-                .kv_connector("NixlConnector")
+                .runtime_type(BackendType::Vllm)
+                .kv_connector("nixl")
                 .build(),
         );
         let decode = Arc::new(
             BasicWorkerBuilder::new(decode_url)
                 .worker_type(WorkerType::Decode)
-                .runtime_type(RuntimeType::Vllm)
+                .runtime_type(BackendType::Vllm)
                 .build(),
         );
 
@@ -2063,14 +2090,14 @@ mod tests {
                 .worker_type(WorkerType::Prefill {
                     bootstrap_port: Some(8998),
                 })
-                .runtime_type(RuntimeType::Vllm)
-                .kv_connector("NixlConnector")
+                .runtime_type(BackendType::Vllm)
+                .kv_connector("nixl")
                 .build(),
         );
         let decode = Arc::new(
             BasicWorkerBuilder::new(decode_url)
                 .worker_type(WorkerType::Decode)
-                .runtime_type(RuntimeType::Vllm)
+                .runtime_type(BackendType::Vllm)
                 .build(),
         );
 

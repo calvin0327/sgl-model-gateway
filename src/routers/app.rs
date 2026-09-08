@@ -22,6 +22,7 @@ use crate::{
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
+        messages::CreateMessageRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, V1RerankReqInput},
         responses::ResponsesRequest,
@@ -91,6 +92,17 @@ async fn v1_completions(
     state
         .router
         .route_completion(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn v1_messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
+) -> Response {
+    state
+        .router
+        .route_messages(Some(&headers), &body, Some(&body.model))
         .await
 }
 
@@ -285,17 +297,14 @@ async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-// TODO: multi model
 async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_server_info(req).await
 }
 
-// TODO: multi model
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_models(req).await
 }
 
-// TODO: multi model
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_model_info(req).await
 }
@@ -431,6 +440,7 @@ pub fn build_app(
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
+        .route("/v1/messages", post(v1_messages))
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
@@ -464,11 +474,7 @@ pub fn build_app(
         .route("/health_generate", get(health_generate))
         .route("/engine_metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
-        .route("/model_info", get(get_model_info))
-        // TODO: Remove `/get_model_info` alias after one release-cycle deprecation window.
         .route("/get_model_info", get(get_model_info))
-        .route("/server_info", get(get_server_info))
-        // TODO: Remove `/get_server_info` alias after one release-cycle deprecation window.
         .route("/get_server_info", get(get_server_info));
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth

@@ -35,7 +35,7 @@ pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use model_card::{ModelCard, ProviderType};
 pub use retry::{is_retryable_status, RetryExecutor};
 pub use worker::{
-    pd_group_id, AttachedBody, BasicWorker, ConnectionMode, HealthConfig, RuntimeType, Worker,
+    pd_group_id, AttachedBody, BackendType, BasicWorker, ConnectionMode, HealthConfig, Worker,
     WorkerLoadGuard, WorkerType, DEFAULT_PD_GROUP_ID, PD_GROUP_ID_LABEL,
     PREFERRED_CONTEXT_TOKENS_LABEL,
 };

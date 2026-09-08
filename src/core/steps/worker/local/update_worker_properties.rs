@@ -96,14 +96,17 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 let dp_size = worker.dp_size().unwrap_or(1);
                 let base_url = worker.base_url().to_string();
 
-                let mut builder =
-                    crate::core::DPAwareWorkerBuilder::new(base_url, dp_rank, dp_size)
-                        .worker_type(worker.worker_type().clone())
-                        .connection_mode(worker.connection_mode().clone())
-                        .runtime_type(worker.metadata().runtime_type.clone())
-                        .labels(updated_labels)
-                        .health_config(updated_health_config.clone())
-                        .models(worker.metadata().models.clone());
+                let mut builder = crate::core::DPAwareWorkerBuilder::new_with_backend(
+                    base_url,
+                    dp_rank,
+                    dp_size,
+                    worker.metadata().runtime_type.clone(),
+                )
+                .worker_type(worker.worker_type().clone())
+                .connection_mode(worker.connection_mode().clone())
+                .labels(updated_labels)
+                .health_config(updated_health_config.clone())
+                .models(worker.metadata().models.clone());
 
                 if let Some(kv_connector) = worker.metadata().kv_connector.as_deref() {
                     builder = builder.kv_connector(kv_connector);
@@ -119,13 +122,15 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 Arc::new(builder.build())
             } else {
                 // For basic workers, rebuild with updated properties
-                let mut builder = BasicWorkerBuilder::new(worker.url())
-                    .worker_type(worker.worker_type().clone())
-                    .connection_mode(worker.connection_mode().clone())
-                    .runtime_type(worker.metadata().runtime_type.clone())
-                    .labels(updated_labels)
-                    .health_config(updated_health_config.clone())
-                    .models(worker.metadata().models.clone());
+                let mut builder = BasicWorkerBuilder::new_with_backend(
+                    worker.url(),
+                    worker.metadata().runtime_type.clone(),
+                )
+                .worker_type(worker.worker_type().clone())
+                .connection_mode(worker.connection_mode().clone())
+                .labels(updated_labels)
+                .health_config(updated_health_config.clone())
+                .models(worker.metadata().models.clone());
 
                 if let Some(kv_connector) = worker.metadata().kv_connector.as_deref() {
                     builder = builder.kv_connector(kv_connector);

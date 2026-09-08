@@ -150,9 +150,9 @@ For vLLM PD, configure the same backend and connector:
   --pd-disaggregation \
   --prefill http://prefill:30001 8998 \
   --decode http://decode:30011 \
-  --kv-connector NixlConnector
+  --kv-connector nixl
 ```
-Use `--kv-connector MooncakeConnector --kv-engine-id <id>` for Mooncake deployments with a reported engine ID. The vLLM PD path dispatches prefill first and then decode with `kv_transfer_params`; requests with `n > 1` skip KV relay because the handoff is single-consumer.
+Use `--kv-connector mooncake --kv-engine-id <id>` for Mooncake deployments with a reported engine ID. The vLLM PD path dispatches prefill first and then decode with `kv_transfer_params`; requests with `n > 1` skip KV relay because the handoff is single-consumer.
 
 ### Prefill/Decode Disaggregation (PD)
 - **Rust binary**
@@ -579,7 +579,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 ## Observability
 
 ### Logging
-Structured tracing through `tracing` with optional file sink (`--log-dir`) and `--log-level` (`debug`, `info`, `warn`, `error`).
+Structured tracing through `tracing` with optional file sink (`--log-dir`) and `--log-level` (`debug`, `info`, `warn`, `error`). Text logs use a compact format with colored but non-italic field names; scheduler logs include model, endpoint, context length, runtime, and the selected load-balancing policy. Use `--json-log` for machine-readable logs.
 
 ### Prometheus Metrics
 Enable with `--prometheus-host`/`--prometheus-port` (defaults to `0.0.0.0:29000`).

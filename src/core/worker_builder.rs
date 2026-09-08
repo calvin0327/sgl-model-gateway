@@ -5,8 +5,8 @@ use super::{
     model_card::ModelCard,
     model_type::ModelType,
     worker::{
-        parse_bootstrap_host_from_url, BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig,
-        RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
+        parse_bootstrap_host_from_url, BackendType, BasicWorker, ConnectionMode, DPAwareWorker,
+        HealthConfig, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
         PREFERRED_CONTEXT_TOKENS_LABEL,
     },
 };
@@ -19,7 +19,7 @@ pub struct BasicWorkerBuilder {
     worker_type: WorkerType,
     default_model_type: ModelType,
     connection_mode: ConnectionMode,
-    runtime_type: RuntimeType,
+    runtime_type: BackendType,
     kv_connector: Option<String>,
     kv_engine_id: Option<String>,
     labels: HashMap<String, String>,
@@ -30,14 +30,19 @@ pub struct BasicWorkerBuilder {
 }
 
 impl BasicWorkerBuilder {
-    /// Create a new builder with only the URL
+    /// Create a builder for an SGLang worker.
     pub fn new(url: impl Into<String>) -> Self {
+        Self::new_with_backend(url, BackendType::Sglang)
+    }
+
+    /// Create a new builder with an explicit backend.
+    pub fn new_with_backend(url: impl Into<String>, runtime_type: BackendType) -> Self {
         Self {
             url: url.into(),
             api_key: None,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
+            runtime_type,
             kv_connector: None,
             kv_engine_id: None,
             labels: HashMap::new(),
@@ -51,12 +56,21 @@ impl BasicWorkerBuilder {
 
     /// Create a new builder with URL and worker type (for backwards compatibility)
     pub fn new_with_type(url: impl Into<String>, worker_type: WorkerType) -> Self {
+        Self::new_with_type_and_backend(url, worker_type, BackendType::Sglang)
+    }
+
+    /// Create a new builder with URL, worker type, and explicit backend.
+    pub fn new_with_type_and_backend(
+        url: impl Into<String>,
+        worker_type: WorkerType,
+        runtime_type: BackendType,
+    ) -> Self {
         Self {
             url: url.into(),
             api_key: None,
             worker_type,
             connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
+            runtime_type,
             kv_connector: None,
             kv_engine_id: None,
             labels: HashMap::new(),
@@ -92,7 +106,7 @@ impl BasicWorkerBuilder {
     }
 
     /// Set the runtime type (SGLang or vLLM)
-    pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
+    pub fn runtime_type(mut self, runtime_type: BackendType) -> Self {
         self.runtime_type = runtime_type;
         self
     }
@@ -217,7 +231,7 @@ pub struct DPAwareWorkerBuilder {
     dp_size: usize,
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
-    runtime_type: RuntimeType,
+    runtime_type: BackendType,
     default_model_type: ModelType,
     kv_connector: Option<String>,
     kv_engine_id: Option<String>,
@@ -229,8 +243,18 @@ pub struct DPAwareWorkerBuilder {
 }
 
 impl DPAwareWorkerBuilder {
-    /// Create a new DP-aware worker builder
+    /// Create a DP-aware SGLang worker builder.
     pub fn new(base_url: impl Into<String>, dp_rank: usize, dp_size: usize) -> Self {
+        Self::new_with_backend(base_url, dp_rank, dp_size, BackendType::Sglang)
+    }
+
+    /// Create a new DP-aware worker builder with an explicit backend.
+    pub fn new_with_backend(
+        base_url: impl Into<String>,
+        dp_rank: usize,
+        dp_size: usize,
+        runtime_type: BackendType,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             api_key: None,
@@ -238,7 +262,7 @@ impl DPAwareWorkerBuilder {
             dp_size,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
+            runtime_type,
             kv_connector: None,
             kv_engine_id: None,
             labels: HashMap::new(),
@@ -257,6 +281,23 @@ impl DPAwareWorkerBuilder {
         dp_size: usize,
         worker_type: WorkerType,
     ) -> Self {
+        Self::new_with_type_and_backend(
+            base_url,
+            dp_rank,
+            dp_size,
+            worker_type,
+            BackendType::Sglang,
+        )
+    }
+
+    /// Create a new DP-aware worker builder with worker type and explicit backend.
+    pub fn new_with_type_and_backend(
+        base_url: impl Into<String>,
+        dp_rank: usize,
+        dp_size: usize,
+        worker_type: WorkerType,
+        runtime_type: BackendType,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             api_key: None,
@@ -264,7 +305,7 @@ impl DPAwareWorkerBuilder {
             dp_size,
             worker_type,
             connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
+            runtime_type,
             kv_connector: None,
             kv_engine_id: None,
             labels: HashMap::new(),
@@ -295,7 +336,7 @@ impl DPAwareWorkerBuilder {
     }
 
     /// Set the runtime type (SGLang or vLLM)
-    pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
+    pub fn runtime_type(mut self, runtime_type: BackendType) -> Self {
         self.runtime_type = runtime_type;
         self
     }
@@ -363,11 +404,10 @@ impl DPAwareWorkerBuilder {
     /// Build the DPAwareWorker instance
     pub fn build(self) -> DPAwareWorker {
         let worker_url = format!("{}@{}", self.base_url, self.dp_rank);
-        let mut builder = BasicWorkerBuilder::new(worker_url)
+        let mut builder = BasicWorkerBuilder::new_with_backend(worker_url, self.runtime_type)
             .models(self.models)
             .worker_type(self.worker_type)
             .connection_mode(self.connection_mode)
-            .runtime_type(self.runtime_type)
             .default_model_type(self.default_model_type)
             .labels(self.labels)
             .health_config(self.health_config)

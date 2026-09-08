@@ -314,7 +314,7 @@ mod model_info_tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/server_info")
+            .uri("/get_server_info")
             .body(Body::empty())
             .unwrap();
 
@@ -385,7 +385,7 @@ mod model_info_tests {
     #[tokio::test]
     async fn test_v1_models() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
-            port: 18203,
+            port: 0,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
@@ -401,7 +401,7 @@ mod model_info_tests {
             .body(Body::empty())
             .unwrap();
 
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -435,6 +435,26 @@ mod model_info_tests {
             Some("organization-owner")
         );
 
+        let req = Request::builder()
+            .method("GET")
+            .uri("/server_info")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/model_info")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+
         ctx.shutdown().await;
     }
 
@@ -445,7 +465,7 @@ mod model_info_tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/server_info")
+            .uri("/get_server_info")
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -566,6 +586,88 @@ mod model_info_tests {
             "Expected error status for always-failing worker, got: {:?}",
             resp.status()
         );
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod messages_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_v1_messages_success() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "mock-model-path",
+            "max_tokens": 32,
+            "messages": [
+                {"role": "user", "content": "Hello!"}
+            ],
+            "stream": false
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body_json.get("type").and_then(|v| v.as_str()),
+            Some("message")
+        );
+        assert_eq!(
+            body_json.get("model").and_then(|v| v.as_str()),
+            Some("mock-model-path")
+        );
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_messages_requires_max_tokens() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18902,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "mock-model-path",
+            "messages": [
+                {"role": "user", "content": "Hello!"}
+            ]
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         ctx.shutdown().await;
     }
@@ -1457,7 +1559,7 @@ mod request_id_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
-                port: 18902,
+                port: 0,
                 worker_type: WorkerType::Regular,
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,

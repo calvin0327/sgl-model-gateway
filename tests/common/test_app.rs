@@ -7,7 +7,7 @@ use smg::{
     app_state::AppState,
     config::GatewayConfig,
     core::{
-        BasicWorkerBuilder, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry, WorkerType,
+        BackendType, BasicWorkerBuilder, LoadMonitor, ModelCard, Worker, WorkerRegistry, WorkerType,
     },
     middleware::{AuthConfig, TokenBucket},
     policies::PolicyRegistry,
@@ -152,7 +152,8 @@ pub fn create_test_app_with_context(
 /// Create a minimal test AppContext for unit tests
 #[allow(dead_code)]
 pub async fn create_test_app_context() -> Arc<AppContext> {
-    let gateway_config = GatewayConfig::default();
+    let mut gateway_config = GatewayConfig::default();
+    gateway_config.workers.backend = "sglang".to_string();
     let client = Client::new();
 
     // Initialize empty OnceLocks
@@ -199,9 +200,8 @@ pub fn register_external_worker(ctx: &Arc<AppContext>, url: &str, models: Option
         .collect();
 
     let worker: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new(url)
+        BasicWorkerBuilder::new_with_backend(url, BackendType::External)
             .worker_type(WorkerType::Regular)
-            .runtime_type(RuntimeType::External)
             .models(model_list)
             .build(),
     );
@@ -213,9 +213,8 @@ pub fn register_external_worker(ctx: &Arc<AppContext>, url: &str, models: Option
 #[allow(dead_code)]
 pub fn register_external_worker_with_card(ctx: &Arc<AppContext>, url: &str, model_card: ModelCard) {
     let worker: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new(url)
+        BasicWorkerBuilder::new_with_backend(url, BackendType::External)
             .worker_type(WorkerType::Regular)
-            .runtime_type(RuntimeType::External)
             .model(model_card)
             .build(),
     );

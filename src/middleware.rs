@@ -266,12 +266,10 @@ impl<B> MakeSpan<B> for RequestSpan {
             "http_request",
             method = %request.method(),
             uri = %request.uri(),
-            version = ?request.version(),
             request_id = Empty,  // Will be set later
             status_code = Empty,
             latency = Empty,
-            error = Empty,
-            module = "smg"
+            error = Empty
         )
     }
 }

@@ -13,7 +13,7 @@ use crate::{
         model_card::ModelCard,
         model_type::ModelType,
         steps::workflow_data::LocalWorkerWorkflowData,
-        worker::{HealthConfig, RuntimeType, WorkerType},
+        worker::{BackendType, HealthConfig, WorkerType},
         BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
     },
     protocol_compat::WorkerConfigRequest,
@@ -100,7 +100,11 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
         // Parse worker type
         let worker_type = parse_worker_type(config);
 
-        let runtime_type = determine_runtime_type(config);
+        let runtime_type =
+            determine_runtime_type(config).map_err(|error| WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message: error,
+            })?;
 
         // Build circuit breaker config
         let circuit_breaker_config = build_circuit_breaker_config(app_context);
@@ -163,8 +167,9 @@ fn build_model_card(
     labels: &HashMap<String, String>,
 ) -> ModelCard {
     let model_type = match determine_runtime_type(config) {
-        RuntimeType::Vllm => ModelType::LLM,
-        _ => ModelType::SGLANG_LLM,
+        Ok(BackendType::Vllm) => ModelType::LLM,
+        Ok(_) => ModelType::SGLANG_LLM,
+        Err(_) => ModelType::SGLANG_LLM,
     };
     let mut card = ModelCard::new(model_id).with_model_type(model_type);
 
@@ -240,11 +245,8 @@ fn parse_worker_type(config: &WorkerConfigRequest) -> WorkerType {
         .unwrap_or(WorkerType::Regular)
 }
 
-fn determine_runtime_type(config: &WorkerConfigRequest) -> RuntimeType {
-    match config.runtime.as_deref() {
-        Some("vllm") => RuntimeType::Vllm,
-        _ => RuntimeType::Sglang,
-    }
+fn determine_runtime_type(config: &WorkerConfigRequest) -> Result<BackendType, String> {
+    config.runtime.parse::<BackendType>()
 }
 
 #[cfg(test)]
@@ -252,7 +254,7 @@ mod tests {
     use super::*;
     use crate::core::model_type::Endpoint;
 
-    fn config(runtime: Option<&str>) -> WorkerConfigRequest {
+    fn config(runtime: &str) -> WorkerConfigRequest {
         WorkerConfigRequest {
             url: "http://worker:8000".to_string(),
             api_key: None,
@@ -261,7 +263,7 @@ mod tests {
             cost: None,
             worker_type: None,
             bootstrap_port: None,
-            runtime: runtime.map(str::to_string),
+            runtime: runtime.to_string(),
             kv_connector: None,
             kv_engine_id: None,
             tokenizer_path: None,
@@ -281,7 +283,7 @@ mod tests {
 
     #[test]
     fn vllm_model_card_does_not_advertise_sglang_generate() {
-        let card = build_model_card("test-model", &config(Some("vllm")), &HashMap::new());
+        let card = build_model_card("test-model", &config("vllm"), &HashMap::new());
 
         assert!(card.supports_endpoint(Endpoint::Chat));
         assert!(card.supports_endpoint(Endpoint::Completions));
@@ -290,9 +292,16 @@ mod tests {
 
     #[test]
     fn sglang_model_card_advertises_generate() {
-        let card = build_model_card("test-model", &config(None), &HashMap::new());
+        let card = build_model_card("test-model", &config("sglang"), &HashMap::new());
 
         assert!(card.supports_endpoint(Endpoint::Generate));
+    }
+
+    #[test]
+    fn invalid_backend_is_rejected() {
+        let error = determine_runtime_type(&config("invalid")).unwrap_err();
+
+        assert!(error.contains("Unknown runtime type"));
     }
 }
 
@@ -336,7 +345,7 @@ fn create_dp_aware_workers(
     model_card: ModelCard,
     worker_type: WorkerType,
     connection_mode: &ConnectionMode,
-    runtime_type: RuntimeType,
+    runtime_type: BackendType,
     circuit_breaker_config: CircuitBreakerConfig,
     health_config: HealthConfig,
     config: &WorkerConfigRequest,
@@ -354,14 +363,17 @@ fn create_dp_aware_workers(
 
     let mut workers = Vec::with_capacity(dp_info.dp_size);
     for rank in 0..dp_info.dp_size {
-        let mut builder =
-            DPAwareWorkerBuilder::new(normalized_url.to_string(), rank, dp_info.dp_size)
-                .model(model_card.clone())
-                .worker_type(worker_type.clone())
-                .connection_mode(connection_mode.clone())
-                .runtime_type(runtime_type.clone())
-                .circuit_breaker_config(circuit_breaker_config.clone())
-                .health_config(health_config.clone());
+        let mut builder = DPAwareWorkerBuilder::new_with_backend(
+            normalized_url.to_string(),
+            rank,
+            dp_info.dp_size,
+            runtime_type.clone(),
+        )
+        .model(model_card.clone())
+        .worker_type(worker_type.clone())
+        .connection_mode(connection_mode.clone())
+        .circuit_breaker_config(circuit_breaker_config.clone())
+        .health_config(health_config.clone());
 
         if let Some(kv_connector) = config.kv_connector.as_deref() {
             builder = builder.kv_connector(kv_connector);
@@ -400,7 +412,7 @@ fn create_single_worker(
     model_card: ModelCard,
     worker_type: WorkerType,
     connection_mode: &ConnectionMode,
-    runtime_type: RuntimeType,
+    runtime_type: BackendType,
     circuit_breaker_config: CircuitBreakerConfig,
     health_config: HealthConfig,
     config: &WorkerConfigRequest,
@@ -408,13 +420,13 @@ fn create_single_worker(
 ) -> Vec<Arc<dyn Worker>> {
     let health_check_disabled = health_config.disable_health_check;
 
-    let mut builder = BasicWorkerBuilder::new(normalized_url.to_string())
-        .model(model_card)
-        .worker_type(worker_type)
-        .connection_mode(connection_mode.clone())
-        .runtime_type(runtime_type)
-        .circuit_breaker_config(circuit_breaker_config)
-        .health_config(health_config);
+    let mut builder =
+        BasicWorkerBuilder::new_with_backend(normalized_url.to_string(), runtime_type)
+            .model(model_card)
+            .worker_type(worker_type)
+            .connection_mode(connection_mode.clone())
+            .circuit_breaker_config(circuit_breaker_config)
+            .health_config(health_config);
 
     if let Some(kv_connector) = config.kv_connector.as_deref() {
         builder = builder.kv_connector(kv_connector);

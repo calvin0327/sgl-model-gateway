@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     core::{
-        metrics_aggregator::MetricPack, worker::RuntimeType, ConnectionMode, Worker,
+        metrics_aggregator::MetricPack, worker::BackendType, ConnectionMode, Worker,
         WorkerRegistry, WorkerType,
     },
     policies::PolicyRegistry,
@@ -213,9 +213,9 @@ impl WorkerManager {
         client: &reqwest::Client,
         url: &str,
         api_key: Option<&str>,
-        runtime_type: RuntimeType,
+        runtime_type: BackendType,
     ) -> isize {
-        if runtime_type == RuntimeType::Vllm {
+        if runtime_type == BackendType::Vllm {
             return Self::parse_vllm_load_response(client, url, api_key).await;
         }
 
@@ -334,7 +334,7 @@ fn sum_prometheus_metric(body: &str, metric_name: &str) -> Option<isize> {
         }
     }
 
-    found.then(|| total as isize)
+    found.then_some(total as isize)
 }
 
 /// Load monitoring service that periodically fetches worker loads

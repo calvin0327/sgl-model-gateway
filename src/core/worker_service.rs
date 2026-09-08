@@ -4,8 +4,7 @@
 //! and business logic for worker management. The service orchestrates
 //! WorkerRegistry and JobQueue operations.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     http::StatusCode,
@@ -256,18 +255,15 @@ impl WorkerService {
         &self,
         mut config: WorkerConfigRequest,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
-        if let Some(runtime) = config.runtime.as_deref() {
-            if !matches!(runtime, "sglang" | "vllm") {
-                return Err(WorkerServiceError::InvalidConfiguration {
-                    message: "runtime must be 'sglang' or 'vllm'".to_string(),
-                });
-            }
+        if !matches!(config.runtime.as_str(), "sglang" | "vllm") {
+            return Err(WorkerServiceError::InvalidConfiguration {
+                message: "runtime must be 'sglang' or 'vllm'".to_string(),
+            });
         }
         if let Some(connector) = config.kv_connector.as_deref() {
-            if !matches!(connector, "MooncakeConnector" | "NixlConnector") {
+            if !matches!(connector, "mooncake" | "nixl") {
                 return Err(WorkerServiceError::InvalidConfiguration {
-                    message: "kv_connector must be 'MooncakeConnector' or 'NixlConnector'"
-                        .to_string(),
+                    message: "kv_connector must be 'mooncake' or 'nixl'".to_string(),
                 });
             }
         }

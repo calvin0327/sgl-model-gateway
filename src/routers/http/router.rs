@@ -32,6 +32,7 @@ use crate::{
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
+        messages::CreateMessageRequest,
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::ResponsesRequest,
     },
@@ -554,7 +555,7 @@ impl Router {
 
         let is_vllm = matches!(
             worker.metadata().runtime_type,
-            crate::core::worker::RuntimeType::Vllm
+            crate::core::worker::BackendType::Vllm
         );
 
         let mut request_builder = if self.dp_aware {
@@ -805,7 +806,7 @@ impl RouterTrait for Router {
     }
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
-        self.proxy_get_request(req, "server_info").await
+        self.proxy_get_request(req, "get_server_info").await
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
@@ -813,7 +814,7 @@ impl RouterTrait for Router {
     }
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
-        self.proxy_get_request(req, "model_info").await
+        self.proxy_get_request(req, "get_model_info").await
     }
 
     async fn route_generate(
@@ -864,6 +865,26 @@ impl RouterTrait for Router {
             headers,
             body,
             "/v1/completions",
+            model_id,
+            worker.clone(),
+        )
+        .await
+    }
+
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CreateMessageRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let worker = match Self::scheduled_regular_worker() {
+            Ok(worker) => worker,
+            Err(response) => return response,
+        };
+        self.route_typed_request_with_worker(
+            headers,
+            body,
+            "/v1/messages",
             model_id,
             worker.clone(),
         )
@@ -991,7 +1012,7 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use crate::core::{
-        model_type::ModelType, worker::RuntimeType, BasicWorkerBuilder, ModelCard, WorkerType,
+        model_type::ModelType, worker::BackendType, BasicWorkerBuilder, ModelCard, WorkerType,
     };
 
     fn create_test_regular_router() -> Router {
@@ -1122,7 +1143,7 @@ mod tests {
         let vllm_worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(vllm_url)
                 .worker_type(WorkerType::Regular)
-                .runtime_type(RuntimeType::Vllm)
+                .runtime_type(BackendType::Vllm)
                 .model(ModelCard::new("test-model").with_model_type(ModelType::LLM))
                 .build(),
         );

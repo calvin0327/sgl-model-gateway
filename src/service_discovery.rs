@@ -15,7 +15,6 @@ use kube::{
     Client,
 };
 use rustls;
-
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
@@ -360,7 +359,7 @@ async fn handle_pod_event(
                 worker_type,
                 priority: None,
                 cost: None,
-                runtime: app_context.config.workers.runtime.clone(),
+                runtime: app_context.config.workers.backend.clone(),
                 kv_connector: app_context.config.workers.kv_connector.clone(),
                 kv_engine_id: app_context.config.workers.kv_engine_id.clone(),
                 labels,

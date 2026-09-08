@@ -15,8 +15,8 @@ use crate::{
     protocol_compat::ResponsesGetParams,
     protocols::{
         chat::ChatCompletionRequest, classify::ClassifyRequest, completion::CompletionRequest,
-        embedding::EmbeddingRequest, generate::GenerateRequest, rerank::RerankRequest,
-        responses::ResponsesRequest,
+        embedding::EmbeddingRequest, generate::GenerateRequest, messages::CreateMessageRequest,
+        rerank::RerankRequest, responses::ResponsesRequest,
     },
 };
 
@@ -103,6 +103,16 @@ pub trait RouterTrait: Send + Sync + Debug {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response;
+
+    /// Route Anthropic Messages API requests (/v1/messages)
+    async fn route_messages(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &CreateMessageRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Messages API not implemented").into_response()
+    }
 
     /// Route a completion request
     async fn route_completion(

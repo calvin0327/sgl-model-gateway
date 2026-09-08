@@ -23,12 +23,12 @@ pub(crate) fn connector_mode_for_worker(worker: &dyn Worker) -> KvConnectorMode 
         worker.dp_rank(),
     );
     match metadata.kv_connector.as_deref() {
-        Some("MooncakeConnector") => KvConnectorMode::Mooncake {
+        Some("mooncake") => KvConnectorMode::Mooncake {
             host: metadata.bootstrap_host.clone(),
             port: metadata.bootstrap_port.unwrap_or(DEFAULT_BOOTSTRAP_PORT),
             engine_id,
         },
-        Some("NixlConnector") => KvConnectorMode::Nixl,
+        Some("nixl") => KvConnectorMode::Nixl,
         _ => KvConnectorMode::Passthrough,
     }
 }
@@ -80,7 +80,7 @@ mod tests {
             .worker_type(WorkerType::Prefill {
                 bootstrap_port: Some(8998),
             })
-            .kv_connector("MooncakeConnector")
+            .kv_connector("mooncake")
             .kv_engine_id("engine")
             .build();
 

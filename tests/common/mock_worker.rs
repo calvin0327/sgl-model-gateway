@@ -83,10 +83,13 @@ impl MockWorker {
             .route("/health", get(health_handler))
             .route("/health_generate", get(health_generate_handler))
             .route("/server_info", get(server_info_handler))
+            .route("/get_server_info", get(server_info_handler))
             .route("/model_info", get(model_info_handler))
+            .route("/get_model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
+            .route("/v1/messages", post(messages_handler))
             .route("/v1/rerank", post(rerank_handler))
             .route("/v1/responses", post(responses_handler))
             .route("/v1/responses/{response_id}", get(responses_get_handler))
@@ -1340,6 +1343,53 @@ async fn responses_handler(
             .into_response()
         }
     }
+}
+
+async fn messages_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "internal_error",
+                    "message": "Random failure for testing"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    let model = payload
+        .get("model")
+        .and_then(|model| model.as_str())
+        .unwrap_or("mock-model");
+
+    Json(json!({
+        "id": format!("msg-{}", Uuid::new_v4()),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{
+            "type": "text",
+            "text": "This is a mock message."
+        }],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 5
+        }
+    }))
+    .into_response()
 }
 
 async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {

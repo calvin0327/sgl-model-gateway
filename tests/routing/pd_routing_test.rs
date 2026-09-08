@@ -223,4 +223,62 @@ mod pd_routing_tests {
 
         ctx.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn test_pd_mode_routes_messages() {
+        let config = crate::common::TestGatewayConfigBuilder::new()
+            .prefill_decode_mode(
+                vec![("http://127.0.0.1:19820".to_string(), None)],
+                vec!["http://127.0.0.1:19821".to_string()],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(3810)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::prefill(19820),
+                TestWorkerConfig::decode(19821),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "mock-model-path",
+            "max_tokens": 32,
+            "messages": [
+                {"role": "user", "content": "Hello PD!"}
+            ],
+            "stream": false
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body_json.get("type").and_then(|v| v.as_str()),
+            Some("message")
+        );
+
+        ctx.shutdown().await;
+    }
 }

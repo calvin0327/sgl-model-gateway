@@ -32,7 +32,7 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest, classify::ClassifyRequest, common::GenerationRequest,
         completion::CompletionRequest, embedding::EmbeddingRequest, generate::GenerateRequest,
-        rerank::RerankRequest, responses::ResponsesRequest,
+        messages::CreateMessageRequest, rerank::RerankRequest, responses::ResponsesRequest,
     },
     routers::{RouterFactory, RouterTrait},
     tokenizer::registry::TokenizerRegistry,
@@ -59,8 +59,7 @@ pub mod router_ids {
     pub const HTTP_PD: RouterId = RouterId::new("http-pd");
 }
 
-type ScheduledExecution =
-    Arc<dyn Fn(Arc<dyn RouterTrait>) -> BoxFuture<'static, Response> + Send + Sync>;
+type Execution = Arc<dyn Fn(Arc<dyn RouterTrait>) -> BoxFuture<'static, Response> + Send + Sync>;
 
 const SCHEDULED_MODE_UNKNOWN: u8 = 0;
 const SCHEDULED_MODE_REGULAR: u8 = 1;
@@ -206,14 +205,15 @@ impl RouterManager {
                 model_id,
                 endpoint,
                 request_text,
-                token_ids: None,
+                token_ids: None, // TODO: remove
                 headers,
             })
             .await
             .map_err(|error| {
                 let status = match error {
-                    SchedulerError::ModelRequired { .. } => StatusCode::BAD_REQUEST,
-                    SchedulerError::ModelNotFound { .. } => StatusCode::BAD_REQUEST,
+                    SchedulerError::ModelRequired { .. } | SchedulerError::ModelNotFound { .. } => {
+                        StatusCode::BAD_REQUEST
+                    }
                     SchedulerError::NoModelsAvailable
                     | SchedulerError::NoAvailableWorker { .. }
                     | SchedulerError::NoAvailablePdPair { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -233,7 +233,7 @@ impl RouterManager {
         endpoint: Endpoint,
         request_text: Option<&str>,
         headers: Option<&HeaderMap>,
-        execute: ScheduledExecution,
+        execute: Execution,
     ) -> Response {
         let scheduled_mode = Arc::new(AtomicU8::new(SCHEDULED_MODE_UNKNOWN));
 
@@ -242,6 +242,7 @@ impl RouterManager {
             |_attempt| {
                 let execute = Arc::clone(&execute);
                 let scheduled_mode = Arc::clone(&scheduled_mode);
+
                 async move {
                     scheduled_mode.store(SCHEDULED_MODE_UNKNOWN, Ordering::Relaxed);
 
@@ -276,6 +277,14 @@ impl RouterManager {
             {
                 let scheduled_mode = Arc::clone(&scheduled_mode);
                 move |delay: Duration, next_attempt: u32| {
+                    info!(
+                        model_id = model_id.unwrap_or("auto"),
+                        endpoint = %endpoint,
+                        retry_attempt = next_attempt,
+                        backoff_ms = delay.as_millis() as u64,
+                        "Retrying request with a fresh Scheduler selection"
+                    );
+
                     Metrics::record_worker_retry_backoff(next_attempt, delay);
 
                     match scheduled_mode.load(Ordering::Relaxed) {
@@ -354,7 +363,6 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    // TODO: multi model
     async fn get_model_info(&self, req: Request<Body>) -> Response {
         if let Some(router) = self.default_router() {
             router.get_model_info(req).await
@@ -438,6 +446,35 @@ impl RouterTrait for RouterManager {
                 Box::pin(async move {
                     router
                         .route_completion(headers.as_ref(), &request, None)
+                        .await
+                })
+            }),
+        )
+        .await
+    }
+
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CreateMessageRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let model_id = model_id.or_else(|| Some(body.get_model()));
+        let request_text = body.extract_text_for_routing();
+        let request = Arc::new(body.clone());
+        let request_headers = headers.cloned();
+
+        self.execute_with_retry(
+            model_id,
+            Endpoint::Chat,
+            (!request_text.is_empty()).then_some(request_text.as_str()),
+            headers,
+            Arc::new(move |router| {
+                let request = Arc::clone(&request);
+                let headers = request_headers.clone();
+                Box::pin(async move {
+                    router
+                        .route_messages(headers.as_ref(), &request, None)
                         .await
                 })
             }),

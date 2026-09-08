@@ -89,22 +89,26 @@ impl ConfigValidator {
     }
 
     fn validate_worker(workers: &WorkerConfig) -> ConfigResult<()> {
-        if let Some(runtime) = &workers.runtime {
-            if !matches!(runtime.as_str(), "sglang" | "vllm") {
-                return Err(ConfigError::InvalidValue {
-                    field: "workers.runtime".to_string(),
-                    value: runtime.clone(),
-                    reason: "Must be 'sglang' or 'vllm'".to_string(),
-                });
-            }
+        if workers.backend.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "workers.backend".to_string(),
+            });
+        }
+
+        if !matches!(workers.backend.as_str(), "sglang" | "vllm") {
+            return Err(ConfigError::InvalidValue {
+                field: "workers.backend".to_string(),
+                value: workers.backend.clone(),
+                reason: "Must be 'sglang' or 'vllm'".to_string(),
+            });
         }
 
         if let Some(connector) = &workers.kv_connector {
-            if !matches!(connector.as_str(), "MooncakeConnector" | "NixlConnector") {
+            if !matches!(connector.as_str(), "mooncake" | "nixl") {
                 return Err(ConfigError::InvalidValue {
                     field: "workers.kv_connector".to_string(),
                     value: connector.clone(),
-                    reason: "Must be 'MooncakeConnector' or 'NixlConnector'".to_string(),
+                    reason: "Must be 'mooncake' or 'nixl'".to_string(),
                 });
             }
         }
@@ -535,5 +539,41 @@ impl ConfigValidator {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_backend_is_required() {
+        let error = ConfigValidator::validate_worker(&WorkerConfig::default()).unwrap_err();
+
+        assert!(
+            matches!(error, ConfigError::MissingRequired { field } if field == "workers.backend")
+        );
+    }
+
+    #[test]
+    fn worker_backend_rejects_external() {
+        let mut workers = WorkerConfig::default();
+        workers.backend = "external".to_string();
+
+        let error = ConfigValidator::validate_worker(&workers).unwrap_err();
+
+        assert!(
+            matches!(error, ConfigError::InvalidValue { field, .. } if field == "workers.backend")
+        );
+    }
+
+    #[test]
+    fn worker_backend_accepts_supported_runtimes() {
+        for backend in ["sglang", "vllm"] {
+            let mut workers = WorkerConfig::default();
+            workers.backend = backend.to_string();
+
+            ConfigValidator::validate_worker(&workers).unwrap();
+        }
     }
 }
