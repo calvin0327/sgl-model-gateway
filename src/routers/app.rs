@@ -76,8 +76,12 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    Json(mut body): Json<ChatCompletionRequest>,
 ) -> Response {
+    // TODO: Keep protocol parsing here, but defer backend-specific validation
+    // to the selected backend instead of applying duplicate gateway rules.
+    body.normalize();
+
     state
         .router
         .route_chat(Some(&headers), &body, Some(&body.model))
