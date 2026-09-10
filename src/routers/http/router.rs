@@ -225,18 +225,6 @@ impl Router {
         }
     }
 
-    async fn route_typed_request_with_worker<T: GenerationRequest + serde::Serialize + Clone>(
-        &self,
-        headers: Option<&HeaderMap>,
-        typed_req: &T,
-        route: &'static str,
-        model_id: Option<&str>,
-        worker: Arc<dyn Worker>,
-    ) -> Response {
-        self.route_typed_request_internal(headers, typed_req, route, model_id, worker)
-            .await
-    }
-
     async fn route_detached_typed_request_with_worker<
         T: GenerationRequest + serde::Serialize + Clone,
     >(
@@ -352,8 +340,11 @@ impl Router {
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
+
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
+
         inject_trace_context_http(&mut headers_with_trace);
+
         let headers = Some(&headers_with_trace);
 
         let response = self
@@ -827,7 +818,7 @@ impl RouterTrait for Router {
             Ok(worker) => worker,
             Err(response) => return response,
         };
-        self.route_typed_request_with_worker(headers, body, "/generate", model_id, worker.clone())
+        self.route_typed_request_internal(headers, body, "/generate", model_id, worker.clone())
             .await
     }
 
@@ -841,7 +832,7 @@ impl RouterTrait for Router {
             Ok(worker) => worker,
             Err(response) => return response,
         };
-        self.route_typed_request_with_worker(
+        self.route_typed_request_internal(
             headers,
             body,
             "/v1/chat/completions",
@@ -861,7 +852,7 @@ impl RouterTrait for Router {
             Ok(worker) => worker,
             Err(response) => return response,
         };
-        self.route_typed_request_with_worker(
+        self.route_typed_request_internal(
             headers,
             body,
             "/v1/completions",
@@ -881,14 +872,8 @@ impl RouterTrait for Router {
             Ok(worker) => worker,
             Err(response) => return response,
         };
-        self.route_typed_request_with_worker(
-            headers,
-            body,
-            "/v1/messages",
-            model_id,
-            worker.clone(),
-        )
-        .await
+        self.route_typed_request_internal(headers, body, "/v1/messages", model_id, worker.clone())
+            .await
     }
 
     async fn route_responses(
@@ -911,7 +896,7 @@ impl RouterTrait for Router {
             )
             .await
         } else {
-            self.route_typed_request_with_worker(
+            self.route_typed_request_internal(
                 headers,
                 body,
                 "/v1/responses",
@@ -947,14 +932,8 @@ impl RouterTrait for Router {
             Ok(worker) => worker,
             Err(response) => return response,
         };
-        self.route_typed_request_with_worker(
-            headers,
-            body,
-            "/v1/embeddings",
-            model_id,
-            worker.clone(),
-        )
-        .await
+        self.route_typed_request_internal(headers, body, "/v1/embeddings", model_id, worker.clone())
+            .await
     }
 
     async fn route_classify(
@@ -967,14 +946,8 @@ impl RouterTrait for Router {
             Ok(worker) => worker,
             Err(response) => return response,
         };
-        self.route_typed_request_with_worker(
-            headers,
-            body,
-            "/v1/classify",
-            model_id,
-            worker.clone(),
-        )
-        .await
+        self.route_typed_request_internal(headers, body, "/v1/classify", model_id, worker.clone())
+            .await
     }
 
     async fn route_rerank(
@@ -988,7 +961,7 @@ impl RouterTrait for Router {
             Err(response) => return response,
         };
         let response = self
-            .route_typed_request_with_worker(headers, body, "/v1/rerank", model_id, worker.clone())
+            .route_typed_request_internal(headers, body, "/v1/rerank", model_id, worker.clone())
             .await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, response).await {

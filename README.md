@@ -581,6 +581,10 @@ Supported tool parsers: `json`, `python`, `xml`.
 ### Logging
 Structured tracing through `tracing` with optional file sink (`--log-dir`) and `--log-level` (`debug`, `info`, `warn`, `error`). Text logs use a compact format with colored but non-italic field names; scheduler logs include model, endpoint, context length, runtime, and the selected load-balancing policy. Use `--json-log` for machine-readable logs.
 
+HTTP completion logs include `error_code` for failures and `latency_us` in microseconds; the existing `latency` field is retained with the same unit. HTTP 4xx/5xx responses also emit an `HTTP error response details` event as the response body finishes or is dropped, using the original request span. Search by `request_id` to correlate the completion and details events.
+
+Error details include `error_message`, `error_code`, `error_body_truncated`, and `error_body_complete`. Capture is limited to the first 8 KiB of the error response, with diagnostic fields limited to 1,024 characters. JSON summaries extract message/code/type fields or validation messages, excluding unrelated fields such as validation `input`; plain-text errors use a bounded preview. Unknown or incomplete JSON produces a diagnostic placeholder instead of a raw JSON dump. This observes the body during normal transmission without buffering the entire response or delaying streaming headers. A dropped or failed body can produce incomplete details, and successful HTTP responses (including errors embedded in HTTP 200 SSE streams) are not inspected.
+
 ### Prometheus Metrics
 Enable with `--prometheus-host`/`--prometheus-port` (defaults to `0.0.0.0:29000`).
 

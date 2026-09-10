@@ -29,6 +29,12 @@ pub struct SchedulerInput<'a> {
     pub headers: Option<&'a HeaderMap>,
 }
 
+const REQUEST_PRIORITY_HEADER: &str = "x-request-priority";
+
+fn has_high_request_priority(headers: Option<&HeaderMap>) -> bool {
+    headers.is_some_and(|headers| headers.contains_key(REQUEST_PRIORITY_HEADER))
+}
+
 /// Errors produced while selecting a backend.
 #[derive(Debug, Error)]
 pub enum SchedulerError {
@@ -126,15 +132,25 @@ impl Scheduler {
         let model_id = self.resolve_model_id(req.model_id)?;
         let available_workers = self.available_workers(&model_id, req.endpoint)?;
 
-        let context_tokens = self.context_tokens(req, &model_id);
         let mut mode_order = Vec::with_capacity(3);
 
-        if let Some(preferred_mode) =
-            self.context_preferred_mode(&available_workers, context_tokens)
-        {
-            mode_order.push(preferred_mode);
-        } else if let Some(default_mode) = Self::select_by_mode(&available_workers) {
-            mode_order.push(default_mode);
+        // TODO:
+        // High-priority requests prefer a regular worker regardless of context
+        // length. The normal fallback order remains available if no regular
+        // worker can serve the request.
+        if has_high_request_priority(req.headers) {
+            mode_order.push(WorkerMode::Regular);
+        }
+
+        let context_tokens = self.context_tokens(req, &model_id);
+        if mode_order.is_empty() {
+            if let Some(preferred_mode) =
+                self.context_preferred_mode(&available_workers, context_tokens)
+            {
+                mode_order.push(preferred_mode);
+            } else if let Some(default_mode) = Self::select_by_mode(&available_workers) {
+                mode_order.push(default_mode);
+            }
         }
 
         // Context length determines the first choice only. The remaining
@@ -763,6 +779,21 @@ mod tests {
             Scheduler::select_by_mode(&workers),
             Some(WorkerMode::Regular)
         );
+    }
+
+    #[test]
+    fn request_priority_is_based_on_header_presence() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Request-Priority", "anything".parse().unwrap());
+        assert!(has_high_request_priority(Some(&headers)));
+
+        headers.insert("X-Request-Priority", "".parse().unwrap());
+        assert!(has_high_request_priority(Some(&headers)));
+
+        let mut unrelated_headers = HeaderMap::new();
+        unrelated_headers.insert("Other-Header", "high".parse().unwrap());
+        assert!(!has_high_request_priority(Some(&unrelated_headers)));
+        assert!(!has_high_request_priority(None));
     }
 
     #[tokio::test]

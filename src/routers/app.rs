@@ -533,6 +533,7 @@ pub fn build_app(
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
+        .layer(axum::middleware::from_fn(middleware::log_error_response))
         .layer(middleware::create_logging_layer())
         .layer(middleware::HttpMetricsLayer::new(
             app_state.context.inflight_tracker.clone(),
