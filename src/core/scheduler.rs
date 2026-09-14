@@ -579,6 +579,7 @@ impl Scheduler {
                 req,
             )
             .await?;
+
         let decode = self
             .select_by_policy(
                 &decode_workers,
@@ -655,6 +656,10 @@ impl Scheduler {
     ) -> Option<Arc<dyn Worker>> {
         if workers.is_empty() {
             return None;
+        }
+
+        if workers.len() == 1 {
+            return workers.first().cloned();
         }
 
         let hash_ring = self.worker_registry.get_hash_ring(model_id);

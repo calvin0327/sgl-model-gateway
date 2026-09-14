@@ -21,7 +21,8 @@ impl ConfigValidator {
         if let Some(discovery) = &config.discovery {
             Self::validate_gateway_discovery(discovery)?;
         }
-        Self::validate_gateway_compatibility(config)
+
+        Ok(())
     }
 
     fn validate_server(server: &ServerConfig) -> ConfigResult<()> {
@@ -237,44 +238,6 @@ impl ConfigValidator {
         if discovery.port == 0 || discovery.check_interval_secs == 0 {
             return Err(ConfigError::ValidationFailed {
                 reason: "Discovery port and check interval must be > 0".to_string(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Checks restrictions that span routing, discovery, and worker settings.
-    fn validate_gateway_compatibility(config: &GatewayConfig) -> ConfigResult<()> {
-        if let PolicyConfig::PowerOfTwo { .. } = &config.routing.policy {
-            if config.workers.regular_urls.len() < 2 {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "Power-of-two policy requires at least 2 workers".to_string(),
-                });
-            }
-        }
-
-        if let Some(PolicyConfig::PowerOfTwo { .. }) = &config.routing.prefill_policy {
-            if config.workers.prefill_urls.len() < 2 {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "Power-of-two policy for prefill requires at least 2 prefill workers"
-                        .to_string(),
-                });
-            }
-        }
-        if let Some(PolicyConfig::PowerOfTwo { .. }) = &config.routing.decode_policy {
-            if config.workers.decode_urls.len() < 2 {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "Power-of-two policy for decode requires at least 2 decode workers"
-                        .to_string(),
-                });
-            }
-        }
-        if matches!(
-            config.routing.decode_policy,
-            Some(PolicyConfig::Bucket { .. })
-        ) {
-            return Err(ConfigError::IncompatibleConfig {
-                reason: "Decode policy should not be allowed to be bucket".to_string(),
             });
         }
 
