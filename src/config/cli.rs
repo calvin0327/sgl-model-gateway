@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use crate::{
@@ -15,6 +15,7 @@ use crate::{
         },
         ConfigError, ConfigResult,
     },
+    policies::pre_kv_cache,
     version,
 };
 
@@ -155,6 +156,85 @@ pub struct CliArgs {
     /// Load balancing policy to use
     #[arg(long, value_enum, default_value_t = PolicyKind::CacheAware, help_heading = "Routing Policy")]
     policy: PolicyKind,
+
+    /// Path to a JSON file for vLLM render, KV event sources and cost estimates
+    #[arg(
+        long,
+        conflicts_with_all = ["pre_kv_cache_config_json", "pre_kv_cache_profile"],
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_config: Option<String>,
+
+    /// Inline JSON policy configuration; also accepts PRE_KV_CACHE_CONFIG_JSON
+    #[arg(
+        long,
+        env = "PRE_KV_CACHE_CONFIG_JSON",
+        hide_env_values = true,
+        conflicts_with = "pre_kv_cache_profile",
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_config_json: Option<String>,
+
+    /// Profile name for readable single-profile pre-KV-cache configuration
+    #[arg(long, help_heading = "Routing Policy")]
+    pre_kv_cache_profile: Option<String>,
+
+    /// Served model name for the pre-KV-cache profile
+    #[arg(
+        long,
+        requires = "pre_kv_cache_profile",
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_model: Option<String>,
+
+    /// vLLM KV-cache block size in tokens
+    #[arg(
+        long,
+        requires = "pre_kv_cache_profile",
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_block_size: Option<usize>,
+
+    /// Request token source for exact KV matching
+    #[arg(
+        long,
+        value_enum,
+        requires = "pre_kv_cache_profile",
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_token_source: Option<PreKvCacheTokenSource>,
+
+    /// ZMQ KV-event port on each discovered worker
+    #[arg(
+        long,
+        requires = "pre_kv_cache_profile",
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_event_port: Option<u16>,
+
+    /// ZMQ replay port on each discovered worker
+    #[arg(
+        long,
+        requires = "pre_kv_cache_profile",
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_replay_port: Option<u16>,
+
+    /// ZMQ topic used by vLLM KV events
+    #[arg(
+        long,
+        requires = "pre_kv_cache_profile",
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_topic: Option<String>,
+
+    /// Interval for reconciling discovered workers and KV-event subscriptions
+    #[arg(
+        long,
+        requires = "pre_kv_cache_profile",
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_refresh_ms: Option<u64>,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
     #[arg(long, default_value_t = 0.3, help_heading = "Routing Policy")]
@@ -603,6 +683,7 @@ impl CliArgs {
     /// Combines a selected policy with its CLI tuning parameters.
     fn build_policy_config(&self, policy: PolicyKind) -> PolicyConfig {
         match policy {
+            PolicyKind::PreKvCache => PolicyConfig::PreKvCache,
             PolicyKind::Random => PolicyConfig::Random,
             PolicyKind::RoundRobin => PolicyConfig::RoundRobin,
             PolicyKind::CacheAware => PolicyConfig::CacheAware {
@@ -654,12 +735,64 @@ impl CliArgs {
         }
     }
 
+    /// Builds one canonical pre-KV-cache config from either readable flags or JSON.
+    fn load_pre_kv_cache_config(&self) -> Result<Option<pre_kv_cache::Config>> {
+        if let Some(profile_name) = &self.pre_kv_cache_profile {
+            let mut config = pre_kv_cache::Config::default();
+            config.profiles.insert(
+                profile_name.clone(),
+                pre_kv_cache::Profile {
+                    model: self
+                        .pre_kv_cache_model
+                        .clone()
+                        .context("--pre-kv-cache-model is required")?,
+                    token_source: self
+                        .pre_kv_cache_token_source
+                        .unwrap_or(PreKvCacheTokenSource::Render)
+                        .into(),
+                    render_url: String::new(),
+                    render_api_key_env: None,
+                    block_size: self
+                        .pre_kv_cache_block_size
+                        .context("--pre-kv-cache-block-size is required")?,
+                    cost: pre_kv_cache::CostModel::default(),
+                },
+            );
+
+            let defaults = pre_kv_cache::Discovery::default();
+            config.discovery = Some(pre_kv_cache::Discovery {
+                event_port: self.pre_kv_cache_event_port.unwrap_or(defaults.event_port),
+                replay_port: self
+                    .pre_kv_cache_replay_port
+                    .map(Some)
+                    .unwrap_or(defaults.replay_port),
+                topic: self.pre_kv_cache_topic.clone().unwrap_or(defaults.topic),
+                refresh_ms: self.pre_kv_cache_refresh_ms.unwrap_or(defaults.refresh_ms),
+            });
+            return Ok(Some(config));
+        }
+
+        // File and inline/env JSON share one parser. Clap rejects mixed sources.
+        let json = self
+            .pre_kv_cache_config
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?
+            .or_else(|| self.pre_kv_cache_config_json.clone());
+        json.as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("Invalid pre_kv_cache JSON configuration")
+    }
+
     /// Resolves CLI arguments into the canonical gateway configuration.
     ///
-    /// File-backed settings are loaded here so the resulting configuration is
-    /// self-contained and does not retain CLI paths.
+    /// File and environment settings are loaded here so the resulting config
+    /// is self-contained and does not retain CLI paths.
     fn resolve_config(&self) -> Result<GatewayConfig> {
         let prefill_urls = self.parse_prefill_args()?;
+
+        let pre_kv_cache = self.load_pre_kv_cache_config()?;
 
         let discovery = self.service_discovery.then(|| DiscoveryConfig {
             selector: parse_label_selectors(&self.selector),
@@ -696,6 +829,7 @@ impl CliArgs {
                 ..Default::default()
             },
             routing: RoutingConfig {
+                pre_kv_cache,
                 policy: self.build_policy_config(self.policy),
                 prefill_policy: self.prefill_policy.map(|p| self.build_policy_config(p)),
                 decode_policy: self.decode_policy.map(|p| self.build_policy_config(p)),
@@ -779,6 +913,7 @@ impl CliArgs {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, ValueEnum)]
 #[value(rename_all = "snake_case")]
 enum PolicyKind {
+    PreKvCache,
     Random,
     RoundRobin,
 
@@ -787,6 +922,22 @@ enum PolicyKind {
     PowerOfTwo,
     PrefixHash,
     Manual,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum PreKvCacheTokenSource {
+    Render,
+    LocalTokenizer,
+}
+
+impl From<PreKvCacheTokenSource> for pre_kv_cache::TokenSource {
+    fn from(source: PreKvCacheTokenSource) -> Self {
+        match source {
+            PreKvCacheTokenSource::Render => Self::Render,
+            PreKvCacheTokenSource::LocalTokenizer => Self::LocalTokenizer,
+        }
+    }
 }
 
 /// Parse role mapping from CLI format "idp_role=gateway_role"

@@ -599,9 +599,11 @@ Supported tool parsers: `json`, `python`, `xml`.
 - **Cache Management**: `/flush_cache` ensures LRU eviction when redeploying PD workers.
 
 ## Load Balancing Policies
+
 - `random`: uniform random worker selection.
 - `round_robin`: sequential rotation with atomic counters.
 - `cache_aware`: maintains a prefix tree of prompts to route repeat traffic and evens load with configurable thresholds (`--cache-threshold`, `--balance-abs-threshold`, `--balance-rel-threshold`, `--eviction-interval`, `--max-tree-size`).
+- `pre_kv_cache`: uses vLLM KV events, exact token-block prefixes, and worker load. Configure a single discovered profile with `--pre-kv-cache-profile`, `--pre-kv-cache-model`, `--pre-kv-cache-block-size`, and optional `--pre-kv-cache-token-source`; advanced configurations can use `--pre-kv-cache-config`, `--pre-kv-cache-config-json`, or `PRE_KV_CACHE_CONFIG_JSON`.
 - `power_of_two`: chooses the lighter worker among two random candidates; integrates with `LoadMonitor`.
   Per-model overrides are available in PD mode (`--prefill-policy`, `--decode-policy`) and IGW mode via the worker registry.
 

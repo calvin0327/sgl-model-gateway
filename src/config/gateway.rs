@@ -121,6 +121,8 @@ pub struct ServerTlsConfig {
 /// Configuration for request routing and worker selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingConfig {
+    #[serde(default)]
+    pub pre_kv_cache: Option<crate::policies::pre_kv_cache::Config>,
     /// Default load-balancing policy for worker selection.
     pub policy: PolicyConfig,
 
@@ -145,6 +147,7 @@ impl RoutingConfig {
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
+            pre_kv_cache: None,
             prefill_policy: Some(PolicyConfig::Random),
             decode_policy: Some(PolicyConfig::Random),
             policy: PolicyConfig::Random,
@@ -171,6 +174,8 @@ pub enum ManualAssignmentMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PolicyConfig {
+    #[serde(rename = "pre_kv_cache")]
+    PreKvCache,
     #[serde(rename = "random")]
     Random,
 
@@ -260,6 +265,7 @@ fn default_manual_max_idle_secs() -> u64 {
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
+            PolicyConfig::PreKvCache => "pre_kv_cache",
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",

@@ -25,6 +25,7 @@ use crate::{
 /// Input needed by the scheduler. Request bodies and clients do not belong here.
 #[derive(Debug, Clone)]
 pub struct SchedulerInput<'a> {
+    pub kv_request: Option<&'a crate::policies::pre_kv_cache::KvRequest>,
     pub model_id: Option<&'a str>,
     pub endpoint: Endpoint,
     pub request_text: Option<&'a str>,
@@ -159,7 +160,7 @@ impl Scheduler {
             mode_order.push(WorkerMode::Regular);
         }
 
-        let context_tokens = self.context_tokens(req, &model_id);
+        let context_tokens = self.context_tokens(req, &model_id).await;
         if mode_order.is_empty() {
             if let Some(preferred_mode) =
                 self.context_preferred_mode(&available_workers, context_tokens)
@@ -304,9 +305,20 @@ impl Scheduler {
         candidates
     }
 
-    fn context_tokens(&self, req: &SchedulerInput<'_>, model_id: &str) -> Option<usize> {
+    async fn context_tokens(&self, req: &SchedulerInput<'_>, model_id: &str) -> Option<usize> {
         if let Some(token_ids) = req.token_ids {
             return Some(token_ids.len());
+        }
+
+        // Local pre_kv_cache already needs the exact, chat-templated token IDs.
+        // Compute them once before pool selection; the policy reuses the same
+        // request-level OnceCell instead of tokenizing the prompt a second time.
+        if let (Some(request), Some(runtime)) =
+            (req.kv_request, self.policy_registry.pre_kv_cache_runtime())
+        {
+            if let Some(tokens) = runtime.local_request_token_count(model_id, request).await {
+                return Some(tokens);
+            }
         }
 
         let request_text = req.request_text?;
@@ -731,6 +743,7 @@ impl Scheduler {
             .select_worker(
                 workers,
                 &SelectWorkerInfo {
+                    kv_request: req.kv_request,
                     request_text: req.request_text,
                     tokens: req.token_ids,
                     headers: req.headers,
@@ -811,6 +824,7 @@ mod tests {
 
     fn request(endpoint: Endpoint) -> SchedulerInput<'static> {
         SchedulerInput {
+            kv_request: None,
             model_id: Some(MODEL_ID),
             endpoint,
             request_text: None,
@@ -821,6 +835,7 @@ mod tests {
 
     fn request_with_model(endpoint: Endpoint, model_id: &'static str) -> SchedulerInput<'static> {
         SchedulerInput {
+            kv_request: None,
             model_id: Some(model_id),
             endpoint,
             request_text: None,

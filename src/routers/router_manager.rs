@@ -66,6 +66,7 @@ const SCHEDULED_MODE_REGULAR: u8 = 1;
 const SCHEDULED_MODE_PD: u8 = 2;
 
 pub struct RouterManager {
+    policy_registry: Arc<crate::policies::PolicyRegistry>,
     worker_registry: Arc<WorkerRegistry>,
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
     scheduler: Arc<Scheduler>,
@@ -94,6 +95,7 @@ impl RouterManager {
         priority_worker_count: usize,
     ) -> Self {
         Self {
+            policy_registry: policy_registry.clone(),
             scheduler: Arc::new(
                 Scheduler::new_with_tokenizer_registry(
                     worker_registry.clone(),
@@ -205,9 +207,11 @@ impl RouterManager {
         endpoint: Endpoint,
         request_text: Option<&str>,
         headers: Option<&HeaderMap>,
+        kv_request: Option<&crate::policies::pre_kv_cache::KvRequest>,
     ) -> Result<SchedulerOutput, Response> {
         self.scheduler
             .schedule(&SchedulerInput {
+                kv_request,
                 model_id,
                 endpoint,
                 request_text,
@@ -239,6 +243,7 @@ impl RouterManager {
         endpoint: Endpoint,
         request_text: Option<&str>,
         headers: Option<&HeaderMap>,
+        kv_request: Option<&crate::policies::pre_kv_cache::KvRequest>,
         execute: Execution,
     ) -> Response {
         let scheduled_mode = Arc::new(AtomicU8::new(SCHEDULED_MODE_UNKNOWN));
@@ -253,11 +258,16 @@ impl RouterManager {
                     scheduled_mode.store(SCHEDULED_MODE_UNKNOWN, Ordering::Relaxed);
 
                     let selection = match self
-                        .schedule_request(model_id, endpoint, request_text, headers)
+                        .schedule_request(model_id, endpoint, request_text, headers, kv_request)
                         .await
                     {
                         Ok(selection) => selection,
-                        Err(response) => return response,
+                        Err(response) => {
+                            if let Some(request) = kv_request {
+                                request.finish_attempt(false);
+                            }
+                            return response;
+                        }
                     };
 
                     let mode = match selection.worker_selection {
@@ -267,6 +277,9 @@ impl RouterManager {
                     scheduled_mode.store(mode, Ordering::Relaxed);
 
                     let Some(router) = self.select_router(&selection) else {
+                        if let Some(request) = kv_request {
+                            request.finish_attempt(false);
+                        }
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
                             "No router available for the scheduled worker",
@@ -274,9 +287,13 @@ impl RouterManager {
                             .into_response();
                     };
 
-                    crate::routers::SCHEDULED_SELECTION
+                    let response = crate::routers::SCHEDULED_SELECTION
                         .scope(Some(selection), execute(router))
-                        .await
+                        .await;
+                    if let Some(request) = kv_request {
+                        request.finish_attempt(response.status().is_success());
+                    }
+                    response
                 }
             },
             |response, _attempt| is_retryable_status(response.status()),
@@ -392,6 +409,7 @@ impl RouterTrait for RouterManager {
             Endpoint::Generate,
             body.text.as_deref(),
             headers,
+            None,
             Arc::new(move |router| {
                 let request = Arc::clone(&request);
                 let headers = request_headers.clone();
@@ -415,12 +433,24 @@ impl RouterTrait for RouterManager {
         let request_text = body.extract_text_for_routing();
         let request = Arc::new(body.clone());
         let request_headers = headers.cloned();
+        let kv_request = self
+            .policy_registry
+            .needs_kv_request(model_id)
+            .then(|| serde_json::to_value(body).ok())
+            .flatten()
+            .map(|payload| {
+                crate::policies::pre_kv_cache::KvRequest::new(
+                    "/v1/chat/completions/render",
+                    payload,
+                )
+            });
 
         self.execute_with_retry(
             model_id,
             Endpoint::Chat,
             (!request_text.is_empty()).then_some(request_text.as_str()),
             headers,
+            kv_request.as_ref(),
             Arc::new(move |router| {
                 let request = Arc::clone(&request);
                 let headers = request_headers.clone();
@@ -440,12 +470,21 @@ impl RouterTrait for RouterManager {
         let request_text = body.extract_text_for_routing();
         let request = Arc::new(body.clone());
         let request_headers = headers.cloned();
+        let kv_request = self
+            .policy_registry
+            .needs_kv_request(model_id)
+            .then(|| serde_json::to_value(body).ok())
+            .flatten()
+            .map(|payload| {
+                crate::policies::pre_kv_cache::KvRequest::new("/v1/completions/render", payload)
+            });
 
         self.execute_with_retry(
             model_id,
             Endpoint::Completions,
             (!request_text.is_empty()).then_some(request_text.as_str()),
             headers,
+            kv_request.as_ref(),
             Arc::new(move |router| {
                 let request = Arc::clone(&request);
                 let headers = request_headers.clone();
@@ -475,6 +514,7 @@ impl RouterTrait for RouterManager {
             Endpoint::Chat,
             (!request_text.is_empty()).then_some(request_text.as_str()),
             headers,
+            None,
             Arc::new(move |router| {
                 let request = Arc::clone(&request);
                 let headers = request_headers.clone();
@@ -503,6 +543,7 @@ impl RouterTrait for RouterManager {
             Endpoint::Responses,
             None,
             headers,
+            None,
             Arc::new(move |router| {
                 let request = Arc::clone(&request);
                 let headers = request_headers.clone();
@@ -583,6 +624,7 @@ impl RouterTrait for RouterManager {
             Endpoint::Embeddings,
             None,
             headers,
+            None,
             Arc::new(move |router| {
                 let request = Arc::clone(&request);
                 let headers = request_headers.clone();
@@ -611,6 +653,7 @@ impl RouterTrait for RouterManager {
             Endpoint::Models,
             None,
             headers,
+            None,
             Arc::new(move |router| {
                 let request = Arc::clone(&request);
                 let headers = request_headers.clone();
@@ -639,6 +682,7 @@ impl RouterTrait for RouterManager {
             Endpoint::Rerank,
             Some(body.query.as_str()),
             headers,
+            None,
             Arc::new(move |router| {
                 let request = Arc::clone(&request);
                 let headers = request_headers.clone();

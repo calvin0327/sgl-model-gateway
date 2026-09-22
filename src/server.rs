@@ -92,6 +92,10 @@ async fn shutdown_background_services(
 ) {
     const BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+    if let Some(runtime) = app_context.policy_registry.pre_kv_cache_runtime() {
+        runtime.stop();
+    }
+
     if let Some(processor) = concurrency_processor {
         processor.abort();
         let _ = processor.await;
@@ -141,6 +145,17 @@ async fn initialize_app_context(config: &GatewayConfig) -> Result<Arc<AppContext
         .policy_registry
         .set_prefill_policy(prefill_policy);
     app_context.policy_registry.set_decode_policy(decode_policy);
+
+    if let Some(config) = &config.routing.pre_kv_cache {
+        let runtime = crate::policies::pre_kv_cache::Runtime::new_with_tokenizer_registry(
+            config.clone(),
+            app_context.client.clone(),
+            app_context.tokenizer_registry.clone(),
+        )
+        .map_err(Error::msg)?;
+        runtime.start(&app_context.worker_registry);
+        app_context.policy_registry.install_pre_kv_cache(runtime);
+    }
 
     app_context.inflight_tracker.start_sampler(20);
 

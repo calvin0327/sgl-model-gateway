@@ -22,7 +22,7 @@ impl ConfigValidator {
             Self::validate_gateway_discovery(discovery)?;
         }
 
-        Ok(())
+        Self::validate_gateway_compatibility(config)
     }
 
     fn validate_server(server: &ServerConfig) -> ConfigResult<()> {
@@ -79,6 +79,24 @@ impl ConfigValidator {
     }
 
     fn validate_routing(routing: &RoutingConfig) -> ConfigResult<()> {
+        let enabled = matches!(routing.policy, PolicyConfig::PreKvCache)
+            || matches!(routing.prefill_policy, Some(PolicyConfig::PreKvCache));
+        if matches!(routing.decode_policy, Some(PolicyConfig::PreKvCache)) {
+            return Err(ConfigError::ValidationFailed {
+                reason: "pre_kv_cache is a Regular/Prefill policy; select a separate Decode policy"
+                    .into(),
+            });
+        }
+        if enabled && routing.pre_kv_cache.is_none() {
+            return Err(ConfigError::ValidationFailed {
+                reason: "pre_kv_cache requires structured --pre-kv-cache-* flags, PRE_KV_CACHE_CONFIG_JSON, --pre-kv-cache-config-json or --pre-kv-cache-config".into(),
+            });
+        }
+        if let Some(config) = &routing.pre_kv_cache {
+            config
+                .validate()
+                .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+        }
         Self::validate_policy(&routing.policy)?;
         if let Some(policy) = &routing.prefill_policy {
             Self::validate_policy(policy)?;
@@ -244,6 +262,62 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Checks restrictions that span routing, discovery, and worker settings.
+    fn validate_gateway_compatibility(config: &GatewayConfig) -> ConfigResult<()> {
+        if let Some(kv) = &config.routing.pre_kv_cache {
+            if config.routing.dp_aware
+                || (!config.workers.backend.is_empty() && config.workers.backend != "vllm")
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "pre_kv_cache v1 requires vLLM HTTP workers without --dp-aware".into(),
+                });
+            }
+            if kv
+                .workers
+                .iter()
+                .any(|s| config.workers.decode_urls.contains(&s.worker_url))
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "pre_kv_cache event sources must be Regular/Prefill workers, not Decode workers".into(),
+                });
+            }
+        }
+        if let PolicyConfig::PowerOfTwo { .. } = &config.routing.policy {
+            if config.workers.regular_urls.len() < 2 {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Power-of-two policy requires at least 2 workers".to_string(),
+                });
+            }
+        }
+
+        if let Some(PolicyConfig::PowerOfTwo { .. }) = &config.routing.prefill_policy {
+            if config.workers.prefill_urls.len() < 2 {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Power-of-two policy for prefill requires at least 2 prefill workers"
+                        .to_string(),
+                });
+            }
+        }
+        if let Some(PolicyConfig::PowerOfTwo { .. }) = &config.routing.decode_policy {
+            if config.workers.decode_urls.len() < 2 {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "Power-of-two policy for decode requires at least 2 decode workers"
+                        .to_string(),
+                });
+            }
+        }
+        if matches!(
+            config.routing.decode_policy,
+            Some(PolicyConfig::Bucket { .. })
+        ) {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Decode policy should not be allowed to be bucket".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     fn validate_otlp_endpoint(endpoint: &str, field: &str) -> ConfigResult<()> {
         let Some((host, port)) = endpoint.rsplit_once(':') else {
             return Err(ConfigError::InvalidValue {
@@ -264,7 +338,8 @@ impl ConfigValidator {
 
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random
+            PolicyConfig::PreKvCache
+            | PolicyConfig::Random
             | PolicyConfig::RoundRobin
             | PolicyConfig::Manual { .. }
             | PolicyConfig::ConsistentHashing => {}

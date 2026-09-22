@@ -15,6 +15,7 @@ use crate::{config::PolicyConfig, core::Worker};
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
 pub struct PolicyRegistry {
+    pre_kv_cache: Arc<OnceLock<Arc<super::pre_kv_cache::Runtime>>>,
     /// Model ID -> Policy instance mapping (lock-free reads via DashMap)
     model_policies: Arc<DashMap<String, Arc<dyn LoadBalancingPolicy>>>,
 
@@ -32,11 +33,47 @@ pub struct PolicyRegistry {
 }
 
 impl PolicyRegistry {
+    pub fn install_pre_kv_cache(&self, runtime: Arc<super::pre_kv_cache::Runtime>) {
+        let _ = self.pre_kv_cache.set(runtime);
+        self.bind_pre_kv_cache(&self.default_policy);
+        if let Some(p) = self.prefill_policy.get() {
+            self.bind_pre_kv_cache(p);
+        }
+        if let Some(p) = self.decode_policy.get() {
+            self.bind_pre_kv_cache(p);
+        }
+        for p in self.model_policies.iter() {
+            self.bind_pre_kv_cache(p.value());
+        }
+    }
+
+    fn bind_pre_kv_cache(&self, policy: &Arc<dyn LoadBalancingPolicy>) {
+        if let (Some(runtime), Some(policy)) = (
+            self.pre_kv_cache.get(),
+            policy
+                .as_any()
+                .downcast_ref::<super::pre_kv_cache::PreKvCachePolicy>(),
+        ) {
+            policy.bind(runtime.clone());
+        }
+    }
+
+    pub fn pre_kv_cache_runtime(&self) -> Option<Arc<super::pre_kv_cache::Runtime>> {
+        self.pre_kv_cache.get().cloned()
+    }
+
+    pub fn needs_kv_request(&self, model: Option<&str>) -> bool {
+        self.pre_kv_cache.get().is_some()
+            && (self.get_policy_or_default(model.unwrap_or("")).name() == "pre_kv_cache"
+                || self.get_prefill_policy().name() == "pre_kv_cache")
+    }
+
     /// Create a new PolicyRegistry with a default policy
     pub fn new(default_policy_config: PolicyConfig) -> Self {
         let default_policy = Self::create_policy_from_config(&default_policy_config);
 
         Self {
+            pre_kv_cache: Arc::new(OnceLock::new()),
             model_policies: Arc::new(DashMap::new()),
             model_worker_counts: Arc::new(DashMap::new()),
             default_policy,
@@ -73,6 +110,7 @@ impl PolicyRegistry {
 
         // New model - determine policy
         let policy = self.determine_policy_for_model(model_id, policy_hint);
+        self.bind_pre_kv_cache(&policy);
 
         info!(
             "Assigning policy {} to new model {}",
@@ -199,6 +237,7 @@ impl PolicyRegistry {
 
     /// Set the prefill policy for PD mode (lock-free, set once at startup)
     pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        self.bind_pre_kv_cache(&policy);
         // OnceLock::set returns Err if already set, which we ignore since
         // the policy should only be set once at startup
         let _ = self.prefill_policy.set(policy);
@@ -206,6 +245,7 @@ impl PolicyRegistry {
 
     /// Set the decode policy for PD mode (lock-free, set once at startup)
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        self.bind_pre_kv_cache(&policy);
         // OnceLock::set returns Err if already set, which we ignore since
         // the policy should only be set once at startup
         let _ = self.decode_policy.set(policy);

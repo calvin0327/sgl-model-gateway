@@ -15,6 +15,7 @@ mod consistent_hashing;
 mod factory;
 mod manual;
 mod power_of_two;
+pub mod pre_kv_cache;
 mod prefix_hash;
 mod random;
 mod registry;
@@ -152,6 +153,8 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
 /// Information passed to policy for worker selection
 #[derive(Debug, Clone, Default)]
 pub struct SelectWorkerInfo<'a> {
+    /// Exact KV input is separate from tokens used by legacy length routing.
+    pub kv_request: Option<&'a pre_kv_cache::KvRequest>,
     /// Request text for cache-aware routing
     pub request_text: Option<&'a str>,
     /// Tokenized request for prefix-hash routing
