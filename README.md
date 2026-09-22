@@ -134,6 +134,35 @@ The `--version` (or `-V`) flag displays the version string. Use `--version-verbo
     --policy cache_aware
   ```
 
+### Priority Worker Reservations
+
+Use `--priority-worker-count 1` to reserve one worker per eligible pool for
+requests containing the `X-Request-Priority` header (any value, including empty).
+The default is `0`, which disables reservations. Even when this option is omitted
+or set to `0`, requests containing `X-Request-Priority` still prefer Regular workers
+regardless of context length, falling back to PD if no Regular worker can serve
+the request.
+
+Reservations apply independently to Regular and Prefill pools for the
+requested model and endpoint. Prefill pools are additionally separated by deployment
+group, transport, and backend runtime so that pairing constraints remain intact.
+When a pool has more healthy workers than the reserved count, priority requests
+use the reserved workers and ordinary requests use the remainder. When its
+healthy count is less than or equal to the reserved count, all requests share the
+pool. Decode workers never count toward the reservation and are always shared
+through the existing Decode policy and pairing rules. For example, with
+`1P + 3D` and a reservation of `1`, Priority isolation is disabled for PD;
+with `3P + 1D`, one Prefill is reserved and the Decode is shared by all requests.
+
+The lexicographically first worker URLs in each eligible pool are reserved.
+Assignments are recomputed as discovery membership or health changes; no fixed
+worker count or URL configuration is required. Filtering happens before context
+preferences and load balancing, so ordinary requests cannot fall back into a
+reserved pool while isolation is active. Existing Regular/PD mode preferences
+and fallback remain in effect within the allowed candidates. A single candidate
+continues to bypass the balancing policy. Changes affect new scheduling attempts,
+not requests already running on a worker.
+
 ### vLLM HTTP Routing
 Add `--backend vllm` to mark URL-configured workers as vLLM workers:
 ```bash

@@ -82,6 +82,7 @@ impl RouterManager {
             policy_registry,
             RetryConfig::default(),
             None,
+            0,
         )
     }
 
@@ -90,13 +91,17 @@ impl RouterManager {
         policy_registry: Arc<crate::policies::PolicyRegistry>,
         retry_config: RetryConfig,
         tokenizer_registry: Option<Arc<TokenizerRegistry>>,
+        priority_worker_count: usize,
     ) -> Self {
         Self {
-            scheduler: Arc::new(Scheduler::new_with_tokenizer_registry(
-                worker_registry.clone(),
-                policy_registry,
-                tokenizer_registry,
-            )),
+            scheduler: Arc::new(
+                Scheduler::new_with_tokenizer_registry(
+                    worker_registry.clone(),
+                    policy_registry,
+                    tokenizer_registry,
+                )
+                .with_priority_worker_count(priority_worker_count),
+            ),
             worker_registry,
             routers: Arc::new(DashMap::new()),
             retry_config,
@@ -112,6 +117,7 @@ impl RouterManager {
             app_context.policy_registry.clone(),
             config.workers.effective_retry_config(),
             Some(app_context.tokenizer_registry.clone()),
+            config.workers.priority_worker_count,
         ));
 
         info!("Initializing all router implementations");

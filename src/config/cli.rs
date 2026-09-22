@@ -128,6 +128,14 @@ pub struct CliArgs {
     #[arg(long, help_heading = "Worker Configuration")]
     regular_preferred_context_tokens: Option<usize>,
 
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Workers reserved for requests with X-Request-Priority per Regular/Prefill pool; disabled when the pool size is at most this count; Decode workers are shared",
+        help_heading = "Worker Configuration"
+    )]
+    priority_worker_count: usize,
+
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     openai_urls: Vec<String>,
 
@@ -697,6 +705,7 @@ impl CliArgs {
                 regular_urls: self.worker_urls.clone(),
                 backend: self.backend.clone(),
                 regular_preferred_context_tokens: self.regular_preferred_context_tokens,
+                priority_worker_count: self.priority_worker_count,
                 openai_urls: self.openai_urls.clone(),
                 prefill_urls: prefill_urls.clone(),
                 pd_preferred_context_tokens: self.pd_preferred_context_tokens,
@@ -845,4 +854,40 @@ fn parse_label_selectors(selector_list: &[String]) -> HashMap<String, String> {
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn priority_worker_count_reaches_gateway_config() {
+        for configured in [None, Some("0"), Some("2")] {
+            let mut args = vec![
+                "smg",
+                "--backend",
+                "vllm",
+                "--worker-urls",
+                "http://localhost:8000",
+            ];
+            if let Some(count) = configured {
+                args.extend(["--priority-worker-count", count]);
+            }
+            let config = Cli::try_parse_from(args)
+                .unwrap()
+                .try_into_config()
+                .unwrap();
+            assert_eq!(
+                config.workers.priority_worker_count,
+                configured.unwrap_or("0").parse::<usize>().unwrap()
+            );
+            let mut serialized = serde_json::to_value(&config.workers).unwrap();
+            serialized
+                .as_object_mut()
+                .unwrap()
+                .remove("priority_worker_count");
+            let restored: WorkerConfig = serde_json::from_value(serialized).unwrap();
+            assert_eq!(restored.priority_worker_count, 0);
+        }
+    }
 }

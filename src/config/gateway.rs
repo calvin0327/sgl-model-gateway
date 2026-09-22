@@ -289,6 +289,9 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub regular_preferred_context_tokens: Option<usize>,
 
+    #[serde(default)]
+    pub priority_worker_count: usize,
+
     pub prefill_urls: Vec<(String, Option<u16>)>,
 
     /// Preferred input context length for PD prefill workers. This is a
@@ -364,6 +367,7 @@ impl Default for WorkerConfig {
             regular_urls: Vec::new(),
             backend: String::new(),
             regular_preferred_context_tokens: None,
+            priority_worker_count: 0,
             prefill_urls: Vec::new(),
             pd_preferred_context_tokens: None,
             decode_urls: Vec::new(),

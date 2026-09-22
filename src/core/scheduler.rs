@@ -4,7 +4,10 @@
 //! Routers are intentionally not involved here: they only execute the selection
 //! returned by this module.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use http::HeaderMap;
 use thiserror::Error;
@@ -78,6 +81,12 @@ pub enum WorkerMode {
     PrefillDecode,
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum PriorityPool {
+    Regular,
+    Prefill(String, ConnectionMode, BackendType),
+}
+
 /// A single worker or a complete PD worker pair.
 #[derive(Debug, Clone)]
 pub enum WorkerSelection {
@@ -106,6 +115,7 @@ pub struct Scheduler {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     tokenizer_registry: Option<Arc<TokenizerRegistry>>,
+    priority_worker_count: usize,
 }
 
 impl Scheduler {
@@ -122,7 +132,13 @@ impl Scheduler {
             worker_registry,
             policy_registry,
             tokenizer_registry,
+            priority_worker_count: 0,
         }
+    }
+
+    pub fn with_priority_worker_count(mut self, count: usize) -> Self {
+        self.priority_worker_count = count;
+        self
     }
 
     pub async fn schedule(
@@ -131,6 +147,7 @@ impl Scheduler {
     ) -> Result<SchedulerOutput, SchedulerError> {
         let model_id = self.resolve_model_id(req.model_id)?;
         let available_workers = self.available_workers(&model_id, req.endpoint)?;
+        let available_workers = self.filter_priority_workers(available_workers, req.headers);
 
         let mut mode_order = Vec::with_capacity(3);
 
@@ -238,6 +255,53 @@ impl Scheduler {
             model_id,
             worker_selection,
         })
+    }
+
+    fn filter_priority_workers(
+        &self,
+        workers: Vec<Arc<dyn Worker>>,
+        headers: Option<&HeaderMap>,
+    ) -> Vec<Arc<dyn Worker>> {
+        if self.priority_worker_count == 0 {
+            return workers;
+        }
+
+        let mut pools: HashMap<PriorityPool, Vec<Arc<dyn Worker>>> = HashMap::new();
+        let mut candidates = Vec::new();
+        for worker in workers {
+            if matches!(worker.metadata().runtime_type, BackendType::External) {
+                candidates.push(worker);
+                continue;
+            }
+            let pool = match worker.worker_type() {
+                WorkerType::Regular => PriorityPool::Regular,
+                WorkerType::Prefill { .. } => PriorityPool::Prefill(
+                    pd_group_id(worker.as_ref()).to_string(),
+                    worker.connection_mode().clone(),
+                    worker.metadata().runtime_type.clone(),
+                ),
+                WorkerType::Decode => {
+                    candidates.push(worker);
+                    continue;
+                }
+            };
+            pools.entry(pool).or_default().push(worker);
+        }
+
+        let high_priority = has_high_request_priority(headers);
+        for mut pool in pools.into_values() {
+            if pool.len() > self.priority_worker_count {
+                pool.sort_unstable_by(|left, right| left.url().cmp(right.url()));
+                if high_priority {
+                    pool.truncate(self.priority_worker_count);
+                } else {
+                    pool.drain(..self.priority_worker_count);
+                }
+            }
+            candidates.extend(pool);
+        }
+        candidates.sort_unstable_by(|left, right| left.url().cmp(right.url()));
+        candidates
     }
 
     fn context_tokens(&self, req: &SchedulerInput<'_>, model_id: &str) -> Option<usize> {
@@ -799,6 +863,304 @@ mod tests {
         unrelated_headers.insert("Other-Header", "high".parse().unwrap());
         assert!(!has_high_request_priority(Some(&unrelated_headers)));
         assert!(!has_high_request_priority(None));
+    }
+
+    #[tokio::test]
+    async fn priority_header_prefers_regular_without_reservations() {
+        let regular: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://regular")
+                .worker_type(WorkerType::Regular)
+                .preferred_context_tokens(10)
+                .build(),
+        );
+        let scheduler = scheduler_with_workers(vec![
+            regular.clone(),
+            pd_worker(
+                "http://prefill",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "group-a",
+            ),
+            pd_worker("http://decode", WorkerType::Decode, "group-a"),
+        ]);
+        let mut req = request(Endpoint::Chat);
+        req.token_ids = Some(&[0; 100]);
+        let output = scheduler.schedule(&req).await.unwrap();
+        assert!(matches!(
+            output.worker_selection,
+            WorkerSelection::PrefillDecode { .. }
+        ));
+
+        for value in ["high", "anything", ""] {
+            let mut headers = HeaderMap::new();
+            headers.insert(REQUEST_PRIORITY_HEADER, value.parse().unwrap());
+            let priority_req = SchedulerInput {
+                headers: Some(&headers),
+                ..req.clone()
+            };
+            let output = scheduler.schedule(&priority_req).await.unwrap();
+            assert!(
+                matches!(output.worker_selection, WorkerSelection::Regular { worker } if worker.url() == regular.url())
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(REQUEST_PRIORITY_HEADER, "".parse().unwrap());
+        req.headers = Some(&headers);
+        regular.set_healthy(false);
+        let output = scheduler.schedule(&req).await.unwrap();
+        assert!(matches!(
+            output.worker_selection,
+            WorkerSelection::PrefillDecode { .. }
+        ));
+        scheduler.worker_registry.remove_by_url(regular.url());
+        let output = scheduler.schedule(&req).await.unwrap();
+        assert!(matches!(
+            output.worker_selection,
+            WorkerSelection::PrefillDecode { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn priority_regular_workers_are_reserved_only_when_capacity_allows() {
+        for reserved_count in [0, 1, 2, 3, 4] {
+            let scheduler = scheduler_with_workers(vec![
+                worker("http://regular-2", WorkerType::Regular),
+                worker("http://regular-0", WorkerType::Regular),
+                worker("http://regular-1", WorkerType::Regular),
+            ])
+            .with_priority_worker_count(reserved_count);
+            let mut headers = HeaderMap::new();
+            headers.insert(REQUEST_PRIORITY_HEADER, "".parse().unwrap());
+            for high_priority in [false, true] {
+                let mut req = request(Endpoint::Chat);
+                req.headers = high_priority.then_some(&headers);
+                let expected: HashSet<_> = (0..3)
+                    .filter(|index| {
+                        reserved_count == 0
+                            || reserved_count >= 3
+                            || (*index < reserved_count) == high_priority
+                    })
+                    .map(|index| format!("http://regular-{index}"))
+                    .collect();
+                let mut selected = HashSet::new();
+                for _ in 0..6 {
+                    let output = scheduler.schedule(&req).await.unwrap();
+                    let WorkerSelection::Regular { worker } = output.worker_selection else {
+                        panic!("expected a regular worker");
+                    };
+                    assert!(expected.contains(worker.url()));
+                    selected.insert(worker.url().to_string());
+                }
+                assert_eq!(selected, expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_reservations_follow_discovery_and_health() {
+        async fn assert_selected(scheduler: &Scheduler, expected: &str) {
+            let output = scheduler.schedule(&request(Endpoint::Chat)).await.unwrap();
+            let WorkerSelection::Regular { worker } = output.worker_selection else {
+                panic!("expected a regular worker");
+            };
+            assert_eq!(worker.url(), expected);
+        }
+        let first = worker("http://regular-0", WorkerType::Regular);
+        let second = worker("http://regular-1", WorkerType::Regular);
+        let scheduler = scheduler_with_workers(vec![first.clone()]).with_priority_worker_count(1);
+        assert_selected(&scheduler, first.url()).await;
+        scheduler.worker_registry.register(second.clone());
+        assert_selected(&scheduler, second.url()).await;
+        second.set_healthy(false);
+        assert_selected(&scheduler, first.url()).await;
+        second.set_healthy(true);
+        assert_selected(&scheduler, second.url()).await;
+        scheduler.worker_registry.remove_by_url(second.url());
+        assert_selected(&scheduler, first.url()).await;
+    }
+
+    #[tokio::test]
+    async fn priority_pd_reserves_only_prefill_and_shares_all_decodes() {
+        for (prefill_count, decode_count) in [(1, 1), (1, 3), (3, 1), (3, 2), (3, 3)] {
+            let workers = (0..prefill_count)
+                .map(|index| {
+                    pd_worker(
+                        &format!("http://prefill-{index}"),
+                        WorkerType::Prefill {
+                            bootstrap_port: None,
+                        },
+                        "group-a",
+                    )
+                })
+                .chain((0..decode_count).map(|index| {
+                    pd_worker(
+                        &format!("http://decode-{index}"),
+                        WorkerType::Decode,
+                        "group-a",
+                    )
+                }))
+                .collect();
+            let scheduler = scheduler_with_workers(workers).with_priority_worker_count(1);
+            scheduler
+                .policy_registry
+                .set_decode_policy(Arc::new(crate::policies::RoundRobinPolicy::new()));
+            let expected_decodes: HashSet<_> = (0..decode_count)
+                .map(|index| format!("http://decode-{index}"))
+                .collect();
+            let mut headers = HeaderMap::new();
+            headers.insert(REQUEST_PRIORITY_HEADER, "anything".parse().unwrap());
+            for high_priority in [false, true] {
+                let mut req = request(Endpoint::Chat);
+                req.headers = high_priority.then_some(&headers);
+                let mut selected_decodes = HashSet::new();
+                for _ in 0..6 {
+                    let output = scheduler.schedule(&req).await.unwrap();
+                    let WorkerSelection::PrefillDecode {
+                        prefill,
+                        decode,
+                        pd_group_id,
+                    } = output.worker_selection
+                    else {
+                        panic!("expected a PD pair");
+                    };
+                    assert_eq!(pd_group_id, "group-a");
+                    assert_eq!(
+                        prefill.url() == "http://prefill-0",
+                        high_priority || prefill_count == 1
+                    );
+                    selected_decodes.insert(decode.url().to_string());
+                }
+                assert_eq!(selected_decodes, expected_decodes);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_capacity_is_counted_per_model() {
+        let scheduler = scheduler_with_workers(vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://model-a")
+                    .model(ModelCard::new(MODEL_ID))
+                    .build(),
+            ) as Arc<dyn Worker>,
+            Arc::new(
+                BasicWorkerBuilder::new("http://model-b")
+                    .model(ModelCard::new("another-model"))
+                    .build(),
+            ) as Arc<dyn Worker>,
+        ])
+        .with_priority_worker_count(1);
+        let output = scheduler.schedule(&request(Endpoint::Chat)).await.unwrap();
+        assert!(
+            matches!(output.worker_selection, WorkerSelection::Regular { worker } if worker.url() == "http://model-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_pd_pools_preserve_pairing_compatibility() {
+        let workers = vec![
+            pd_worker_with_runtime(
+                "http://prefill-0",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "group-a",
+                BackendType::Sglang,
+            ),
+            pd_worker_with_runtime(
+                "http://decode-2",
+                WorkerType::Decode,
+                "group-a",
+                BackendType::Sglang,
+            ),
+            pd_worker_with_runtime(
+                "http://prefill-1",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "group-a",
+                BackendType::Vllm,
+            ),
+            pd_worker_with_runtime(
+                "http://decode-1",
+                WorkerType::Decode,
+                "group-a",
+                BackendType::Vllm,
+            ),
+            pd_worker(
+                "http://prefill-2",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "group-b",
+            ),
+            pd_worker("http://decode-0", WorkerType::Decode, "group-b"),
+        ];
+        let scheduler = scheduler_with_workers(workers).with_priority_worker_count(1);
+        let mut headers = HeaderMap::new();
+        headers.insert(REQUEST_PRIORITY_HEADER, "low".parse().unwrap());
+        for high_priority in [false, true] {
+            let mut req = request(Endpoint::Chat);
+            req.headers = high_priority.then_some(&headers);
+            let output = scheduler.schedule(&req).await.unwrap();
+            let WorkerSelection::PrefillDecode {
+                prefill, decode, ..
+            } = output.worker_selection
+            else {
+                panic!("expected a PD pair");
+            };
+            assert_eq!(pd_group_id(prefill.as_ref()), pd_group_id(decode.as_ref()));
+            assert_eq!(
+                prefill.metadata().runtime_type,
+                decode.metadata().runtime_type
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_pd_reservations_precede_context_preferences() {
+        let scheduler = scheduler_with_workers(vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://prefill-0")
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: None,
+                    })
+                    .label("pd_group_id", "group-a")
+                    .preferred_context_tokens(10)
+                    .build(),
+            ) as Arc<dyn Worker>,
+            pd_worker(
+                "http://prefill-1",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "group-a",
+            ),
+            pd_worker("http://decode-0", WorkerType::Decode, "group-a"),
+            pd_worker("http://decode-1", WorkerType::Decode, "group-a"),
+        ])
+        .with_priority_worker_count(1);
+        let mut headers = HeaderMap::new();
+        headers.insert(REQUEST_PRIORITY_HEADER, "high".parse().unwrap());
+        for high_priority in [false, true] {
+            let mut req = request(Endpoint::Chat);
+            req.token_ids = Some(&[0; 100]);
+            req.headers = high_priority.then_some(&headers);
+            let output = scheduler.schedule(&req).await.unwrap();
+            let WorkerSelection::PrefillDecode {
+                prefill, decode, ..
+            } = output.worker_selection
+            else {
+                panic!("expected a PD pair");
+            };
+            assert_eq!(prefill.url() == "http://prefill-0", high_priority);
+            assert!(matches!(
+                decode.url(),
+                "http://decode-0" | "http://decode-1"
+            ));
+        }
     }
 
     #[tokio::test]
