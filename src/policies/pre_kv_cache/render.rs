@@ -176,9 +176,23 @@ impl KvRequest {
         validate_text_request(&self.payload)?;
         validate_model(&self.payload, profile)?;
         let salt = cache_salt(&self.payload)?;
-        let tokenizer = tokenizer_registry
-            .get(&profile.model)
-            .ok_or("local_tokenizer_unavailable")?;
+        // Startup registration uses --tokenizer-path as its initial name, while
+        // worker discovery later registers the same tokenizer by served model.
+        // A single-model gateway can safely use the sole loaded tokenizer during
+        // that interval; a multi-model gateway must wait for an exact model name.
+        let tokenizer = tokenizer_registry.get(&profile.model).or_else(|| {
+            let entries = tokenizer_registry.list();
+            (entries.len() == 1).then(|| entries[0].tokenizer.clone())
+        });
+        let tokenizer = tokenizer.ok_or_else(|| {
+            tracing::debug!(
+                profile = name,
+                model = profile.model,
+                registered_tokenizers = tokenizer_registry.len(),
+                "pre_kv_cache local tokenizer unavailable"
+            );
+            "local_tokenizer_unavailable"
+        })?;
 
         let tokens = match self.path {
             "/v1/chat/completions/render" => {
@@ -189,7 +203,7 @@ impl KvRequest {
                     .ok_or("local_chat_messages")?;
                 let tools = optional_array(&self.payload, "tools")?;
                 let documents = optional_array(&self.payload, "documents")?;
-                let template_kwargs = optional_object(&self.payload, "chat_template_kwargs")?;
+                let template_kwargs = local_template_kwargs(&self.payload)?;
                 let continue_final_message =
                     optional_bool(&self.payload, "continue_final_message")?.unwrap_or(false);
                 let rendered = tokenizer
@@ -201,12 +215,27 @@ impl KvRequest {
                             documents,
                             template_kwargs: template_kwargs.as_ref(),
                             special_tokens: Some(tokenizer.get_special_tokens()),
+                            ..Default::default()
                         },
                     )
-                    .map_err(|_| "local_chat_template")?;
+                    .map_err(|error| {
+                        tracing::debug!(
+                            profile = name,
+                            error = %error,
+                            "pre_kv_cache local chat template failed"
+                        );
+                        "local_chat_template"
+                    })?;
                 tokenizer
                     .encode(&rendered, false)
-                    .map_err(|_| "local_tokenize")?
+                    .map_err(|error| {
+                        tracing::debug!(
+                            profile = name,
+                            error = %error,
+                            "pre_kv_cache local tokenization failed"
+                        );
+                        "local_tokenize"
+                    })?
                     .token_ids()
                     .to_vec()
             }
@@ -288,6 +317,23 @@ fn optional_object(
             .ok_or("local_request_shape"),
         None => Ok(None),
     }
+}
+
+fn local_template_kwargs(body: &Value) -> Result<Option<HashMap<String, Value>>, &'static str> {
+    let mut kwargs = optional_object(body, "chat_template_kwargs")?.unwrap_or_default();
+
+    // vLLM forwards the OpenAI top-level reasoning effort into the model's
+    // native chat encoder. Keep that value in the one local rendering pass.
+    if !kwargs.contains_key("reasoning_effort") {
+        if let Some(effort) = body
+            .get("reasoning_effort")
+            .filter(|value| !value.is_null())
+        {
+            kwargs.insert("reasoning_effort".into(), effort.clone());
+        }
+    }
+
+    Ok((!kwargs.is_empty()).then_some(kwargs))
 }
 
 fn optional_bool(body: &Value, key: &str) -> Result<Option<bool>, &'static str> {
@@ -383,9 +429,31 @@ pub(super) async fn limited_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tokenizer::traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer};
+    use crate::tokenizer::{
+        huggingface::HuggingFaceTokenizer,
+        traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer},
+    };
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        fs,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    const MIN_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": { "type": "Whitespace" },
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "BPE",
+            "vocab": { "hello": 0, "<s>": 1, "</s>": 2 },
+            "merges": []
+        }
+    }"#;
 
     #[derive(Default)]
     struct TestTokenizer {
@@ -491,12 +559,38 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn deepseek_v4_model_uses_its_native_chat_encoder() {
+        // A V4 checkpoint has no ordinary Jinja chat template. The local
+        // tokenizer must select its native encoder from the model architecture.
+        let temp = tempfile::tempdir().unwrap();
+        let model_dir = temp.path().join("DeepSeek-V4-Flash-0731");
+        fs::create_dir(&model_dir).unwrap();
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+        fs::write(
+            model_dir.join("config.json"),
+            r#"{"architectures":["DeepseekV4ForCausalLM"]}"#,
+        )
+        .unwrap();
+
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        let messages = vec![json!({"role":"user","content":"Hello"})];
+        let prompt = tokenizer
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+
+        assert!(prompt.contains("<｜begin▁of▁sentence｜>"));
+        assert!(prompt.contains("<｜User｜>Hello<｜Assistant｜>"));
+        assert!(prompt.ends_with("</think>"));
+    }
+
     #[tokio::test]
     async fn local_chat_applies_template_once_and_never_requires_render() {
         let tokenizer = Arc::new(TestTokenizer::default());
         let registry = TokenizerRegistry::new();
         registry
-            .load("id", "m", "m", || {
+            .load("id", "/models/test", "/models/test", || {
                 let tokenizer = tokenizer.clone();
                 async move { Ok(tokenizer as Arc<dyn Tokenizer>) }
             })
@@ -517,6 +611,7 @@ mod tests {
                 "tools":[{"type":"function","function":{"name":"lookup"}}],
                 "documents":[{"title":"memo"}],
                 "chat_template_kwargs":{"enable_thinking":false},
+                "reasoning_effort":"high",
                 "continue_final_message":true
             }),
         );
@@ -553,6 +648,50 @@ mod tests {
             tokenizer.kwargs.lock()[0].as_ref().unwrap()["enable_thinking"],
             false
         );
+        assert_eq!(
+            tokenizer.kwargs.lock()[0].as_ref().unwrap()["reasoning_effort"],
+            "high"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_tokenizer_never_guesses_between_multiple_models() {
+        let registry = TokenizerRegistry::new();
+        for (id, name) in [("id-a", "model-a"), ("id-b", "model-b")] {
+            registry
+                .load(id, name, name, || async {
+                    Ok(Arc::new(TestTokenizer::default()) as Arc<dyn Tokenizer>)
+                })
+                .await
+                .unwrap();
+        }
+        let profile: Profile = serde_json::from_value(json!({
+            "model":"missing-model",
+            "block_size":2,
+            "token_source":"local_tokenizer"
+        }))
+        .unwrap();
+        let request = KvRequest::new(
+            "/v1/chat/completions/render",
+            json!({
+                "model":"missing-model",
+                "messages":[{"role":"user","content":"hello"}]
+            }),
+        );
+
+        let error = request
+            .tokens(
+                "missing-model",
+                &profile,
+                &Config::default(),
+                &reqwest::Client::new(),
+                &registry,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "local_tokenizer_unavailable");
     }
 
     #[tokio::test]
