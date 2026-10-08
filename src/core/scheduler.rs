@@ -146,6 +146,11 @@ impl Scheduler {
         &self,
         req: &SchedulerInput<'_>,
     ) -> Result<SchedulerOutput, SchedulerError> {
+        // Each retry gets a fresh measured value; an unavailable KV lookup is
+        // logged as unknown instead of reusing the previous attempt's value.
+        if let Some(request) = req.kv_request {
+            request.clear_selected_cached_tokens();
+        }
         let model_id = self.resolve_model_id(req.model_id)?;
         let available_workers = self.available_workers(&model_id, req.endpoint)?;
         let available_workers = self.filter_priority_workers(available_workers, req.headers);
@@ -182,6 +187,12 @@ impl Scheduler {
 
         let mut worker_selection = None;
         for mode in mode_order {
+            // A failed mode may have performed a partial KV lookup before its
+            // fallback mode is tried; do not carry that value into the final
+            // scheduling log.
+            if let Some(request) = req.kv_request {
+                request.clear_selected_cached_tokens();
+            }
             let selection = match mode {
                 WorkerMode::Regular => {
                     self.select_regular(&available_workers, &model_id, req)
@@ -227,9 +238,11 @@ impl Scheduler {
                 let policy = self
                     .policy_registry
                     .get_policy_or_default(model_id.as_str());
+                let cache_hit_ratio = Self::format_cache_hit_ratio(req, context_tokens);
                 info!(
                     model_id = %model_id,
                     context_tokens = %context_tokens.unwrap_or_default(),
+                    cache_hit_ratio = %cache_hit_ratio,
                     policy = %policy.name(),
                     worker_url = %worker.url(),
                     "Request scheduled to worker"
@@ -240,9 +253,11 @@ impl Scheduler {
             } => {
                 let prefill_policy = self.policy_registry.get_prefill_policy();
                 let decode_policy = self.policy_registry.get_decode_policy();
+                let cache_hit_ratio = Self::format_cache_hit_ratio(req, context_tokens);
                 info!(
                     model_id = %model_id,
                     context_tokens = %context_tokens.unwrap_or_default(),
+                    cache_hit_ratio = %cache_hit_ratio,
                     prefill_policy = %prefill_policy.name(),
                     decode_policy = %decode_policy.name(),
                     prefill_url = %prefill.url(),
@@ -256,6 +271,27 @@ impl Scheduler {
             model_id,
             worker_selection,
         })
+    }
+
+    /// Format the measured KV coverage using the scheduler's existing context
+    /// token count as the denominator, without adding another token field.
+    fn cache_hit_ratio(req: &SchedulerInput<'_>, context_tokens: Option<usize>) -> Option<f64> {
+        let cached_tokens = req.kv_request?.selected_cached_tokens()?;
+        let context_tokens = context_tokens?;
+        if cached_tokens > context_tokens {
+            return None;
+        }
+        Some(if context_tokens == 0 {
+            0.0
+        } else {
+            cached_tokens as f64 / context_tokens as f64
+        })
+    }
+
+    fn format_cache_hit_ratio(req: &SchedulerInput<'_>, context_tokens: Option<usize>) -> String {
+        Self::cache_hit_ratio(req, context_tokens)
+            .map(|ratio| format!("{ratio:.4}"))
+            .unwrap_or_else(|| "unknown".to_string())
     }
 
     fn filter_priority_workers(
@@ -735,6 +771,15 @@ impl Scheduler {
         }
 
         if workers.len() == 1 {
+            // Reuse local tokens for observability without running the policy's
+            // scoring, reservations or remote render on the single-worker path.
+            if policy.name() == "pre_kv_cache" {
+                if let (Some(request), Some(runtime)) =
+                    (req.kv_request, self.policy_registry.pre_kv_cache_runtime())
+                {
+                    runtime.record_single_worker_cache(&workers[0], request);
+                }
+            }
             return workers.first().cloned();
         }
 
@@ -796,6 +841,128 @@ mod tests {
                 .runtime_type(BackendType::External)
                 .build(),
         )
+    }
+
+    #[test]
+    fn cache_hit_ratio_uses_context_tokens_without_an_input_field() {
+        let request = crate::policies::pre_kv_cache::KvRequest::new(
+            "/v1/chat/completions",
+            serde_json::json!({"model": MODEL_ID}),
+        );
+        request.set_selected_cached_tokens(Some(768));
+        let input = SchedulerInput {
+            kv_request: Some(&request),
+            model_id: Some(MODEL_ID),
+            endpoint: Endpoint::Chat,
+            request_text: None,
+            token_ids: None,
+            headers: None,
+        };
+
+        assert_eq!(
+            Scheduler::format_cache_hit_ratio(&input, Some(1024)),
+            "0.7500"
+        );
+        assert_eq!(
+            Scheduler::format_cache_hit_ratio(&input, Some(512)),
+            "unknown"
+        );
+        assert_eq!(Scheduler::format_cache_hit_ratio(&input, None), "unknown");
+        request.set_selected_cached_tokens(Some(0));
+        assert_eq!(
+            Scheduler::format_cache_hit_ratio(&input, Some(1024)),
+            "0.0000"
+        );
+        assert_eq!(Scheduler::format_cache_hit_ratio(&input, Some(0)), "0.0000");
+        request.clear_selected_cached_tokens();
+        assert_eq!(
+            Scheduler::format_cache_hit_ratio(&input, Some(1024)),
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn pd_failure_does_not_log_prefill_cache_for_regular_fallback() {
+        // Prefill can succeed before Decode becomes unavailable. The Regular
+        // fallback must not inherit that unfinished PD attempt's cache count.
+        #[derive(Debug)]
+        struct PdAttemptPolicy {
+            prefill: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl LoadBalancingPolicy for PdAttemptPolicy {
+            async fn select_worker(
+                &self,
+                _workers: &[Arc<dyn Worker>],
+                info: &SelectWorkerInfo<'_>,
+            ) -> Option<usize> {
+                let request = info.kv_request.unwrap();
+                if self.prefill {
+                    assert_eq!(request.selected_cached_tokens(), None);
+                    request.set_selected_cached_tokens(Some(8));
+                    Some(0)
+                } else {
+                    assert_eq!(request.selected_cached_tokens(), Some(8));
+                    None
+                }
+            }
+            fn name(&self) -> &'static str {
+                "test_pd_attempt"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let regular: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://regular")
+                .preferred_context_tokens(1)
+                .build(),
+        );
+        let scheduler = scheduler_with_workers(vec![
+            regular,
+            pd_worker(
+                "http://p1",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "g",
+            ),
+            pd_worker(
+                "http://p2",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "g",
+            ),
+            pd_worker("http://d1", WorkerType::Decode, "g"),
+            pd_worker("http://d2", WorkerType::Decode, "g"),
+        ]);
+        scheduler
+            .policy_registry
+            .set_prefill_policy(Arc::new(PdAttemptPolicy { prefill: true }));
+        scheduler
+            .policy_registry
+            .set_decode_policy(Arc::new(PdAttemptPolicy { prefill: false }));
+        let kv_request = crate::policies::pre_kv_cache::KvRequest::new(
+            "/v1/chat/completions/render",
+            serde_json::json!({"model": MODEL_ID}),
+        );
+        let input = SchedulerInput {
+            kv_request: Some(&kv_request),
+            token_ids: Some(&[0; 10]),
+            ..request(Endpoint::Chat)
+        };
+        for _ in 0..2 {
+            let output = scheduler.schedule(&input).await.unwrap();
+            assert!(matches!(output.worker_selection,
+                WorkerSelection::Regular { worker } if worker.url() == "http://regular"));
+            assert_eq!(
+                Scheduler::format_cache_hit_ratio(&input, Some(10)),
+                "unknown"
+            );
+        }
     }
 
     fn pd_worker(url: &str, worker_type: WorkerType, group: &str) -> Arc<dyn Worker> {

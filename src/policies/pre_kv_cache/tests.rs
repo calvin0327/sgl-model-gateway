@@ -4,7 +4,13 @@ use super::*;
 use crate::{
     app_context::AppContext,
     config::{GatewayConfig, PolicyConfig},
-    core::{model_card::ModelCard, BasicWorkerBuilder},
+    core::{
+        model_card::ModelCard,
+        model_type::Endpoint,
+        scheduler::{Scheduler, SchedulerInput, WorkerSelection},
+        BasicWorkerBuilder,
+    },
+    policies::PolicyRegistry,
     protocols::chat::ChatCompletionRequest,
     routers::{router_manager::RouterManager, RouterTrait},
     tokenizer::{
@@ -19,6 +25,22 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicUsize;
+use tracing::instrument::WithSubscriber;
+
+// Capture the ordinary INFO event, so the contract covers actual emitted fields.
+#[derive(Clone, Default)]
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 #[derive(Default)]
 struct CountingTokenizer {
@@ -458,12 +480,6 @@ async fn missing_local_tokenizer_falls_back_to_load_without_render() {
 async fn scheduler_and_policy_share_one_local_tokenization() {
     // The exact prompt tokens decide the Regular/PD pool and then feed the KV
     // lookup. Scheduling the same request twice must still call encode once.
-    use crate::core::{
-        model_type::Endpoint,
-        scheduler::{Scheduler, SchedulerInput, WorkerSelection},
-    };
-    use crate::policies::PolicyRegistry;
-
     let tokenizer = Arc::new(CountingTokenizer::default());
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     tokenizer_registry
@@ -551,6 +567,8 @@ async fn scheduler_and_policy_share_one_local_tokenization() {
             }
             other => panic!("expected PD, got {other:?}"),
         }
+        // Decode policy selection must preserve the chosen Prefill's coverage.
+        assert_eq!(request.selected_cached_tokens(), Some(4));
         request.finish_attempt(false);
     }
 
@@ -573,6 +591,28 @@ async fn scheduler_never_calls_render_to_measure_context_length() {
     );
 
     assert_eq!(runtime.local_request_token_count("m", &request).await, None);
+
+    // With one candidate, logging must not add a render call or a reservation.
+    let workers = Arc::new(WorkerRegistry::new());
+    workers.register(worker("http://w1", WorkerType::Regular));
+    let policies = Arc::new(PolicyRegistry::new(PolicyConfig::PreKvCache));
+    policies.install_pre_kv_cache(runtime.clone());
+    let scheduler = Scheduler::new(workers, policies);
+    let input = SchedulerInput {
+        kv_request: Some(&request),
+        model_id: Some("m"),
+        endpoint: Endpoint::Chat,
+        request_text: Some("hello"),
+        token_ids: None,
+        headers: None,
+    };
+    assert!(matches!(
+        scheduler.schedule(&input).await.unwrap().worker_selection,
+        WorkerSelection::Regular { .. }
+    ));
+    assert_eq!(request.selected_cached_tokens(), None);
+    assert!(request.reservations.lock().is_empty());
+    assert!(runtime.loads.lock().is_empty());
     assert_eq!(render.renders.load(Ordering::Relaxed), 0);
 }
 
@@ -633,6 +673,125 @@ fn seed(runtime: &Runtime, worker: &Arc<dyn Worker>) {
             &runtime.config,
         )
         .unwrap();
+}
+
+#[tokio::test]
+async fn scheduler_info_logs_distinguish_hits_misses_and_stale_retries() {
+    // A retry must replace old coverage, while a valid empty index is a real
+    // zero. INFO logging must reuse the one local tokenization across retries.
+    let tokenizer = Arc::new(CountingTokenizer::default());
+    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+    tokenizer_registry
+        .load("id", "m", "m", || {
+            let tokenizer = tokenizer.clone();
+            async move { Ok(tokenizer as Arc<dyn Tokenizer>) }
+        })
+        .await
+        .unwrap();
+    let workers = vec![
+        worker("http://w1", WorkerType::Regular),
+        worker("http://w2", WorkerType::Regular),
+    ];
+    let mut cfg = config(
+        "",
+        vec![
+            source("http://w1", "tcp://w1:1"),
+            source("http://w2", "tcp://w2:1"),
+        ],
+    );
+    cfg.profiles.get_mut("m").unwrap().token_source = TokenSource::LocalTokenizer;
+    let runtime =
+        Runtime::new_with_tokenizer_registry(cfg, reqwest::Client::new(), tokenizer_registry)
+            .unwrap();
+    let registry = Arc::new(WorkerRegistry::new());
+    for worker in &workers {
+        registry.register(worker.clone());
+        seed(&runtime, worker);
+    }
+    let policies = Arc::new(PolicyRegistry::new(PolicyConfig::PreKvCache));
+    policies.install_pre_kv_cache(runtime.clone());
+    let scheduler = Scheduler::new(registry, policies.clone());
+    let request = KvRequest::new(
+        "/v1/chat/completions/render",
+        json!({"model":"m","messages":[{"role":"user","content":"hello"}]}),
+    );
+    let input = SchedulerInput {
+        kv_request: Some(&request),
+        model_id: Some("m"),
+        endpoint: Endpoint::Chat,
+        request_text: Some("hello"),
+        token_ids: None,
+        headers: None,
+    };
+    let output = LogWriter::default();
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || writer.clone())
+        .finish();
+
+    async {
+        for expected in [Some(4), None, Some(0)] {
+            for subscription in runtime.subscriptions.read().values() {
+                let mut state = subscription.state.lock();
+                if expected.is_none() {
+                    state.stream.last_event = Some(Instant::now() - Duration::from_secs(60));
+                } else if expected == Some(0) {
+                    state.stream.index.clear();
+                    state.stream.last_event = Some(Instant::now());
+                }
+            }
+            scheduler.schedule(&input).await.unwrap();
+            assert_eq!(request.selected_cached_tokens(), expected);
+            request.finish_attempt(false);
+        }
+
+        // Scaling down to one worker still reports coverage from the existing
+        // tokens without running load scoring or creating a reservation.
+        let singleton = Arc::new(WorkerRegistry::new());
+        singleton.register(workers[0].clone());
+        seed(&runtime, &workers[0]);
+        Scheduler::new(singleton, policies)
+            .schedule(&input)
+            .await
+            .unwrap();
+        assert_eq!(request.selected_cached_tokens(), Some(4));
+        assert!(request.reservations.lock().is_empty());
+        assert!(runtime
+            .loads
+            .lock()
+            .values()
+            .all(|load| load.credits.is_empty()));
+
+        // The logging helper alone cannot initialize a fresh tokenization.
+        let fresh = KvRequest::new(
+            "/v1/chat/completions/render",
+            json!({"model":"m","messages":[]}),
+        );
+        runtime.record_single_worker_cache(&workers[0], &fresh);
+        assert_eq!(fresh.selected_cached_tokens(), None);
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    let logs = String::from_utf8(output.0.lock().clone()).unwrap();
+    let scheduled: Vec<Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|entry| entry["fields"]["message"] == "Request scheduled to worker")
+        .collect();
+    assert_eq!(scheduled.len(), 4);
+    for (entry, ratio) in scheduled
+        .iter()
+        .zip(["0.8000", "unknown", "0.0000", "0.8000"])
+    {
+        assert_eq!(entry["level"], "INFO");
+        assert_eq!(entry["fields"]["context_tokens"], "5");
+        assert_eq!(entry["fields"]["cache_hit_ratio"], ratio);
+        assert!(entry["fields"].get("input_tokens").is_none());
+    }
+    assert_eq!(tokenizer.encode_calls.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

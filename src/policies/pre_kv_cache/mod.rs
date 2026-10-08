@@ -67,6 +67,33 @@ impl Subscription {
         metrics::gauge!("pre_kv_cache_index_blocks", "worker" => self.source.worker_url.clone())
             .set(0.0);
     }
+
+    // Use the same residency validity checks for selection and logging.
+    fn cached_tokens(
+        &self,
+        worker: &Arc<dyn Worker>,
+        input: &render::Rendered,
+        block_size: usize,
+        event_stale_ms: u64,
+    ) -> Option<usize> {
+        let state = self.state.lock();
+        let current = state
+            .binding
+            .as_ref()
+            .is_some_and(|bound| Arc::ptr_eq(bound, worker));
+        if current
+            && !self.stop.load(Ordering::Acquire)
+            && !state.stream.unsupported
+            && state
+                .stream
+                .last_event
+                .is_some_and(|t| t.elapsed() <= Duration::from_millis(event_stale_ms))
+        {
+            Some(state.stream.index.matched_keys(&input.keys, block_size))
+        } else {
+            None
+        }
+    }
 }
 
 pub struct Runtime {
@@ -181,6 +208,32 @@ impl Runtime {
             .await
             .ok()
             .map(|rendered| rendered.tokens.len())
+    }
+
+    /// Observe a single local-tokenizer worker using the existing request tokens.
+    /// Keep the fast path free of tokenization, HTTP calls and load reservations.
+    pub(crate) fn record_single_worker_cache(&self, worker: &Arc<dyn Worker>, request: &KvRequest) {
+        if worker.metadata().runtime_type != BackendType::Vllm
+            || matches!(worker.worker_type(), WorkerType::Decode)
+        {
+            return;
+        }
+        let subscription = self.subscriptions.read().get(worker.url()).cloned();
+        let cached = subscription.and_then(|subscription| {
+            let name = &subscription.source.profile;
+            let profile = &self.config.profiles[name];
+            if profile.token_source != TokenSource::LocalTokenizer {
+                return None;
+            }
+            let input = request.cached_input(name)?;
+            subscription.cached_tokens(
+                worker,
+                &input,
+                profile.block_size,
+                self.config.event_stale_ms,
+            )
+        });
+        request.set_selected_cached_tokens(cached);
     }
 
     fn start_subscription(&self, subscription: &Subscription, registry: &Arc<WorkerRegistry>) {
@@ -335,28 +388,21 @@ impl Runtime {
             let input = source
                 .and_then(|s| rendered.get(&s.profile))
                 .and_then(|r| r.as_ref());
+            let mut cache_state_valid = false;
             let total = input
                 .map(|r| r.tokens.len())
                 .unwrap_or(cost.mean_uncached_tokens);
             let mut cached = 0;
             if let (Some(_), Some(input), Some(profile)) = (source, input, profile) {
                 let subscription = subscription.unwrap();
-                let state = subscription.state.lock();
-                let current = state
-                    .binding
-                    .as_ref()
-                    .is_some_and(|bound| Arc::ptr_eq(bound, worker));
-                if current
-                    && !subscription.stop.load(Ordering::Acquire)
-                    && !state.stream.unsupported
-                    && state.stream.last_event.is_some_and(|t| {
-                        t.elapsed() <= Duration::from_millis(self.config.event_stale_ms)
-                    })
-                {
-                    cached = state
-                        .stream
-                        .index
-                        .matched_keys(&input.keys, profile.block_size);
+                if let Some(tokens) = subscription.cached_tokens(
+                    worker,
+                    input,
+                    profile.block_size,
+                    self.config.event_stale_ms,
+                ) {
+                    cached = tokens;
+                    cache_state_valid = true;
                 } else {
                     metrics::counter!("pre_kv_cache_fallback_total", "reason" => "event_state_unavailable").increment(1);
                 }
@@ -367,6 +413,7 @@ impl Runtime {
                 total,
                 cached,
                 source.map(|s| s.speed).unwrap_or(1.0),
+                cache_state_valid,
             ));
         }
         // Hold the load lock through selection and credit: concurrent requests
@@ -387,7 +434,7 @@ impl Runtime {
         }
         let baseline = choices
             .iter()
-            .filter_map(|(i, c, _, _, speed)| {
+            .filter_map(|(i, c, _, _, speed, _)| {
                 let s = loads
                     .get(workers[*i].url())?
                     .snapshot
@@ -397,9 +444,9 @@ impl Runtime {
             })
             .reduce(f64::min)
             .unwrap_or(0.0);
-        let mut best: Option<(usize, f64, usize, usize)> = None;
+        let mut best: Option<(usize, f64, usize, usize, bool)> = None;
         let mut tied = 0;
-        for (i, cost, total, cached, speed) in choices {
+        for (i, cost, total, cached, speed, cache_state_valid) in choices {
             let state = loads.entry(workers[i].url().to_string()).or_default();
             let snapshot = state
                 .snapshot
@@ -419,16 +466,16 @@ impl Runtime {
                 baseline,
             );
             if best.is_none_or(|b| score < b.1) {
-                best = Some((i, score, total, cached));
+                best = Some((i, score, total, cached, cache_state_valid));
                 tied = 1;
             } else if best.is_some_and(|b| (score - b.1).abs() < 1e-9) {
                 tied += 1;
                 if rand::rng().random_range(0..tied) == 0 {
-                    best = Some((i, score, total, cached));
+                    best = Some((i, score, total, cached, cache_state_valid));
                 }
             }
         }
-        let (selected, score, total, cached) = best?;
+        let (selected, score, total, cached, cache_state_valid) = best?;
         if let Some(request) = request {
             let id = self.next_credit.fetch_add(1, Ordering::Relaxed);
             let url = workers[selected].url().to_string();
@@ -452,10 +499,14 @@ impl Runtime {
         metrics::histogram!("pre_kv_cache_selected_cached_tokens").record(cached as f64);
         metrics::histogram!("pre_kv_cache_selected_cost_ms").record(score);
         metrics::counter!("pre_kv_cache_selections_total", "worker" => workers[selected].url().to_string()).increment(1);
+        // Record only coverage measured with exact tokens and a valid event
+        // index. A fallback is unknown, not a measured zero-hit request.
+        if let Some(request) = request {
+            request.set_selected_cached_tokens(cache_state_valid.then_some(cached));
+        }
         tracing::debug!(
             worker_url = workers[selected].url(),
             cached_tokens = cached,
-            input_tokens = total,
             estimated_cost_ms = score,
             "pre_kv_cache selected worker"
         );

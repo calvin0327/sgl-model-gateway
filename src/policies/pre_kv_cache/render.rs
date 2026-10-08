@@ -27,6 +27,9 @@ pub struct KvRequest {
     path: &'static str,
     payload: Value,
     inputs: Mutex<HashMap<String, Arc<OnceCell<RenderResult>>>>,
+    // Keep the selected worker's cached prefix for the scheduler log without
+    // re-tokenizing the request or adding another token-count field.
+    selected_cached_tokens: Mutex<Option<usize>>,
     pub(super) reservations: Mutex<Vec<Reservation>>,
 }
 
@@ -45,8 +48,33 @@ impl KvRequest {
             path,
             payload,
             inputs: Mutex::new(HashMap::new()),
+            selected_cached_tokens: Mutex::new(None),
             reservations: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn clear_selected_cached_tokens(&self) {
+        *self.selected_cached_tokens.lock() = None;
+    }
+
+    pub(crate) fn set_selected_cached_tokens(&self, cached_tokens: Option<usize>) {
+        *self.selected_cached_tokens.lock() = cached_tokens;
+    }
+
+    pub(crate) fn selected_cached_tokens(&self) -> Option<usize> {
+        *self.selected_cached_tokens.lock()
+    }
+
+    // Logging may reuse tokens already computed for length routing, but must
+    // never initialize tokenization or render solely to observe a single worker.
+    pub(super) fn cached_input(&self, profile: &str) -> Option<Arc<Rendered>> {
+        self.inputs
+            .lock()
+            .get(profile)?
+            .get()?
+            .as_ref()
+            .ok()
+            .cloned()
     }
 
     /// A successful dispatch remains credited until a newer backend poll.
