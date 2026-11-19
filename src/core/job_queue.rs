@@ -10,7 +10,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
 use wfaas::WorkflowId;
 
@@ -101,7 +101,7 @@ impl Default for JobQueueConfig {
 /// Job queue manager for worker validation and removal operations
 pub struct JobQueue {
     /// Channel for submitting jobs
-    tx: mpsc::Sender<Job>,
+    tx: mpsc::Sender<QueuedJob>,
     /// Weak reference to AppContext to avoid circular dependencies
     context: Weak<AppContext>,
     /// Job status tracking by worker URL
@@ -110,6 +110,13 @@ pub struct JobQueue {
     concurrency_limit: Arc<Semaphore>,
     /// Router manager injected after application startup.
     router_manager: Arc<OnceLock<Arc<RouterManager>>>,
+}
+
+// Discovery needs the actual completion result to order add/remove operations.
+// Ordinary API jobs retain their existing fire-and-forget behavior.
+struct QueuedJob {
+    job: Job,
+    completion: Option<oneshot::Sender<Result<String, String>>>,
 }
 
 impl std::fmt::Debug for JobQueue {
@@ -150,7 +157,7 @@ impl JobQueue {
         let sem = concurrency_limit.clone();
 
         tokio::spawn(async move {
-            while let Some(job) = rx.recv().await {
+            while let Some(queued) = rx.recv().await {
                 // Acquire permit (blocks if at concurrency limit)
                 let Ok(permit) = sem.clone().acquire_owned().await else {
                     error!("Semaphore closed, stopping dispatcher");
@@ -161,7 +168,17 @@ impl JobQueue {
                 let status_clone = status.clone();
 
                 tokio::spawn(async move {
-                    Self::process_job(job, ctx_clone, status_clone, permit).await;
+                    let result = Self::process_job(
+                        queued.job,
+                        ctx_clone,
+                        status_clone,
+                        permit,
+                        queued.completion.is_some(),
+                    )
+                    .await;
+                    if let Some(completion) = queued.completion {
+                        let _ = completion.send(result);
+                    }
                 });
             }
 
@@ -196,6 +213,23 @@ impl JobQueue {
 
     /// Submit a job with detailed queue status
     pub async fn submit(&self, job: Job) -> Result<(), String> {
+        self.enqueue(job, None).await
+    }
+
+    pub(crate) async fn submit_with_completion(
+        &self,
+        job: Job,
+    ) -> Result<oneshot::Receiver<Result<String, String>>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(job, Some(tx)).await?;
+        Ok(rx)
+    }
+
+    async fn enqueue(
+        &self,
+        job: Job,
+        completion: Option<oneshot::Sender<Result<String, String>>>,
+    ) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
         if self.context.upgrade().is_none() {
             return Err("Job queue shutting down: AppContext dropped".to_string());
@@ -211,7 +245,7 @@ impl JobQueue {
             JobStatus::pending(job_type, &worker_url),
         );
 
-        match self.tx.send(job).await {
+        match self.tx.send(QueuedJob { job, completion }).await {
             Ok(_) => {
                 let (queue_depth, available_permits) = self.get_load_info();
                 debug!(
@@ -248,7 +282,8 @@ impl JobQueue {
         context: Weak<AppContext>,
         status_map: Arc<DashMap<String, JobStatus>>,
         _permit: tokio::sync::OwnedSemaphorePermit,
-    ) {
+        wait_for_terminal: bool,
+    ) -> Result<String, String> {
         let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
         let start = std::time::Instant::now();
@@ -264,9 +299,10 @@ impl JobQueue {
         // Execute job
         match context.upgrade() {
             Some(ctx) => {
-                let result = Self::execute_job(&job, &ctx).await;
+                let result = Self::execute_job(&job, &ctx, wait_for_terminal).await;
                 let duration = start.elapsed();
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
+                result
             }
             None => {
                 let error_msg = "AppContext dropped".to_string();
@@ -279,14 +315,17 @@ impl JobQueue {
                     resource = %worker_url,
                     "AppContext dropped; cannot process job"
                 );
+                Err("AppContext dropped".to_string())
             }
         }
-
-        // Permit automatically released when dropped
     }
 
     /// Execute a specific job
-    async fn execute_job(job: &Job, context: &Arc<AppContext>) -> Result<String, String> {
+    async fn execute_job(
+        job: &Job,
+        context: &Arc<AppContext>,
+        wait_for_terminal: bool,
+    ) -> Result<String, String> {
         let router_manager = context
             .worker_job_queue
             .get()
@@ -299,8 +338,14 @@ impl JobQueue {
                     .get()
                     .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
-                let timeout_duration =
-                    Duration::from_secs(context.config.workers.startup_timeout_secs + 30);
+                // A waiter timeout does not stop the workflow. Discovery must
+                // see its terminal state before starting a removal; each step
+                // still has its own timeout and bounded retries.
+                let timeout_duration = if wait_for_terminal {
+                    Duration::MAX
+                } else {
+                    Duration::from_secs(context.config.workers.startup_timeout_secs + 30)
+                };
 
                 let workflow_data = create_local_worker_workflow_data(
                     (**config).clone(),
@@ -381,7 +426,11 @@ impl JobQueue {
                     url, instance_id
                 );
 
-                let timeout_duration = Duration::from_secs(30);
+                let timeout_duration = if wait_for_terminal {
+                    Duration::MAX
+                } else {
+                    Duration::from_secs(30)
+                };
 
                 let result = engines
                     .worker_removal

@@ -403,6 +403,15 @@ PD mode accepts dedicated selectors:
 ```
 Prefill pods can expose bootstrap ports via the `sglang.ai/bootstrap-port` annotation. RBAC must allow `get`, `list`, and `watch` on pods.
 
+Discovery tracks Pod namespace/name and UID independently of readiness or IP.
+Deletion events, termination timestamps, selector removal, and completed relists
+unregister discovery-owned workers. Add/remove jobs for a Pod finish in order;
+failed operations retain state for retry. Existing static/API workers are not
+adopted by discovery. Registry removal stops subsequent health-check rounds and
+the automatic pre-KV subscription is removed on its next reconciliation tick.
+An already-running probe may still finish after removal. Explicit KV event-source
+mappings retain their configured lifecycle.
+
 ## Data Plane
 
 ### Router Capabilities (HTTP & gRPC)
@@ -606,6 +615,416 @@ Supported tool parsers: `json`, `python`, `xml`.
 - `pre_kv_cache`: uses vLLM KV events, exact token-block prefixes, and worker load. Configure a single discovered profile with `--pre-kv-cache-profile`, `--pre-kv-cache-model`, `--pre-kv-cache-block-size`, and optional `--pre-kv-cache-token-source`; advanced configurations can use `--pre-kv-cache-config`, `--pre-kv-cache-config-json`, or `PRE_KV_CACHE_CONFIG_JSON`.
 - `power_of_two`: chooses the lighter worker among two random candidates; integrates with `LoadMonitor`.
   Per-model overrides are available in PD mode (`--prefill-policy`, `--decode-policy`) and IGW mode via the worker registry.
+
+### Local tokenizer compatibility
+
+The pinned `llm-tokenizer 1.9.0` recognizes `DeepseekV41ForCausalLM` and
+`model_type: deepseek_v41`, including checkpoints without a Jinja chat template.
+The Gateway adapts V4.1 options to vLLM 0.31 semantics: effort budgets
+`low/high/xhigh/max = 50/75/75/100`, default `high`, top-level effort precedence,
+OR of the thinking switches, `none` forcing thinking off, and history-message
+`reasoning` overriding `reasoning_content` (including null). A null thinking
+switch retains the default observed in `v0.31.0-cu129-fixed`. Detection uses the
+loaded tokenizer's local `config.json`, never the arbitrary profile name, and
+caches the result per loaded instance. Local tokenization still runs once and
+serves both length routing and cache routing, without calling backend `/render`.
+Unsupported options or unavailable native-model metadata produce WARN and a
+safe routing fallback. The regression suite checks prompt construction; full
+token-ID parity with the actual checkpoint must still be verified on deployment.
+
+### V4.1 cache layout without a worker extension
+
+For the measured DeepSeek-V4.1-Flash deployment, keep the existing profile,
+served model, tokenizer path and event-source options. No new option is needed:
+
+```bash
+--pre-kv-cache-token-source local_tokenizer \
+--pre-kv-cache-block-size 64
+```
+
+The background resolver uses the served model's registered tokenizer and its
+local `config.json` to identify `DeepseekV41ForCausalLM` / `deepseek_v41`. With
+`local_tokenizer`, block size `64`, and no explicit layout or manual groups, it
+automatically selects `deepseek_v41_vllm031_dspark5` and logs the selection at
+INFO. A tokenizer registered after worker startup is picked up on the next
+background check (within five seconds). Profile names and served aliases are
+not used as model-type heuristics; another model's sole registered tokenizer
+cannot trigger this selection.
+
+This mode needs no worker wheel, middleware, mount or metadata HTTP polling.
+Recognition reuses cached model metadata, performs no encoding, and stays off
+the inference request path. Request tokens still come from the local tokenizer;
+the Router continues subscribing to live KV events and using replay to rebuild
+residency. A layout describes how to interpret events, not which blocks are
+currently resident.
+
+This preset records the scheduler layout collected on 2026-10-12 from
+`vllm-openai:v0.31.0-cu129-fixed`, with TP=8, DP/DCP/PCP=1, DSpark with five
+speculative tokens, prefix retention interval 0, partial hash hits disabled,
+and Mooncake disabled. Hash, scheduler and alignment blocks are all 64 tokens.
+It contains all ten groups: groups 0–7 are non-prefix-cacheable SWA MLA with
+32-token blocks and a 128-token window; group 8 is prefix-cacheable full MLA
+with 64-token blocks; group 9 is a non-prefix-cacheable circular buffer with
+8-token blocks. The hybrid coordinator looks up only `[[8]]`, its effective
+`use_eagle` is false, and its prefix replay tail is 128 tokens. The tail is
+backend SWA reconstruction, separate from the event publisher's replay port.
+
+Automatic selection applies this known deployment contract; it does not discover
+arbitrary V4.1 scheduler layouts. Before reporting hits it also requires a valid
+local group-8 Store event with the expected block size and attention type. Empty
+batches and auxiliary-group events alone leave the cache ratio unknown. Events
+cannot verify all scheduler settings; a changed checkpoint, worker image, speculative-decoding
+configuration, parallelism or cache configuration requires collecting and
+checking the layout again. Unsupported event groups and incompatible cacheable
+group metadata produce WARN and a safe fallback. Do not assume that every
+change to a skipped auxiliary group is detectable through events. Repeated
+background recognition preserves the index and any sticky compatibility error;
+tokenizer removal/replacement or worker replacement clears automatic residency.
+
+`--pre-kv-cache-layout deepseek_v41_vllm031_dspark5` remains an optional explicit
+override (JSON: `"layout": "deepseek_v41_vllm031_dspark5"`), not a requirement.
+It requires `local_tokenizer` and block size `64`, and cannot be combined with
+manual `cache_groups` / `--pre-kv-cache-groups`. Explicit layouts and manual
+groups are never overwritten by automatic model recognition.
+
+Inspect the Router through its business address:
+
+```bash
+curl -fsS "$ROUTER_URL/v1/pre-kv-cache/status" | python3 -m json.tool
+```
+
+Automatically adapted workers report `layout_source: "automatic_builtin"`, the
+selected `layout_preset`, and `layout_events_confirmed` for the observed group-8
+signature. Explicit presets report `layout_source: "builtin_preset"`. Both
+report `layout_engine_verified: false` and `layout_age_ms: null`.
+Their layout's `engine_id` is empty because the Router did not obtain a live
+engine identity. Event freshness, resident blocks and active warnings are
+still reported and checked; a preset never makes a stale index valid. Verify
+token-ID parity and predicted cache hits against the actual backend before
+interpreting performance results.
+
+### Optional automatic runtime cache groups
+
+Deployments without a recognized built-in adapter retain automatic metadata
+discovery. The following optional worker bridge exposes actual runtime layouts;
+the recognized V4.1 configuration above does not require or poll it. Do not configure group IDs
+by hand or infer a complete layout from observed events. The vLLM 0.31 engine
+has an internal `get_kv_cache_group_metadata` method, but its standard HTTP API
+does not expose the complete lookup contract (including DSpark's effective
+last-block-drop rules).
+
+Install the small metadata bridge on each vLLM worker, using its existing Python
+environment, and append one option to its existing `vllm serve` command:
+
+```bash
+pip install --no-deps /path/to/smg_vllm_kv_metadata-0.1.0-py3-none-any.whl
+# Append to the existing vllm serve command:
+--middleware smg_vllm_kv_metadata.KVMetadataMiddleware
+```
+
+The wheel is built from `integrations/vllm_kv_metadata`. If `VLLM_PLUGINS` is set,
+include `smg_kv_metadata` in that allowlist. The bridge reads actual scheduler
+metadata through vLLM's internal engine IPC; it does not enable the development
+RPC API. Its read-only `/v1/pre-kv-cache/metadata` endpoint preserves existing
+API-key authentication. Normal inference requests pass through directly.
+
+In this dynamic mode the Router fetches metadata in the background every five seconds; no
+metadata HTTP request or backend `/render` runs in the inference request path.
+`--pre-kv-cache-groups` is unnecessary. Each engine's complete layout includes
+cacheable groups, physical/hash block sizes, lookup order, sliding windows and
+effective speculative-decoding flags. Layout or engine changes clear residency
+and reconnect the event stream; missing or incompatible metadata produces WARN
+and `cache_hit_ratio=unknown`, never an invented layout. The profile block size
+must match the backend hash block size.
+
+Matching follows vLLM's common-prefix search across full-attention/MLA, RSWA and
+sliding-window groups, including DSpark/EAGLE block drops and mixed physical
+block sizes. Only local GPU residency counts; Mooncake remote/CPU/storage hits
+are not included. Unsupported managers, partial-block lookup and DCP/PCP/DP > 1
+produce an explicit compatibility warning. TP > 1 is supported. Sparse events
+resolve physical hashes through verified content ancestry; missing history
+never becomes a positive hit. The unit tests cover the upstream search rules;
+the actual V4.1 checkpoint's token IDs and custom worker build must still be
+verified in deployment.
+
+The same status endpoint reports `layout_source: "vllm_engine"`, the complete `runtime_layout`,
+`layout_error`, event freshness, resident blocks and active warnings. In contrast,
+`observed_groups` only describes sampled events; `observed_groups_are_complete`
+remains false. A status query alone cannot expose engine metadata on an old
+worker that has no bridge. Older single-group models retain their existing
+configuration without requiring this extension.
+
+A subscription log only confirms socket setup. `pre_kv_cache event stream active`
+requires accepted events. If none have been received since binding the worker,
+`no_kv_events` emits WARN after `event_stale_ms` (default 30 seconds). The legacy
+configuration name remains accepted, but this interval is only an initial
+diagnostic threshold: it never expires confirmed cache residency. An idle worker
+may have no cache changes to publish. Use a new prompt prefix when checking a
+fresh worker's event publisher.
+
+Confirmed cache residency stays usable during silence, matching llm-d's event
+index model. Only cache events or actual stream/worker failures change it.
+Disconnects, worker/layout replacement and sequence gaps invalidate serving
+state. For a forward gap, a verified checkpoint is replayed from its next missing
+sequence, including removals through the live boundary. Missing parents also
+trigger a background rebuild, even when event sequence numbers are continuous.
+
+Subscriptions start with live events; startup and automatic layout detection
+do not trigger replay. Valid new root chains work immediately. Existing cached
+prefixes that never emit another event remain unknown until observed or recovered.
+Replay starts for a sequence gap, missing ancestry, or the request-driven silent
+stream check described below. Gap/ancestry recovery performs one recovery per
+worker at a time, with at most eight across the Router, a two-minute
+budget, a two-second idle limit per attempt and three consecutive no-progress
+attempts. Interior gaps and interrupted responses resume from the missing sequence
+using a fresh DEALER identity; the vLLM protocol accepts a start sequence only,
+not a range or batch limit. Receive buffering is bounded to 10,000 messages and
+never substitutes for sequence validation. Transient failures retain private
+progress and retry on a timer after 30/60/120/240/300 seconds, capped at 300.
+Replay runs outside the request path and index lock; rebuilt state is committed
+only after validating continuity, worker/layout identity and the connection.
+The vLLM replay end marker (empty topic, signed sequence -1, empty payload) is
+handled as a control frame before checking event topics. An end marker never
+makes a gapped history complete; event frames still require the configured topic.
+A failed rebuild leaves only verified live branches available for routing.
+If the first replay event starts after the requested sequence, the old checkpoint
+is discarded and `history_truncated_at` records the start of a partial suffix.
+This is evidence of unavailable history, not proof of eviction rather than packet
+loss. Roots in that suffix can be indexed; missing ancestors remain misses and
+`history_complete` remains false until an authoritative clear or complete rebuild.
+Successful partial recovery does not repeatedly request the missing beginning.
+A bounded replay buffer is not a cache snapshot. Do not clear the worker cache
+merely to silence a warning during a benchmark.
+
+A selected request with exact tokens and zero/unknown cache match also records
+a background progress hint. If no live frame arrives for two seconds, the
+subscriber renews its silent SUB connection without discarding the index, waits
+two seconds for subscription propagation, then checks replay from the next
+missing sequence (zero if no events have been indexed). This requires no later
+live frame to reveal a gap. The renewed SUB stays open during and after replay.
+Progress checks run separately from live receipt, with an eight-second total
+budget, two-second receive-idle limit, 10,000-frame cap, and aggregate payload
+limit of `max_response_bytes`. They share the eight global replay slots. A reply
+is applied only if its sequence is continuous and the worker/layout, connection,
+live receipt counter and indexed sequence have not changed while it was read.
+An empty reply or a replay transport failure preserves existing cache evidence;
+live events can still update the index while replay is unavailable. Invalid
+event contracts and confirmed truncated histories still follow the conservative
+validation rules above. No cache residency is inferred from a successful request.
+
+Progress checks are at least 30 seconds apart. Failures back off through
+30/60/120/240/300 seconds; checks stop five minutes after the last selected miss,
+or when valid live progress resolves the hint. Normal idle workers and known
+positive matches do not start checks. Without a replay endpoint, only subscription
+renewal is attempted. An unresolved progress failure logs one deduplicated
+`event_progress_unavailable` warning; it does not disable the live subscriber.
+Status exposes `progress_check_in_progress`, `progress_checks`,
+`progress_recovered_frames`, `last_progress_check_age_ms`, and
+`last_progress_error`. Live frame counters remain live-only, so a successful
+history repair can advance `last_sequence` without increasing
+`received_event_frames`. If the publisher supplies neither usable live events
+nor retained replay history, the Router still cannot reconstruct missing keys.
+
+INFO logs `pre_kv_cache replay started` and `pre_kv_cache replay completed` report
+the sequence range and rebuilt block count. The status field `history_complete`
+distinguishes verified complete history from a usable subset. `event_state_usable`
+reports whether the bound stream/layout can supply cache evidence; request-specific
+token/key validation still applies. `event_state_fresh` and
+`last_valid_event_age_ms` remain observational: an idle index can be usable even
+when `event_state_fresh` is false. Replay failures and `missing_parent` remain
+visible until recovery is verified. These rules require no new startup options
+and preserve local tokenization and the KV/load scoring formula.
+
+Unknown Store identities (for example unsupported extra-key structures or LoRA)
+are isolated at the first affected block, including descendants across groups.
+They do not disable the worker or prevent unrelated Stores, Removes and Clears
+from being applied. Dense Stores retain only a verified prefix; sparse spans with
+uncertain alignment are skipped. Extra keys are never stripped to manufacture a
+plain-text key. Conflicting hash mappings, unknown deletion formats and incompatible
+layouts still invalidate unsafe residency. This follows llm-d's per-Store failure
+isolation while retaining stricter identity validation for exact text matching.
+
+The status endpoint adds `skipped_stores`, `skipped_blocks`, `last_skipped_store`
+and `isolated_hashes`. The last sample contains bounded type/length information,
+not prompt tokens, salt values or binary contents. Counters describe the current
+index generation; recovery or worker replacement can reset them. The exact
+isolation dictionary is bounded to at most 65,536 hashes (also limited by the
+configured index capacity). When full, evicted rejections enter a fixed 1 MiB
+Bloom filter and `isolation_overflow` becomes true. False positives can only
+reduce coverage; old rejected identities are never silently accepted. A genuine
+index reset clears both structures. `history_complete` describes event sequence
+coverage, not support for every request identity. `unsupported_cache_identity`
+warns once while partial coverage persists; it is not a worker-wide failure.
+
+For receive/index stalls, compare `last_received_sequence` and
+`last_received_event_age_ms` with `last_sequence` and `last_valid_event_age_ms`.
+`received_event_frames`, `duplicate_event_frames`, `event_apply_failures`,
+`subscription_running`, `connection_generation`, `last_connection_event` and
+`replay_in_progress` distinguish receipt, filtering, indexing and recovery.
+Receipt counters are cumulative within the subscription; received frames include
+malformed frames. `connecting` means socket setup, not a confirmed connection.
+Live and replay sequence watermarks are separate: a live regression invalidates
+the old incarnation before replay-overlap filtering. Failed subscriber tasks are
+supervised and restarted after invalidating old residency.
+
+Index capacity is reclaimed entry by entry. `max_blocks_per_worker` bounds
+resident `(group, hash)` entries and a separate cache of nonresident ancestors
+(each defaults to 500,000 entries). Resident identities are protected from
+historical churn; unused ancestors use LRU eviction. If residency itself exceeds
+its budget, the least recently stored local entry is dropped, causing a
+conservative miss rather than a stream reset. `known_blocks` is bounded by twice
+the configured limit; `ancestry_evictions` and `residency_evictions` expose local
+capacity reclamation. These are entry limits, not byte limits.
+
+`event_apply_failures` counts live batches with an actual processing failure.
+A previously skipped orphan does not fail later valid batches. `last_error`
+describes the latest apply result; `history_missing_ancestry` and
+`history_complete` retain the separate coverage information. Incompatible
+protocol/layout state lasts for the current publisher epoch: reconnect, sequence
+restart or an authoritative clear rebuilds from empty state and revalidates
+events. A merely well-formed Store on the same incompatible stream cannot revive
+old residency. Missing optional group fields use current-epoch observations or
+an explicit runtime/manual contract; explicit contradictions still fail closed.
+
+`pre_kv_cache_selected_cached_tokens` records measured matches only, including
+real zeroes. Unknown selections are counted separately by
+`pre_kv_cache_selected_cache_state_total{state="unknown"}` (and `state="known"`
+for measured selections). These selection metrics cover the cost-scoring path;
+single-candidate scheduling continues to bypass scoring. Engine running/waiting
+counts are summed, but KV occupancy ratios use the maximum engine value. When
+load metrics are unavailable, the fallback uses the largest last-observed peer
+cost plus local in-flight load; it is an estimate, not an upper bound on direct
+backend traffic. Fresh load measurements and the KV/load formula are unchanged.
+
+TCP keepalive uses idle=60 seconds, interval=15 seconds and count=3 on SUB/DEALER
+sockets. It probes connections without expiring quiet cache entries or starting
+replay during normal silence. It cannot detect a stuck application publisher on
+an otherwise healthy connection. No new startup flags or Worker installation are
+required. Requests sent directly to a shared Worker still affect its events,
+cache residency and backend load. A Router inference test competes for that same
+capacity; status-only inspection does not submit an inference request.
+
+### Pre-KV-cache importance and failure visibility
+
+For a single discovered profile, set these options alongside the existing
+`--pre-kv-cache-profile`, model, block size and event-source options:
+
+```bash
+--pre-kv-cache-token-source local_tokenizer \
+--pre-kv-cache-kv-importance 1 \
+--pre-kv-cache-load-importance 1 \
+--pre-kv-cache-log-decisions
+```
+
+Both importance values default to `1`, preserving the existing scoring formula.
+They accept numbers from `0` to `1000`, including fractions, and cannot both be
+zero. The upper bound prevents extreme multipliers from overflowing ordinary
+cost estimates. Higher `kv_importance` gives more importance to avoiding
+uncached work; higher `load_importance` gives more importance to avoiding busy
+workers. They are relative multipliers and need not sum to one or 100. Scaling
+both equally preserves ordering within a profile. The lowest estimated cost
+wins inside the existing healthy, eligible worker pool:
+
+```text
+score = kv_importance * uncached_prefill_ms
+      + load_importance * (backend_or_fallback_load_ms + reservation_ms)
+```
+
+Adjust both values atomically at runtime through the same authenticated admin
+routes as worker management. The URL uses the profile name, not the served model:
+
+```bash
+curl -sS "$ROUTER_URL/v1/pre-kv-cache/weights/deepseek_v41"
+curl -sS -X PUT "$ROUTER_URL/v1/pre-kv-cache/weights/deepseek_v41" \
+  -H 'Content-Type: application/json' \
+  -d '{"kv_importance":2,"load_importance":1}'
+```
+
+Include the usual Authorization header when authentication is enabled. Each
+selection uses one consistent snapshot for every candidate. Updates take effect
+on subsequent selections without re-tokenization or resetting subscriptions,
+indices or load reservations. They are process-local and in memory: configure
+each Gateway replica separately, and set startup CLI/JSON values to persist
+across restarts. Invalid values leave the existing pair unchanged (HTTP 400);
+unknown profiles return 404 and an unconfigured runtime returns 503.
+
+The KV term estimates the work remaining after the cached prefix. The load term
+includes backend waiting/running requests, KV-cache occupancy pressure, and
+Router reservations for dispatches not yet reflected in a load poll. When
+backend metrics are missing or stale, the fallback uses Router in-flight
+requests plus the largest last-observed peer load estimate (zero if none).
+`kv_importance=0` ignores the current request's cache savings in scoring;
+`load_importance=0` ignores both observed load and reservations. Health checks,
+pool eligibility and tokenization behavior are unchanged.
+
+`--pre-kv-cache-log-decisions` is optional and off by default. It emits one INFO
+`pre_kv_cache candidate score` event per candidate, correlated through the
+request span. Fields include `selected`, `cache_state_valid`, `kv_importance`,
+`load_importance`, `load_source`, `waiting_requests`, `running_requests`,
+`kv_usage_ratio`, `load_sample_age_ms`, `local_in_flight`, `pending_tokens`,
+`uncached_prefill_ms`, `backend_or_fallback_load_ms`, `reservation_ms`,
+`weighted_kv_ms`, `weighted_load_ms`, and `estimated_cost_ms`.
+`load_source=local_fallback` means backend load gauges are unavailable; backend
+gauge fields are then absent. If only the occupancy gauge is missing or invalid,
+the queue/running gauges still apply, the pressure term retains its existing
+zero default, and `kv_usage_ratio` is omitted rather than reporting a measured
+zero. KV occupancy is not GPU compute utilization.
+One eligible worker logs `pre_kv_cache scoring bypassed reason=single_candidate`
+and keeps the fast path without a reservation or additional tokenization.
+
+Compare candidate differences to understand a load-induced routing change:
+if worker A saves 200 estimated ms of prefill but adds 300 weighted ms of load,
+worker B can win despite less cache. `weighted_load_ms / estimated_cost_ms`
+describes one candidate's score composition, not a load limit or traffic share.
+These costs use initial coefficients, not measured TTFT; start with `1/1`, then
+hold KV importance at `1` and compare load importance `0.5`, `1`, and `2` on identical
+workloads. Validate TTFT, TPOT, throughput, waiting requests and actual backend
+cache hits. Turn off detailed decision logs for final performance comparisons
+because log volume grows with requests times candidates.
+
+For JSON/file configuration, set `profiles.<name>.cost.kv_importance` and
+`profiles.<name>.cost.load_importance`, and the top-level `log_decisions` boolean.
+Structured CLI options cannot be mixed with JSON/file configuration.
+The previous CLI names `--pre-kv-cache-kv-weight` and
+`--pre-kv-cache-load-weight`, and JSON fields `kv_weight` and `load_weight`,
+remain accepted aliases with the same range validation. Use only one spelling
+per setting. Startup and decision logs use the new importance names.
+
+Runtime degradation emits WARN at the ordinary `info` log level, with `scope`,
+`reason` and `detail`; no debug switch or decision-log switch is required.
+The same unresolved scope/reason warns once and remains visible in the status
+API; detected event/load recovery emits INFO and allows a later outage to warn
+again. Invalid startup configuration
+still fails validation. Transient problems preserve request forwarding with
+the existing conservative estimates:
+
+| Warning reason | Meaning / next check |
+| --- | --- |
+| `profile_model_mismatch`, `subscription_unavailable` | Match the served model and profile; check discovery or explicit worker mappings. |
+| `no_kv_events` | No frame within `event_stale_ms` (default 30 s) after worker binding. Check worker `--kv-events-config`, event endpoint, topic and network; an idle worker may also produce no events. Confirmed residency does not expire during silence. |
+| `kv_events_unusable` | Frames arrived but none established usable state; compare receive/application progress and the specific error. |
+| `unsupported_cache_identity` | A Store identity and its descendants are isolated; other valid branches remain eligible. Inspect the structure-only `last_skipped_store` sample. |
+| `subscriber_task_stopped` | The subscriber exited unexpectedly; old residency was invalidated and the supervisor will restart it. |
+| `event_state_unavailable` | No usable event state for this worker: inspect initialization, stream errors and worker/layout identity. Idle time alone never disables matching. |
+| `event_connect`, `event_receive`, `disconnected`, `event_frame` | ZMQ connection, receive or protocol failure; inspect the endpoint in the detail. |
+| `unsupported_group`, `unsupported_attention`, `block_size_mismatch` | The event format/cache kind or block size is incompatible. Verify the backend; weight changes cannot fix this. |
+| `replay_*` | Recovery failed; transient failures retry on a bounded timer. A first-frame history truncation is recorded at INFO and in `history_truncated_at`, not as a repeating replay failure. |
+| `missing_parent`, `sparse_hash_unknown` | Some ancestry is missing. Verified branches remain usable; recovery runs once for known truncated history. Compare `history_complete`, `history_truncated_at` and replay logs before benchmarking weights. |
+| `local_tokenizer_unavailable`, `local_chat_template`, `local_tokenize` | Exact local request tokens could not be derived. Check tokenizer files, served model name and chat-template support. Local mode does not fall back to HTTP render. |
+| `load_metrics_unavailable`, `load_state_unavailable` | Backend load metrics failed, are missing or stale; scoring uses local fallback estimates. |
+| `kv_usage_unavailable` | Occupancy gauge missing/invalid; the pressure term contributes zero while queue/running gauges remain usable. |
+
+The startup message `pre_kv_cache subscription started; awaiting valid KV events`
+only means a subscriber task was created, not that the publisher is reachable.
+Warnings distinguish observed silence from a confirmed configuration error;
+the Router cannot infer a missing backend flag from silence alone. These
+diagnostics do not add support for previously unsupported cache-event formats
+or model chat templates.
+
+The KV index describes local GPU residency. CPU/storage and remote connector
+events do not add or remove local GPU blocks; unknown media remain unsupported.
+A shared store may affect backend cache counters and transfer costs, so backend
+`cached_tokens` is not automatically equivalent to the Router's indexed hits.
 
 ## Observability
 

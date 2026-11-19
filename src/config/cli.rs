@@ -195,6 +195,25 @@ pub struct CliArgs {
     )]
     pre_kv_cache_block_size: Option<usize>,
 
+    /// Complete cacheable group layout as JSON (group_idx, block_size, kind, sliding_window)
+    #[arg(
+        long,
+        requires = "pre_kv_cache_profile",
+        conflicts_with_all = ["pre_kv_cache_config", "pre_kv_cache_config_json"],
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_groups: Option<String>,
+
+    /// Override automatic layout selection with a measured preset (optional)
+    #[arg(
+        long,
+        value_enum,
+        requires = "pre_kv_cache_profile",
+        conflicts_with_all = ["pre_kv_cache_groups", "pre_kv_cache_config", "pre_kv_cache_config_json"],
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_layout: Option<pre_kv_cache::LayoutPreset>,
+
     /// Request token source for exact KV matching
     #[arg(
         long,
@@ -203,6 +222,35 @@ pub struct CliArgs {
         help_heading = "Routing Policy"
     )]
     pre_kv_cache_token_source: Option<PreKvCacheTokenSource>,
+
+    /// Cache importance, 0..1000: larger values favor avoiding uncached work (default: 1)
+    #[arg(
+        long,
+        alias = "pre-kv-cache-kv-weight",
+        requires = "pre_kv_cache_profile",
+        conflicts_with_all = ["pre_kv_cache_config", "pre_kv_cache_config_json"],
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_kv_importance: Option<f64>,
+
+    /// Load importance, 0..1000: larger values favor avoiding busy workers (default: 1)
+    #[arg(
+        long,
+        alias = "pre-kv-cache-load-weight",
+        requires = "pre_kv_cache_profile",
+        conflicts_with_all = ["pre_kv_cache_config", "pre_kv_cache_config_json"],
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_load_importance: Option<f64>,
+
+    /// Log per-candidate KV and load cost contributions at INFO for routing analysis
+    #[arg(
+        long,
+        requires = "pre_kv_cache_profile",
+        conflicts_with_all = ["pre_kv_cache_config", "pre_kv_cache_config_json"],
+        help_heading = "Routing Policy"
+    )]
+    pre_kv_cache_log_decisions: bool,
 
     /// ZMQ KV-event port on each discovered worker
     #[arg(
@@ -738,7 +786,12 @@ impl CliArgs {
     /// Builds one canonical pre-KV-cache config from either readable flags or JSON.
     fn load_pre_kv_cache_config(&self) -> Result<Option<pre_kv_cache::Config>> {
         if let Some(profile_name) = &self.pre_kv_cache_profile {
-            let mut config = pre_kv_cache::Config::default();
+            // Reuse the canonical defaults so old CLI and JSON configurations agree.
+            let mut config = pre_kv_cache::Config {
+                log_decisions: self.pre_kv_cache_log_decisions,
+                ..Default::default()
+            };
+            let defaults = pre_kv_cache::CostModel::default();
             config.profiles.insert(
                 profile_name.clone(),
                 pre_kv_cache::Profile {
@@ -755,7 +808,23 @@ impl CliArgs {
                     block_size: self
                         .pre_kv_cache_block_size
                         .context("--pre-kv-cache-block-size is required")?,
-                    cost: pre_kv_cache::CostModel::default(),
+                    cache_groups: self
+                        .pre_kv_cache_groups
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .context("--pre-kv-cache-groups must be a JSON array of cache groups")?
+                        .unwrap_or_default(),
+                    layout: self.pre_kv_cache_layout,
+                    cost: pre_kv_cache::CostModel {
+                        kv_importance: self
+                            .pre_kv_cache_kv_importance
+                            .unwrap_or(defaults.kv_importance),
+                        load_importance: self
+                            .pre_kv_cache_load_importance
+                            .unwrap_or(defaults.load_importance),
+                        ..defaults
+                    },
                 },
             );
 
@@ -1010,6 +1079,218 @@ fn parse_label_selectors(selector_list: &[String]) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_kv_layout_preset_is_explicit_and_rejects_conflicting_sources() {
+        let base = [
+            "smg",
+            "--backend",
+            "vllm",
+            "--pre-kv-cache-profile",
+            "ds",
+            "--pre-kv-cache-model",
+            "arbitrary-served-name",
+            "--pre-kv-cache-block-size",
+            "64",
+            "--pre-kv-cache-token-source",
+            "local_tokenizer",
+        ];
+        let preset = ["--pre-kv-cache-layout", "deepseek_v41_vllm031_dspark5"];
+        let config = Cli::try_parse_from(base.into_iter().chain(preset))
+            .unwrap()
+            .args
+            .load_pre_kv_cache_config()
+            .unwrap()
+            .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.profiles["ds"].layout,
+            Some(pre_kv_cache::LayoutPreset::DeepseekV41Vllm031Dspark5)
+        );
+        let no_preset = Cli::try_parse_from(base)
+            .unwrap()
+            .args
+            .load_pre_kv_cache_config()
+            .unwrap()
+            .unwrap();
+        assert!(no_preset.profiles["ds"].layout.is_none());
+        assert!(Cli::try_parse_from(["smg"].into_iter().chain(preset)).is_err());
+        assert!(Cli::try_parse_from(
+            base.into_iter()
+                .chain(["--pre-kv-cache-layout", "deepseek_v41"])
+        )
+        .is_err());
+        for conflict in [
+            ["--pre-kv-cache-groups", "[]"],
+            ["--pre-kv-cache-config", "/tmp/unused.json"],
+            ["--pre-kv-cache-config-json", "{}"],
+        ] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(preset).chain(conflict)).is_err());
+        }
+    }
+
+    #[test]
+    fn pre_kv_group_layout_flows_from_cli_and_rejects_bad_json() {
+        let base = [
+            "smg",
+            "--backend",
+            "vllm",
+            "--pre-kv-cache-profile",
+            "ds",
+            "--pre-kv-cache-model",
+            "served",
+            "--pre-kv-cache-block-size",
+            "64",
+        ];
+        let groups = r#"[{"group_idx":0,"block_size":64,"kind":"full_attention"},{"group_idx":1,"block_size":64,"kind":"sliding_window","sliding_window":128}]"#;
+        let config = Cli::try_parse_from(base.into_iter().chain(["--pre-kv-cache-groups", groups]))
+            .unwrap()
+            .args
+            .load_pre_kv_cache_config()
+            .unwrap()
+            .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.profiles["ds"].cache_groups.len(), 2);
+        assert_eq!(
+            config.profiles["ds"].cache_groups[1].sliding_window,
+            Some(128)
+        );
+        let args = Cli::try_parse_from(base.into_iter().chain(["--pre-kv-cache-groups", "{}"]))
+            .unwrap()
+            .args;
+        assert!(args.load_pre_kv_cache_config().is_err());
+        assert!(Cli::try_parse_from(["smg", "--pre-kv-cache-groups", groups]).is_err());
+    }
+
+    #[test]
+    fn pre_kv_importances_and_decision_logging_reach_the_profile() {
+        for enabled in [false, true] {
+            let mut args = vec![
+                "smg",
+                "--backend",
+                "vllm",
+                "--pre-kv-cache-profile",
+                "ds",
+                "--pre-kv-cache-model",
+                "served",
+                "--pre-kv-cache-block-size",
+                "64",
+            ];
+            if enabled {
+                args.extend([
+                    "--pre-kv-cache-kv-importance",
+                    "0.5",
+                    "--pre-kv-cache-load-importance",
+                    "2",
+                    "--pre-kv-cache-log-decisions",
+                ]);
+            }
+            let config = Cli::try_parse_from(args)
+                .unwrap()
+                .args
+                .load_pre_kv_cache_config()
+                .unwrap()
+                .unwrap();
+            config.validate().unwrap();
+            let cost = &config.profiles["ds"].cost;
+            assert_eq!(
+                (cost.kv_importance, cost.load_importance),
+                if enabled { (0.5, 2.0) } else { (1.0, 1.0) }
+            );
+            assert_eq!(config.log_decisions, enabled);
+        }
+    }
+
+    #[test]
+    fn pre_kv_importance_options_require_a_profile() {
+        for args in [
+            vec![
+                "smg",
+                "--backend",
+                "vllm",
+                "--pre-kv-cache-kv-importance",
+                "1",
+            ],
+            vec![
+                "smg",
+                "--backend",
+                "vllm",
+                "--pre-kv-cache-load-importance",
+                "1",
+            ],
+            vec!["smg", "--backend", "vllm", "--pre-kv-cache-log-decisions"],
+        ] {
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+            assert!(error.to_string().contains("--pre-kv-cache-profile"));
+        }
+    }
+
+    #[test]
+    fn pre_kv_importance_options_do_not_silently_override_json() {
+        for source in ["--pre-kv-cache-config", "--pre-kv-cache-config-json"] {
+            for option in [
+                vec!["--pre-kv-cache-kv-importance", "1"],
+                vec!["--pre-kv-cache-load-importance", "1"],
+                vec!["--pre-kv-cache-log-decisions"],
+            ] {
+                let mut args = vec!["smg", "--backend", "vllm", source, "{}"];
+                args.extend(option);
+                let error = Cli::try_parse_from(args).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            }
+        }
+    }
+
+    #[test]
+    fn old_weight_flags_remain_aliases_for_importance() {
+        // Both spellings feed the same complete startup validation and config.
+        let base = [
+            "smg",
+            "--backend",
+            "vllm",
+            "--service-discovery",
+            "--policy",
+            "pre_kv_cache",
+            "--pre-kv-cache-profile",
+            "ds",
+            "--pre-kv-cache-model",
+            "served",
+            "--pre-kv-cache-block-size",
+            "64",
+        ];
+        for (kv, load) in [
+            (
+                "--pre-kv-cache-kv-importance",
+                "--pre-kv-cache-load-importance",
+            ),
+            ("--pre-kv-cache-kv-weight", "--pre-kv-cache-load-weight"),
+        ] {
+            let config = Cli::try_parse_from(base.into_iter().chain([kv, "4", load, "0.5"]))
+                .unwrap()
+                .args
+                .load_pre_kv_cache_config()
+                .unwrap()
+                .unwrap();
+            let cost = &config.profiles["ds"].cost;
+            assert_eq!((cost.kv_importance, cost.load_importance), (4.0, 0.5));
+            let error = Cli::try_parse_from(base.into_iter().chain([kv, "1e308"]))
+                .unwrap()
+                .try_into_config()
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("must be between 0 and 1000"));
+        }
+        assert!(Cli::try_parse_from(base.into_iter().chain([
+            "--pre-kv-cache-kv-weight",
+            "1",
+            "--pre-kv-cache-kv-importance",
+            "2"
+        ]))
+        .is_err());
+    }
 
     #[test]
     fn priority_worker_count_reaches_gateway_config() {

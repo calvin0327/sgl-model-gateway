@@ -15,6 +15,7 @@ use crate::{
     app_state::AppState,
     core::{worker_manager::WorkerManager, UNKNOWN_MODEL_ID},
     middleware::{self, AuthConfig},
+    policies::pre_kv_cache::settings::{get_status, get_weights, put_weights},
     protocol_compat::{ResponsesGetParams, WorkerConfigRequest, WorkerUpdateRequest},
     protocols::{
         chat::ChatCompletionRequest,
@@ -49,7 +50,12 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 
         tower_http::cors::CorsLayer::new()
             .allow_origin(origins)
-            .allow_methods([http::Method::GET, http::Method::POST, http::Method::OPTIONS])
+            .allow_methods([
+                http::Method::GET,
+                http::Method::POST,
+                http::Method::PUT,
+                http::Method::OPTIONS,
+            ])
             .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
             .expose_headers([http::header::HeaderName::from_static("x-request-id")])
     };
@@ -484,6 +490,11 @@ pub fn build_app(
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
+        .route("/v1/pre-kv-cache/status", get(get_status))
+        .route(
+            "/v1/pre-kv-cache/weights/{profile}",
+            get(get_weights).put(put_weights),
+        )
         .route("/v1/loads", get(get_loads))
         // TODO: Remove `/get_loads` alias after one release-cycle deprecation window.
         .route("/get_loads", get(get_loads))

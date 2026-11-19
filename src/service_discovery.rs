@@ -1,22 +1,22 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     api::Api,
     runtime::{
-        watcher::{watcher, Config},
+        watcher::{watcher, Config, Event},
         WatchStreamExt,
     },
     Client,
 };
 use rustls;
-use tokio::{task, time};
-use tracing::{debug, error, info, warn};
+use tokio::{sync::oneshot, task, time};
+use tracing::{error, info, warn};
 
 use crate::{
     app_context::AppContext,
@@ -158,347 +158,548 @@ impl PodInfo {
     }
 }
 
+const DISCOVERY_OWNER_LABEL: &str = "sgl-model-gateway/discovery-pod";
+type PodKey = (String, String);
+
+// Readiness and status are observations, not registration identity. Keep the
+// last registered endpoint so a deletion tombstone needs only namespace/name/UID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Registration {
+    uid: String,
+    ip: String,
+    pod_type: Option<PodType>,
+    bootstrap_port: Option<u16>,
+}
+
+impl Registration {
+    fn url(&self, port: u16) -> String {
+        format!("http://{}:{}", self.ip, port)
+    }
+
+    fn pod_info(&self, name: &str) -> PodInfo {
+        PodInfo {
+            name: name.to_string(),
+            ip: self.ip.clone(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: self.pod_type.clone(),
+            bootstrap_port: self.bootstrap_port,
+        }
+    }
+}
+
+struct PendingChange {
+    target: Option<Registration>,
+    completion: oneshot::Receiver<Result<String, String>>,
+}
+
+#[derive(Default)]
+struct DiscoveredPod {
+    uid: String,
+    desired: Option<Registration>,
+    registered: Option<Registration>,
+    pending: Option<PendingChange>,
+    retry_at: Option<Instant>,
+}
+
+impl DiscoveredPod {
+    // Only one operation per Pod may run at a time. Replacement always removes
+    // the old registration before adding the new one, even at the same URL.
+    fn next_change(&self, now: Instant) -> Option<Option<Registration>> {
+        if self.pending.is_some()
+            || self.retry_at.is_some_and(|deadline| now < deadline)
+            || self.registered == self.desired
+        {
+            return None;
+        }
+        Some(if self.registered.is_some() {
+            None
+        } else {
+            self.desired.clone()
+        })
+    }
+}
+
+#[derive(Default)]
+struct DiscoveryState {
+    pods: HashMap<PodKey, DiscoveredPod>,
+    listed: HashSet<PodKey>,
+}
+
+impl DiscoveryState {
+    fn key(pod: &Pod) -> Option<PodKey> {
+        Some((
+            pod.metadata.namespace.clone().unwrap_or_default(),
+            pod.metadata.name.clone()?,
+        ))
+    }
+
+    fn observe(&mut self, event: Event<Pod>, config: &ServiceDiscoveryConfig) {
+        match event {
+            Event::Init => self.listed.clear(),
+            Event::InitApply(pod) => {
+                if let Some(key) = Self::key(&pod) {
+                    self.listed.insert(key);
+                }
+                self.apply(pod, config);
+            }
+            Event::InitDone => {
+                // A complete relist repairs deletes missed during disconnection.
+                // Never remove on a partial/failed list, or touch manual workers.
+                for (key, state) in &mut self.pods {
+                    if !self.listed.contains(key) {
+                        state.desired = None;
+                    }
+                }
+            }
+            Event::Apply(pod) => self.apply(pod, config),
+            Event::Delete(pod) => {
+                let Some(key) = Self::key(&pod) else { return };
+                if let Some(state) = self.pods.get_mut(&key) {
+                    // A delayed delete for the old incarnation must not delete
+                    // a replacement with the same namespace/name.
+                    if pod
+                        .metadata
+                        .uid
+                        .as_ref()
+                        .is_none_or(|uid| uid == &state.uid)
+                    {
+                        state.desired = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply(&mut self, pod: Pod, config: &ServiceDiscoveryConfig) {
+        let Some(key) = Self::key(&pod) else { return };
+        let selected = PodInfo::should_include(&pod, config);
+        if !selected && !self.pods.contains_key(&key) {
+            return;
+        }
+        let uid = pod
+            .metadata
+            .uid
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}", key.0, key.1));
+        let state = self.pods.entry(key).or_default();
+        if uid != state.uid {
+            state.uid = uid.clone();
+            state.desired = None;
+        }
+        if !selected || pod.metadata.deletion_timestamp.is_some() {
+            state.desired = None;
+            return;
+        }
+        // Keep the existing readiness semantics: transient unready updates do
+        // not unregister a live Pod; health checks control its eligibility.
+        if let Some(info) = PodInfo::from_pod(&pod, Some(config)).filter(PodInfo::is_healthy) {
+            state.desired = Some(Registration {
+                uid,
+                ip: info.ip,
+                pod_type: info.pod_type,
+                bootstrap_port: info.bootstrap_port,
+            });
+        }
+    }
+
+    async fn reconcile(&mut self, context: &Arc<AppContext>, config: &ServiceDiscoveryConfig) {
+        let Some(queue) = context.worker_job_queue.get() else {
+            return;
+        };
+        let retry_delay = config.check_interval.max(Duration::from_secs(1));
+        for (key, state) in &mut self.pods {
+            if let Some(pending) = &mut state.pending {
+                let result = match pending.completion.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(oneshot::error::TryRecvError::Empty) => None,
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        Some(Err("job completion channel closed".into()))
+                    }
+                };
+                if let Some(result) = result {
+                    let pending = state.pending.take().unwrap();
+                    match result {
+                        Ok(_) => {
+                            state.registered = pending.target;
+                            state.retry_at = None;
+                        }
+                        Err(error) => {
+                            // Registration may fail after inserting the worker.
+                            // Retain ownership so a subsequent delete cleans it up.
+                            if let Some(target) = pending.target {
+                                if has_owned_worker(context, &target, config.port) {
+                                    state.registered = Some(target);
+                                }
+                            }
+                            warn!(pod = key.1, %error, "Discovery job failed; retaining state for reconciliation");
+                            state.retry_at = Some(Instant::now() + retry_delay);
+                        }
+                    }
+                }
+            }
+            let Some(target) = state.next_change(Instant::now()) else {
+                continue;
+            };
+            let job = if let Some(registration) = &target {
+                let url = registration.url(config.port);
+                // Discovery must not adopt/delete an existing static or API
+                // registration, or overlap a retiring Pod using the same URL.
+                if has_worker_at_url(context, &url) {
+                    state.retry_at = Some(Instant::now() + retry_delay);
+                    continue;
+                }
+                info!(pod = key.1, worker_url = url, "Adding discovered pod");
+                let info = registration.pod_info(&key.1);
+                let mut worker_config = worker_config(&info, context, config.port);
+                worker_config
+                    .labels
+                    .insert(DISCOVERY_OWNER_LABEL.into(), registration.uid.clone());
+                Job::AddWorker {
+                    config: Box::new(worker_config),
+                }
+            } else {
+                let registered = state.registered.as_ref().unwrap();
+                if !has_owned_worker(context, registered, config.port) {
+                    state.registered = None;
+                    continue;
+                }
+                let url = registered.url(config.port);
+                info!(pod = key.1, worker_url = url, "Removing discovered pod");
+                Job::RemoveWorker { url }
+            };
+            match queue.submit_with_completion(job).await {
+                Ok(completion) => {
+                    if target.is_some() {
+                        Metrics::record_discovery_registration(
+                            metrics_labels::DISCOVERY_KUBERNETES,
+                            metrics_labels::REGISTRATION_SUCCESS,
+                        );
+                    } else {
+                        Metrics::record_discovery_deregistration(
+                            metrics_labels::DISCOVERY_KUBERNETES,
+                            metrics_labels::DEREGISTRATION_POD_DELETED,
+                        );
+                    }
+                    state.pending = Some(PendingChange { target, completion });
+                }
+                Err(error) => {
+                    warn!(pod = key.1, %error, "Discovery submission failed; will retry");
+                    state.retry_at = Some(Instant::now() + retry_delay);
+                }
+            }
+        }
+        self.pods.retain(|_, state| {
+            state.desired.is_some() || state.registered.is_some() || state.pending.is_some()
+        });
+        Metrics::set_discovery_workers_discovered(
+            metrics_labels::DISCOVERY_KUBERNETES,
+            self.pods
+                .values()
+                .filter(|state| state.registered.is_some())
+                .count(),
+        );
+    }
+}
+
+fn matches_worker_url(actual: &str, base: &str) -> bool {
+    actual == base
+        || actual
+            .strip_prefix(base)
+            .is_some_and(|suffix| suffix.starts_with('@'))
+}
+
+fn has_worker_at_url(context: &AppContext, url: &str) -> bool {
+    context
+        .worker_registry
+        .get_all()
+        .iter()
+        .any(|worker| matches_worker_url(worker.url(), url))
+}
+
+fn has_owned_worker(context: &AppContext, registration: &Registration, port: u16) -> bool {
+    let url = registration.url(port);
+    context.worker_registry.get_all().iter().any(|worker| {
+        matches_worker_url(worker.url(), &url)
+            && worker.metadata().labels.get(DISCOVERY_OWNER_LABEL) == Some(&registration.uid)
+    })
+}
+
 pub async fn start_service_discovery(
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
     if !config.enabled {
         return Err(kube::Error::Api(kube::error::ErrorResponse {
-            status: "Disabled".to_string(),
-            message: "Service discovery is disabled".to_string(),
-            reason: "ConfigurationError".to_string(),
+            status: "Disabled".into(),
+            message: "Service discovery is disabled".into(),
+            reason: "ConfigurationError".into(),
             code: 400,
         }));
     }
-
     let _ = rustls::crypto::ring::default_provider().install_default();
-
     let client = Client::try_default().await?;
-
-    let format_selector = |selector: &HashMap<String, String>| {
-        selector
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join(",")
+    let pods: Api<Pod> = if let Some(namespace) = &config.namespace {
+        Api::namespaced(client, namespace)
+    } else {
+        Api::all(client)
     };
-    info!(
-        "Starting K8s service discovery | regular: '{}' | prefill: '{}' | decode: '{}'",
-        format_selector(&config.selector),
-        format_selector(&config.prefill_selector),
-        format_selector(&config.decode_selector),
-    );
-
-    let handle = task::spawn(async move {
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
-
-        let pods: Api<Pod> = if let Some(namespace) = &config.namespace {
-            Api::namespaced(client, namespace)
-        } else {
-            Api::all(client)
-        };
-
-        debug!("K8s service discovery initialized");
-
-        let config_arc = Arc::new(config.clone());
-        let port = config.port;
-
-        let mut retry_delay = Duration::from_secs(1);
-        const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
-
+    info!(regular = ?config.selector, prefill = ?config.prefill_selector,
+        decode = ?config.decode_selector, "Starting K8s service discovery");
+    Ok(task::spawn(async move {
+        let mut state = DiscoveryState::default();
+        let mut tick = time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        // kube-runtime handles reconnect/backoff and emits InitDone only after
+        // a complete list. Keep processing pending removals during watch errors.
         loop {
-            let watcher_config = Config::default();
-            let watcher_stream = watcher(pods.clone(), watcher_config).applied_objects();
-
-            let config_clone = Arc::clone(&config_arc);
-            let tracked_pods_clone = Arc::clone(&tracked_pods);
-
-            let filtered_stream = watcher_stream.filter_map(move |obj_res| {
-                let config_inner = Arc::clone(&config_clone);
-
-                async move {
-                    match obj_res {
-                        Ok(pod) => {
-                            if PodInfo::should_include(&pod, &config_inner) {
-                                Some(Ok(pod))
-                            } else {
-                                None
-                            }
-                        }
-                        Err(e) => Some(Err(e)),
-                    }
+            let stream = watcher(pods.clone(), Config::default()).default_backoff();
+            futures::pin_mut!(stream);
+            loop {
+                tokio::select! {
+                    event = stream.next() => match event {
+                        Some(Ok(event)) => state.observe(event, &config),
+                        Some(Err(error)) => warn!(%error, "Kubernetes watch error; awaiting recovery"),
+                        None => break,
+                    },
+                    _ = tick.tick() => {},
                 }
-            });
-
-            let tracked_pods_clone2 = Arc::clone(&tracked_pods_clone);
-            let app_context_clone = Arc::clone(&app_context);
-            let config_clone2 = Arc::clone(&config_arc);
-
-            match filtered_stream
-                .try_for_each(move |pod| {
-                    let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
-                    let app_context_inner = Arc::clone(&app_context_clone);
-                    let config_inner = Arc::clone(&config_clone2);
-
-                    async move {
-                        let pod_info = PodInfo::from_pod(&pod, Some(&config_inner));
-
-                        if let Some(pod_info) = pod_info {
-                            if pod.metadata.deletion_timestamp.is_some() {
-                                handle_pod_deletion(
-                                    &pod_info,
-                                    tracked_pods_inner,
-                                    app_context_inner,
-                                    port,
-                                )
-                                .await;
-                            } else {
-                                handle_pod_event(
-                                    &pod_info,
-                                    tracked_pods_inner,
-                                    app_context_inner,
-                                    port,
-                                )
-                                .await;
-                            }
-                        }
-                        Ok(())
-                    }
-                })
-                .await
-            {
-                Ok(_) => {
-                    retry_delay = Duration::from_secs(1);
-                }
-                Err(err) => {
-                    error!("Error in Kubernetes watcher: {}", err);
-                    warn!(
-                        "Retrying in {} seconds with exponential backoff",
-                        retry_delay.as_secs()
-                    );
-                    time::sleep(retry_delay).await;
-
-                    retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                }
+                state.reconcile(&app_context, &config).await;
             }
-
-            warn!(
-                "Kubernetes watcher exited, restarting in {} seconds",
-                config_arc.check_interval.as_secs()
-            );
-            time::sleep(config_arc.check_interval).await;
+            error!("Kubernetes watcher ended; restarting");
+            time::sleep(Duration::from_secs(1)).await;
         }
-    });
-
-    Ok(handle)
+    }))
 }
 
-async fn handle_pod_event(
-    pod_info: &PodInfo,
-    tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
-    app_context: Arc<AppContext>,
-    port: u16,
-) {
+fn worker_config(pod_info: &PodInfo, app_context: &AppContext, port: u16) -> WorkerConfigRequest {
     let worker_url = pod_info.worker_url(port);
+    let worker_type = match &pod_info.pod_type {
+        Some(PodType::Prefill) => Some("prefill".to_string()),
+        Some(PodType::Decode) => Some("decode".to_string()),
+        Some(PodType::Regular) => Some("regular".to_string()),
+        None => unreachable!("only selected pods are registered"),
+    };
 
-    if pod_info.is_healthy() {
-        // Track whether to add and get count in single lock acquisition
-        let (should_add, tracked_count) = {
-            let mut tracker = match tracked_pods.lock() {
-                Ok(tracker) => tracker,
-                Err(e) => {
-                    error!("Failed to acquire tracked_pods lock: {}", e);
-                    return;
-                }
-            };
+    let bootstrap_port = match &pod_info.pod_type {
+        Some(PodType::Prefill) => pod_info.bootstrap_port,
+        _ => None,
+    };
 
-            if tracker.contains(pod_info) {
-                (false, tracker.len())
-            } else {
-                tracker.insert(pod_info.clone());
-                (true, tracker.len())
-            }
-        };
+    let preferred_context_tokens = match &pod_info.pod_type {
+        Some(PodType::Regular) => app_context.config.workers.regular_preferred_context_tokens,
+        Some(PodType::Prefill) => app_context.config.workers.pd_preferred_context_tokens,
+        _ => None,
+    };
+    let mut labels = HashMap::new();
+    if let Some(tokens) = preferred_context_tokens {
+        labels.insert(
+            PREFERRED_CONTEXT_TOKENS_LABEL.to_string(),
+            tokens.to_string(),
+        );
+    }
 
-        if should_add {
-            info!(
-                "Adding pod: {} | type: {:?} | url: {}",
-                pod_info.name, pod_info.pod_type, worker_url
-            );
-
-            let worker_type = match &pod_info.pod_type {
-                Some(PodType::Prefill) => Some("prefill".to_string()),
-                Some(PodType::Decode) => Some("decode".to_string()),
-                Some(PodType::Regular) => Some("regular".to_string()),
-                None => return,
-            };
-
-            let bootstrap_port = match &pod_info.pod_type {
-                Some(PodType::Prefill) => pod_info.bootstrap_port,
-                _ => None,
-            };
-
-            let preferred_context_tokens = match &pod_info.pod_type {
-                Some(PodType::Regular) => {
-                    app_context.config.workers.regular_preferred_context_tokens
-                }
-                Some(PodType::Prefill) => app_context.config.workers.pd_preferred_context_tokens,
-                _ => None,
-            };
-            let mut labels = HashMap::new();
-            if let Some(tokens) = preferred_context_tokens {
-                labels.insert(
-                    PREFERRED_CONTEXT_TOKENS_LABEL.to_string(),
-                    tokens.to_string(),
-                );
-            }
-
-            let config = WorkerConfigRequest {
-                url: worker_url.clone(),
-                model_id: None,
-                worker_type,
-                priority: None,
-                cost: None,
-                runtime: app_context.config.workers.backend.clone(),
-                kv_connector: app_context.config.workers.kv_connector.clone(),
-                kv_engine_id: app_context.config.workers.kv_engine_id.clone(),
-                labels,
-                bootstrap_port,
-                tokenizer_path: None,
-                reasoning_parser: None,
-                tool_parser: None,
-                chat_template: None,
-                api_key: app_context.config.server.api_key.clone(),
-                health_check_timeout_secs: app_context.config.workers.health_check.timeout_secs,
-                health_check_interval_secs: app_context
-                    .config
-                    .workers
-                    .health_check
-                    .check_interval_secs,
-                health_success_threshold: app_context.config.workers.health_check.success_threshold,
-                health_failure_threshold: app_context.config.workers.health_check.failure_threshold,
-                disable_health_check: app_context.config.workers.health_check.disable_health_check,
-                max_connection_attempts: app_context.config.workers.health_check.success_threshold
-                    * 20,
-                dp_aware: app_context.config.routing.dp_aware,
-            };
-
-            let job = Job::AddWorker {
-                config: Box::new(config.clone()),
-            };
-
-            if let Some(job_queue) = app_context.worker_job_queue.get() {
-                match job_queue.submit(job).await {
-                    Ok(_) => {
-                        debug!("Worker addition job submitted for: {}", worker_url);
-
-                        // Layer 4: Record successful registration from K8s discovery
-                        Metrics::record_discovery_registration(
-                            metrics_labels::DISCOVERY_KUBERNETES,
-                            metrics_labels::REGISTRATION_SUCCESS,
-                        );
-
-                        // Update workers discovered gauge (using count from initial lock)
-                        Metrics::set_discovery_workers_discovered(
-                            metrics_labels::DISCOVERY_KUBERNETES,
-                            tracked_count,
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to submit worker addition job for {}: {}",
-                            worker_url, e
-                        );
-
-                        // Layer 4: Record failed registration
-                        Metrics::record_discovery_registration(
-                            metrics_labels::DISCOVERY_KUBERNETES,
-                            metrics_labels::REGISTRATION_FAILED,
-                        );
-
-                        if let Ok(mut tracker) = tracked_pods.lock() {
-                            tracker.remove(pod_info);
-                        }
-                    }
-                }
-            } else {
-                debug!(
-                    "JobQueue not initialized, skipping async worker addition for: {}",
-                    worker_url
-                );
-            }
-        } else {
-            // Pod already tracked - this is a duplicate event
-            Metrics::record_discovery_registration(
-                metrics_labels::DISCOVERY_KUBERNETES,
-                metrics_labels::REGISTRATION_DUPLICATE,
-            );
-        }
+    WorkerConfigRequest {
+        url: worker_url.clone(),
+        model_id: None,
+        worker_type,
+        priority: None,
+        cost: None,
+        runtime: app_context.config.workers.backend.clone(),
+        kv_connector: app_context.config.workers.kv_connector.clone(),
+        kv_engine_id: app_context.config.workers.kv_engine_id.clone(),
+        labels,
+        bootstrap_port,
+        tokenizer_path: None,
+        reasoning_parser: None,
+        tool_parser: None,
+        chat_template: None,
+        api_key: app_context.config.server.api_key.clone(),
+        health_check_timeout_secs: app_context.config.workers.health_check.timeout_secs,
+        health_check_interval_secs: app_context.config.workers.health_check.check_interval_secs,
+        health_success_threshold: app_context.config.workers.health_check.success_threshold,
+        health_failure_threshold: app_context.config.workers.health_check.failure_threshold,
+        disable_health_check: app_context.config.workers.health_check.disable_health_check,
+        max_connection_attempts: app_context.config.workers.health_check.success_threshold * 20,
+        dp_aware: app_context.config.routing.dp_aware,
     }
 }
 
-async fn handle_pod_deletion(
-    pod_info: &PodInfo,
-    tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
-    app_context: Arc<AppContext>,
-    port: u16,
-) {
-    let worker_url = pod_info.worker_url(port);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-    // Remove pod and get remaining count in single lock acquisition
-    let (was_tracked, remaining_count) = {
-        let mut tracked = match tracked_pods.lock() {
-            Ok(tracked) => tracked,
-            Err(e) => {
-                error!("Failed to acquire tracked_pods lock during deletion: {}", e);
-                return;
-            }
-        };
-        let removed = tracked.remove(pod_info);
-        (removed, tracked.len())
-    };
-
-    if was_tracked {
-        info!(
-            "Removing pod: {} | type: {:?} | url: {}",
-            pod_info.name, pod_info.pod_type, worker_url
-        );
-
-        let job = Job::RemoveWorker {
-            url: worker_url.clone(),
-        };
-
-        if let Some(job_queue) = app_context.worker_job_queue.get() {
-            if let Err(e) = job_queue.submit(job).await {
-                error!(
-                    "Failed to submit worker removal job for {}: {}",
-                    worker_url, e
-                );
-            } else {
-                debug!("Submitted worker removal job for {}", worker_url);
-
-                // Layer 4: Record deregistration from K8s pod deletion
-                Metrics::record_discovery_deregistration(
-                    metrics_labels::DISCOVERY_KUBERNETES,
-                    metrics_labels::DEREGISTRATION_POD_DELETED,
-                );
-
-                // Update workers discovered gauge (using count from initial lock)
-                Metrics::set_discovery_workers_discovered(
-                    metrics_labels::DISCOVERY_KUBERNETES,
-                    remaining_count,
-                );
-            }
-        } else {
-            error!(
-                "JobQueue not initialized, cannot remove worker {}",
-                worker_url
-            );
+    fn config() -> ServiceDiscoveryConfig {
+        ServiceDiscoveryConfig {
+            selector: HashMap::from([("app".into(), "worker".into())]),
+            ..Default::default()
         }
-    } else {
-        debug!(
-            "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
-            pod_info.name, pod_info.pod_type, worker_url
+    }
+
+    fn pod(namespace: &str, uid: &str, ip: &str) -> Pod {
+        serde_json::from_value(json!({
+            "metadata": {"namespace": namespace, "name": "worker", "uid": uid,
+                         "labels": {"app": "worker"}},
+            "status": {"phase": "Running", "podIP": ip,
+                       "conditions": [{"type": "Ready", "status": "True"}]}
+        }))
+        .unwrap()
+    }
+
+    fn key() -> PodKey {
+        ("default".into(), "worker".into())
+    }
+
+    fn registered() -> (DiscoveryState, Pod) {
+        let pod = pod("default", "old", "10.0.0.1");
+        let mut state = DiscoveryState::default();
+        state.observe(Event::Apply(pod.clone()), &config());
+        let worker = state.pods.get_mut(&key()).unwrap();
+        worker.registered = worker.desired.clone();
+        (state, pod)
+    }
+
+    #[test]
+    fn delete_without_labels_status_or_ip_removes_saved_endpoint() {
+        let (mut state, mut pod) = registered();
+        pod.metadata.labels = None;
+        pod.status = None;
+        state.observe(Event::Delete(pod), &config());
+        let worker = &state.pods[&key()];
+        assert_eq!(worker.next_change(Instant::now()), Some(None));
+        assert_eq!(
+            worker.registered.as_ref().unwrap().url(8000),
+            "http://10.0.0.1:8000"
         );
+    }
+
+    #[test]
+    fn terminating_unready_pod_is_removed_before_final_delete() {
+        let (mut state, mut pod) = registered();
+        pod.status = None;
+        pod.metadata.deletion_timestamp =
+            Some(serde_json::from_value(json!("2026-10-15T00:00:00Z")).unwrap());
+        state.observe(Event::Apply(pod), &config());
+        assert_eq!(state.pods[&key()].next_change(Instant::now()), Some(None));
+    }
+
+    #[test]
+    fn readiness_change_and_duplicate_apply_do_not_reregister() {
+        let (mut state, mut pod) = registered();
+        state.observe(Event::Apply(pod.clone()), &config());
+        pod.status.as_mut().unwrap().conditions = None;
+        state.observe(Event::Apply(pod), &config());
+        assert_eq!(state.pods[&key()].next_change(Instant::now()), None);
+    }
+
+    #[test]
+    fn selector_removal_unregisters_previously_selected_pod() {
+        let (mut state, mut pod) = registered();
+        pod.metadata.labels = None;
+        state.observe(Event::Apply(pod), &config());
+        assert_eq!(state.pods[&key()].next_change(Instant::now()), Some(None));
+    }
+
+    #[test]
+    fn completed_relist_repairs_missed_delete_but_partial_list_does_not() {
+        let (mut state, pod) = registered();
+        state.observe(Event::Init, &config());
+        assert!(state.pods[&key()].desired.is_some());
+        state.observe(Event::InitApply(pod), &config());
+        state.observe(Event::InitDone, &config());
+        assert_eq!(state.pods[&key()].next_change(Instant::now()), None);
+        state.observe(Event::Init, &config());
+        assert!(state.pods[&key()].desired.is_some());
+        state.observe(Event::InitDone, &config());
+        assert_eq!(state.pods[&key()].next_change(Instant::now()), Some(None));
+    }
+
+    #[test]
+    fn namespaced_identity_and_delayed_old_uid_delete_preserve_replacement() {
+        let (mut state, old) = registered();
+        state.observe(Event::Apply(pod("other", "other", "10.0.0.3")), &config());
+        state.observe(Event::Apply(pod("default", "new", "10.0.0.2")), &config());
+        state.observe(Event::Delete(old), &config());
+        assert_eq!(state.pods.len(), 2);
+        let worker = state.pods.get_mut(&key()).unwrap();
+        assert_eq!(worker.desired.as_ref().unwrap().uid, "new");
+        assert_eq!(worker.next_change(Instant::now()), Some(None));
+        worker.registered = None; // Successful removal permits the new incarnation.
+        assert_eq!(
+            worker.next_change(Instant::now()),
+            Some(worker.desired.clone())
+        );
+    }
+
+    #[test]
+    fn delete_during_add_waits_for_completion_then_removes() {
+        let (mut state, pod) = registered();
+        let worker = state.pods.get_mut(&key()).unwrap();
+        let target = worker.registered.take();
+        let (tx, completion) = oneshot::channel();
+        worker.pending = Some(PendingChange { target, completion });
+        state.observe(Event::Delete(pod), &config());
+        let worker = state.pods.get_mut(&key()).unwrap();
+        assert_eq!(worker.next_change(Instant::now()), None);
+        tx.send(Ok("added".into())).unwrap();
+        let mut pending = worker.pending.take().unwrap();
+        assert!(pending.completion.try_recv().unwrap().is_ok());
+        worker.registered = pending.target;
+        assert_eq!(worker.next_change(Instant::now()), Some(None));
+    }
+
+    #[test]
+    fn failed_removal_is_retained_for_retry_without_another_pod_event() {
+        let (mut state, pod) = registered();
+        state.observe(Event::Delete(pod), &config());
+        let worker = state.pods.get_mut(&key()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        worker.retry_at = Some(deadline);
+        assert_eq!(worker.next_change(Instant::now()), None);
+        assert_eq!(worker.next_change(deadline), Some(None));
+    }
+
+    #[test]
+    fn regular_prefill_decode_selectors_and_bootstrap_are_preserved() {
+        let mut config = config();
+        config
+            .prefill_selector
+            .insert("role".into(), "prefill".into());
+        config
+            .decode_selector
+            .insert("role".into(), "decode".into());
+        for (role, expected) in [
+            ("regular", PodType::Regular),
+            ("prefill", PodType::Prefill),
+            ("decode", PodType::Decode),
+        ] {
+            let mut pod = pod("default", role, "10.0.0.1");
+            pod.metadata
+                .labels
+                .as_mut()
+                .unwrap()
+                .insert("role".into(), role.into());
+            pod.metadata.annotations =
+                Some([(config.bootstrap_port_annotation.clone(), "8998".into())].into());
+            let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+            assert_eq!(
+                info.bootstrap_port,
+                if role == "prefill" { Some(8998) } else { None }
+            );
+            assert_eq!(info.pod_type, Some(expected));
+        }
+    }
+
+    #[test]
+    fn dp_worker_url_matching_does_not_match_neighbor_addresses() {
+        assert!(matches_worker_url(
+            "http://10.0.0.1:8000@0",
+            "http://10.0.0.1:8000"
+        ));
+        assert!(!matches_worker_url(
+            "http://10.0.0.1:80001",
+            "http://10.0.0.1:8000"
+        ));
     }
 }

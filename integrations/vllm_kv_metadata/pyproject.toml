@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smg-vllm-kv-metadata"
+version = "0.1.0"
+description = "Read-only runtime KV cache metadata for SMG exact cache routing"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+smg_kv_metadata = "smg_vllm_kv_metadata:register"
+
+[tool.setuptools]
+py-modules = ["smg_vllm_kv_metadata"]
